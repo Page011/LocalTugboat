@@ -4,7 +4,7 @@
   import { api } from "./api";
   import { act, app, chooseLibrary, fail, rescanLibrary } from "./app.svelte";
   import Dialog from "./Dialog.svelte";
-  import { ago, parseBinDays } from "./format";
+  import { ago, lastSeenText, parseBinDays } from "./format";
 
   let autostart = $state<boolean | null>(null);
   let binText = $state("");
@@ -87,7 +87,7 @@
       <h2>Phone</h2>
       {#if app.paired}
         <p><strong>{app.paired.name}</strong></p>
-        <p class="muted">Paired {ago(app.paired.paired_at, app.now)}. Last seen {ago(app.paired.last_seen_at, app.now)}.</p>
+        <p class="muted">Paired {ago(app.paired.paired_at, app.now)}. {lastSeenText(app.paired, app.sync, app.now)}.</p>
         <div><button class="btn danger" onclick={() => (confirmUnpair = true)}><Unlink size={16} aria-hidden="true" /> Unpair</button></div>
       {:else}
         <p class="muted">No phone paired.</p>

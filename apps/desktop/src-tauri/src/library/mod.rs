@@ -7,6 +7,8 @@
 //!   subfolder). The watcher only says "look again"; the pass is the same code the start-up
 //!   and 10-minute full rescans run, so a dropped watcher event can never lose a change.
 //! - `worker`: the thread that owns the watcher, the debounce and the timers.
+//! - `Library::drop_in`: the copy a file dropped on the window gets into the library (drop.rs
+//!   does the copying; this does the placing and the Core call under the same lock as a scan).
 
 pub mod config;
 pub mod placement;
@@ -66,7 +68,7 @@ impl Default for LibraryOptions {
 pub struct NotSyncedFile {
     pub path: String,
     pub name: String,
-    /// One short line, uppercase key word ("NOT A PHOTO OR VIDEO").
+    /// One short line, uppercase key word ("REFUSED - ...", "IN PROGRESS - ...").
     pub reason: String,
 }
 
@@ -91,6 +93,9 @@ pub struct LibraryStatus {
     /// Set when the library folder looks cloud-synced.
     pub cloud_warning: Option<String>,
     pub not_synced: Vec<NotSyncedFile>,
+    /// The library drive cannot keep the Mark-of-the-Web (FAT, exFAT): files from the phone wait
+    /// instead of being saved unmarked.
+    pub cannot_mark: bool,
     #[ts(type = "number | null")]
     pub last_scan_at: Option<i64>,
     /// The first error of the last scan (an unreadable folder, a locked file), if any.
@@ -130,8 +135,11 @@ pub(crate) struct State {
     pub ids: HashMap<String, (u64, i64, FileIdentity)>,
     /// mtime last handled per path: a later mtime means the file was edited.
     pub mtimes: HashMap<String, i64>,
-    /// Media-extension files whose content failed the type check: (size, mtime) when judged.
-    pub rejected: HashMap<String, (u64, i64)>,
+    /// Files judged not importable (content does not match a photo/video type, too large):
+    /// (size, mtime, reason line) when judged, so they are listed and not retried until they change.
+    pub rejected: HashMap<String, (u64, i64, String)>,
+    /// The library drive cannot hold named streams (no Mark-of-the-Web possible).
+    pub cannot_mark: bool,
     pub last_scan_at: Option<i64>,
     pub last_error: Option<String>,
     /// Old files choose() could not delete: kept in the status until they are gone.
@@ -180,6 +188,7 @@ impl Library {
                     std::fs::create_dir_all(default_root)?;
                     cfg.id = Some(config::write_new_marker(default_root)?);
                     cfg.path = Some(default_root.to_path_buf());
+                    cfg.legacy_done = true; // a library made now was empty: nothing pre-dates 0.2.0
                     cfg.save(&data_dir)?;
                     place.set_root(cfg.path.clone());
                 }
@@ -196,6 +205,7 @@ impl Library {
             ids: HashMap::new(),
             mtimes: HashMap::new(),
             rejected: HashMap::new(),
+            cannot_mark: false,
             last_scan_at: None,
             last_error: None,
             leftovers: Vec::new(),
@@ -206,7 +216,7 @@ impl Library {
     }
 
     pub fn status(&self) -> LibraryStatus {
-        reconcile::build_status(&lock(&self.inner.st))
+        self.inner.status_of(&lock(&self.inner.st))
     }
 
     /// One scan pass now, on the calling thread (the worker and the tests both use this).

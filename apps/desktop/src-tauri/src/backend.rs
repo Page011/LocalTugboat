@@ -16,12 +16,14 @@ use serde::{Deserialize, Serialize};
 use tugboat_core::{
     events::{Event, PairingEvent, SyncStatus},
     facade::{device_id_from_secret, NetworkConfig},
-    names, ActivityEntry, Clock, Core, CoreConfig, DeviceId, FolderId, FolderView, ItemId, ItemQuery, ItemView, Page, Role, Settings, SystemClock,
+    names, ActivityEntry, Clock, Core, CoreConfig, DeviceId, FolderId, FolderKind, FolderView, ItemId, ItemQuery, ItemView, Page, Role, Settings, SystemClock,
+    INBOX_ID,
 };
 use tokio::{sync::broadcast, task::JoinHandle};
 use ts_rs::TS;
 
 use crate::{
+    drop::{self, DropLine, DropProgress, DropReport, DropState, DropTarget, NativeDrop},
     error::{CmdError, CmdResult},
     firewall::{self, FirewallInfo},
     keys::{self, KeyStore},
@@ -47,6 +49,12 @@ pub mod ev {
     pub const RESYNC: &str = "resync";
     /// `TrayState`.
     pub const TRAY: &str = "tray-state";
+    /// `DropState`: files dragged over the window (the overlay names the target).
+    pub const DROP_STATE: &str = "drop-state";
+    /// `DropProgress`: how far the file being copied is.
+    pub const DROP_PROGRESS: &str = "drop-progress";
+    /// `DropReport`: what the drop did.
+    pub const DROP_RESULT: &str = "drop-result";
 }
 
 /// Where backend events go: the Tauri window, or a list in a test.
@@ -161,6 +169,12 @@ pub struct Backend {
     bind: Mutex<SocketAddr>,
     network_error: Mutex<Option<String>>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
+    /// The folder the gallery is showing (None = Inbox), set by the UI. Only a folder id: never a path.
+    drop_view: Mutex<Option<FolderId>>,
+    /// The target named by the overlay at the moment files entered the window.
+    drop_locked: Mutex<Option<DropTarget>>,
+    /// One drop copies at a time; a second waits its turn.
+    drop_run: Mutex<()>,
 }
 
 impl Backend {
@@ -213,8 +227,18 @@ impl Backend {
             bind: Mutex::new(SocketAddr::from(([0, 0, 0, 0], 0))),
             network_error: Mutex::new(None),
             tasks: Mutex::new(Vec::new()),
+            drop_view: Mutex::new(None),
+            drop_locked: Mutex::new(None),
+            drop_run: Mutex::new(()),
         });
 
+        // A quit during a drop leaves its temp copy in `.tugboat`: remove it.
+        if let Some(root) = library.root() {
+            let n = drop::clean_stale(&root);
+            if n > 0 {
+                tracing::info!("removed {n} unfinished drop copies");
+            }
+        }
         shared.set_tray(&core.status());
         *lock(&backend.worker) = Some(library.start());
         backend.restart_network().await;
@@ -315,14 +339,17 @@ impl Backend {
         Ok(self.core.activity(before, limit.clamp(1, 500))?)
     }
 
-    /// The file of a held item, for "open" and "show in folder". Only a photo or video that
-    /// Core holds, inside the library or the Bin, is ever handed to the shell: the id comes
-    /// from the webview, the path never does.
+    /// The file of a held item, for "open" and "show in folder". Only a file that Core holds,
+    /// inside the library or the Bin, whose name is not an always-refused one, is ever handed to the
+    /// shell: the id comes from the webview, the path never does. Windows still applies its own
+    /// "downloaded from another computer" check to a received program (the shell is asked, never
+    /// told to skip the zone check).
     pub fn item_path(&self, id: ItemId) -> CmdResult<PathBuf> {
         let view = self.core.item(id)?.ok_or_else(|| CmdError::new("not_found", "ITEM NOT FOUND"))?;
         let path = PathBuf::from(view.path.ok_or_else(|| CmdError::new("not_held", "FILE IS NOT ON THIS PC"))?);
         let in_library = self.library.root().is_some_and(|r| is_inside(&r, &path));
-        if !(in_library || is_inside(&self.paths.bin_dir, &path)) || names::ext_family(path.extension().and_then(|e| e.to_str()).unwrap_or("")).is_none() {
+        let file_name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        if !(in_library || is_inside(&self.paths.bin_dir, &path)) || names::is_refused_name(&file_name) {
             return Err(CmdError::new("forbidden", "THAT FILE CANNOT BE OPENED"));
         }
         if !path.is_file() {
@@ -417,6 +444,65 @@ impl Backend {
         if let Some(w) = lock(&self.worker).as_ref() {
             w.request_scan(true);
         }
+    }
+
+    // ---------- drag and drop ----------
+
+    /// The gallery tells which folder it shows (None = All = Inbox). Called on every change, and with
+    /// None when the gallery is not on screen, so a drop on another screen says "Copy to Inbox".
+    pub fn drop_target_set(&self, folder: Option<FolderId>) {
+        *lock(&self.drop_view) = folder;
+    }
+
+    /// The folder a drop would land in right now: the viewed one when it is still a live folder,
+    /// else Inbox.
+    pub fn drop_target(&self) -> CmdResult<DropTarget> {
+        let live = self.core.live_folders()?;
+        let want = *lock(&self.drop_view);
+        let pick = want.and_then(|w| live.iter().find(|(id, _, _)| *id == w)).or_else(|| live.iter().find(|(id, kind, _)| *id == INBOX_ID || *kind == FolderKind::Inbox));
+        let (id, kind, name) = pick.cloned().ok_or_else(|| CmdError::new("not_found", "INBOX NOT FOUND"))?;
+        Ok(DropTarget { id, kind, name })
+    }
+
+    /// Files entered the window: fix the target now (the overlay names it) and tell the overlay.
+    pub fn drop_enter(&self, paths: &[PathBuf]) {
+        let (files, folders) = drop::count_kinds(paths);
+        match self.drop_target() {
+            Ok(t) => {
+                let state = DropState::Enter { files, folders, target_name: t.name.clone() };
+                *lock(&self.drop_locked) = Some(t);
+                self.shared.emit(ev::DROP_STATE, &state);
+            }
+            Err(e) => self.shared.emit(ev::CORE, &Event::Error { kind: "drop".into(), message: e.message }),
+        }
+    }
+
+    pub fn drop_leave(&self) {
+        *lock(&self.drop_locked) = None;
+        self.shared.emit(ev::DROP_STATE, &DropState::Leave);
+    }
+
+    /// Files were dropped: copy them (blocking: call off the UI thread). Always ends with one `drop-result`.
+    pub fn drop_files(&self, files: NativeDrop) -> DropReport {
+        let _turn = lock(&self.drop_run);
+        let locked = lock(&self.drop_locked).take();
+        self.shared.emit(ev::DROP_STATE, &DropState::Leave);
+        let report = match locked.map(Ok).unwrap_or_else(|| self.drop_target()) {
+            Ok(target) => {
+                let shared = self.shared.clone();
+                let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    drop::copy_dropped(&self.library, files, &target, &mut |p: DropProgress| shared.emit(ev::DROP_PROGRESS, &p))
+                }));
+                run.unwrap_or_else(|_| DropReport {
+                    folder_name: target.name.clone(),
+                    failed: vec![DropLine { name: String::new(), reason: "COPY FAILED - internal error, see the log".into() }],
+                    ..Default::default()
+                })
+            }
+            Err(e) => DropReport { failed: vec![DropLine { name: String::new(), reason: format!("COPY FAILED - {}", e.message) }], ..Default::default() },
+        };
+        self.shared.emit(ev::DROP_RESULT, &report);
+        report
     }
 
     // ---------- firewall ----------

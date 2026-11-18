@@ -144,7 +144,9 @@ object UiLogic {
         if (paired && perms != null && !perms.localNetwork) {
             out += BannerUi(BannerId.LOCAL_NETWORK, "LOCAL NETWORK BLOCKED - sync cannot work", "Allow", Level.BLOCKER)
         }
-        if (paired && ui.storageLow) out += BannerUi(BannerId.STORAGE, "PHONE STORAGE LOW - downloads from the PC wait", null, Level.BLOCKER)
+        // The core enforces the guard and says when it holds downloads back: the banner follows the core, not the free-bytes guess.
+        val st = ui.status
+        if (paired && st != null && st.storageLow) out += BannerUi(BannerId.STORAGE, Texts.storageLow(st.downloading), null, Level.BLOCKER)
         ui.stoppedGapFromMs?.let { out += BannerUi(BannerId.STOPPED, Texts.stoppedAt(it, zone), "Fix", Level.WARNING) }
         if (paired && perms != null && !perms.notifications) {
             out += BannerUi(BannerId.NOTIFICATIONS, "Notifications off: sync state shows only in Tugboat", "Allow", Level.WARNING)
@@ -188,6 +190,13 @@ object UiLogic {
         val r = Math.round(ratio * 10) / 10f
         return if (r == r.toInt().toFloat()) "${r.toInt()}x" else "${r}x"
     }
+
+    /**
+     * Screen orientation request while the camera screen runs: locked at the current orientation during a recording
+     * (a rotation would recreate the activity and end the video), free otherwise.
+     */
+    fun recordingOrientation(recording: Boolean): Int =
+        if (recording) android.content.pm.ActivityInfo.SCREEN_ORIENTATION_LOCKED else android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
 
     /** Recording clock: "0:07", "12:30", "1:02:03". */
     fun clock(ms: Long): String {
@@ -261,14 +270,25 @@ object UiLogic {
     /** Furthest the zoomed photo may be dragged from centre on one axis: its edge stops at the screen edge. */
     fun panLimit(scale: Float, extent: Float) = if (scale <= 1f) 0f else extent * (scale - 1f) / 2f
 
-    class CellUi(val label: String, val kept: Boolean, val video: Boolean, val waiting: Boolean)
+    class CellUi(val label: String, val kept: Boolean, val video: Boolean, val file: Boolean)
 
-    /** Label and badges under one thumbnail. */
+    /** Label and badges under one thumbnail or file tile. A Bin item that never reached the PC says so. */
     fun cell(item: ItemInfo, nowMs: Long, binDays: UInt, bin: Boolean): CellUi {
-        val label = fileNote(item.local, bin) ?: Texts.expiryLabel(item.state, nowMs, binDays)
+        val base = fileNote(item.local, bin) ?: Texts.expiryLabel(item.state, nowMs, binDays)
+        val label = if (bin && item.neverReachedPeer) "$base - ${Texts.NOT_ON_PC}" else base
         val kept = item.pinned || item.state is uniffi.tugboat_ffi.ItemStateInfo.Kept || item.state is uniffi.tugboat_ffi.ItemStateInfo.FolderKeep
-        return CellUi(label, kept, item.kind == MediaKind.VIDEO, item.state is uniffi.tugboat_ffi.ItemStateInfo.Waiting)
+        return CellUi(label, kept, item.kind == MediaKind.VIDEO, item.kind == MediaKind.FILE)
     }
+
+    /** Spoken name of a tile or page: "Photo", "Video" or "File". */
+    fun kindWord(k: MediaKind): String = when (k) {
+        MediaKind.IMAGE -> "Photo"
+        MediaKind.VIDEO -> "Video"
+        MediaKind.FILE -> "File"
+    }
+
+    /** Share and Open need the file on this phone AND outside the Bin (the provider serves items/ only). */
+    fun canOpen(item: ItemInfo, bin: Boolean) = !bin && fileHeld(item)
 
     /** "17 Nov, 10:30" in the phone's own zone and language. */
     fun capturedAt(ms: Long, zone: java.time.ZoneId, locale: java.util.Locale = java.util.Locale.getDefault()): String =

@@ -3,7 +3,8 @@
   import { thumbUrl } from "./api";
   import type { ItemView } from "./api";
   import Chip from "./Chip.svelte";
-  import { fmtSize, type Label } from "./format";
+  import { fileIcon, itemMeta, kindText, peerNote, type Label } from "./format";
+  import { fileIcons } from "./icons";
 
   let {
     item,
@@ -25,7 +26,10 @@
 
   // A missing thumbnail (404: nothing held yet, or a format the Shell cannot render) shows an icon.
   let failed = $state(false);
-  const Kind = $derived(item.kind === "video" ? Film : ImageIcon);
+  // Only photos and videos have thumbnails; any other file is a tile with an icon for its type (no thumbnail request at all).
+  const isFile = $derived(item.kind === "file");
+  const Kind = $derived(item.kind === "video" ? Film : isFile ? fileIcons[fileIcon(item.ext)] : ImageIcon);
+  const note = $derived(peerNote(item));
 </script>
 
 <button
@@ -33,7 +37,7 @@
   class:selected
   role="option"
   aria-selected={selected}
-  aria-label="{item.name}, {item.kind}, {label.text}"
+  aria-label="{item.name}, {kindText(item)}, {label.text}{note ? `, ${note}` : ''}"
   title={item.name}
   data-i={index}
   {tabindex}
@@ -42,14 +46,16 @@
   ondblclick={onopen}
 >
   <span class="thumb">
-    {#if !failed}
+    {#if isFile}
+      <Kind size={40} aria-hidden="true" />
+    {:else if !failed}
       <img src={thumbUrl(item.id)} alt="" loading="lazy" draggable="false" onerror={() => (failed = true)} />
     {:else}
       <Kind size={28} aria-hidden="true" />
     {/if}
   </span>
   <span class="name">{item.name}</span>
-  <span class="meta"><Kind size={12} aria-hidden="true" /> {item.kind === "video" ? "Video" : "Photo"}, {fmtSize(item.size)}</span>
+  <span class="meta"><Kind size={12} aria-hidden="true" /> {itemMeta(item)}{#if note}<span class="peer"> {note}</span>{/if}</span>
   <Chip {label} />
 </button>
 
@@ -105,8 +111,16 @@
     font-weight: 600;
   }
   .meta {
+    max-width: calc(100% - 16px);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
     color: var(--fg-muted);
     font-size: 12px;
+  }
+  .peer {
+    color: var(--warn);
+    font-weight: 600;
   }
   .tile.selected .meta {
     color: var(--fg-muted);

@@ -160,9 +160,9 @@ private fun Badge(icon: Int) {
 private fun ItemCell(item: ItemInfo, cell: UiLogic.CellUi, onClick: () -> Unit) {
     Box(
         Modifier.aspectRatio(1f).clip(RoundedCornerShape(8.dp)).clickable(role = Role.Button, onClick = onClick)
-            .described("${if (cell.video) "Video" else "Photo"}, ${cell.label}"),
+            .described("${UiLogic.kindWord(item.kind)}, ${if (cell.file) FileRules.displayName(item.name, item.ext) + ", " else ""}${cell.label}"),
     ) {
-        ThumbImage(item.thumbPath, null, Modifier.fillMaxSize())
+        if (cell.file) FileFace(item, Modifier.fillMaxSize()) else ThumbImage(item.thumbPath, null, Modifier.fillMaxSize())
         Row(Modifier.align(Alignment.TopStart).padding(4.dp), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
             if (cell.video) Badge(R.drawable.ic_videocam)
             if (cell.kept) Badge(R.drawable.ic_star_fill1)
@@ -196,10 +196,16 @@ fun BinScreen(vm: SnapViewModel, ui: UiState) {
                             Modifier.fillMaxWidth().defaultMinSize(minHeight = 72.dp).clickable(role = Role.Button) { vm.nav.go(Route.Viewer(null, true, item.id)) }.padding(horizontal = 16.dp, vertical = 6.dp),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
-                            ThumbImage(item.thumbPath, null, Modifier.size(56.dp).clip(RoundedCornerShape(8.dp)))
+                            if (cell.file) {
+                                Box(Modifier.size(56.dp).clip(RoundedCornerShape(8.dp)).background(MaterialTheme.colorScheme.surfaceVariant), contentAlignment = Alignment.Center) {
+                                    Ico(fileIcon(item.ext), null, tint = MaterialTheme.colorScheme.onSurfaceVariant, size = 28)
+                                }
+                            } else {
+                                ThumbImage(item.thumbPath, null, Modifier.size(56.dp).clip(RoundedCornerShape(8.dp)))
+                            }
                             Spacer(Modifier.width(12.dp))
                             Column(Modifier.weight(1f)) {
-                                Text(item.name, style = MaterialTheme.typography.bodyLarge, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                Text(if (cell.file) FileRules.displayName(item.name, item.ext) else item.name, style = MaterialTheme.typography.bodyLarge, maxLines = 1, overflow = TextOverflow.Ellipsis)
                                 Text(cell.label, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                             }
                             TextButton(onClick = { scope.launchRestore(vm, model, item.id) }, modifier = Modifier.defaultMinSize(minHeight = Touch)) {

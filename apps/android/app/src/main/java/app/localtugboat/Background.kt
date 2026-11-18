@@ -22,7 +22,7 @@ object ServiceGate {
             val p = core.phone()
             val wanted = p.pairedPc() != null && p.settings().stayConnected
             KLog.log(c, "start check ($why): wanted=$wanted running=${core.serviceRunning}")
-            if (wanted && !core.serviceRunning) SnapService.start(c)
+            if (wanted && !core.serviceRunning) SnapService.start(c, why)
             wanted
         } catch (e: Exception) {
             core.reportError("start check ($why) failed: ${e.message}")
@@ -69,7 +69,7 @@ class CatchUpWorker(c: Context, p: WorkerParameters) : CoroutineWorker(c, p) {
             if (p.settings().stayConnected && !core.serviceRunning) {
                 if (Perms.batteryExempt(app)) {
                     KLog.log(app, "worker: service not running, restarting it")
-                    SnapService.start(app)
+                    SnapService.start(app, "worker")
                 } else {
                     KLog.log(app, "worker: service not running and not exempt from battery optimisation, cannot restart it")
                 }

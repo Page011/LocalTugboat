@@ -280,7 +280,7 @@ async fn s16_wrong_bytes_never_become_a_file_or_a_receipt() {
 }
 
 // S17: the record says .jpg, the bytes (with a valid hash) are a Windows executable. The phone
-// refuses it: nothing is stored, no receipt, so the PC never expires the item.
+// refuses it: nothing is stored, no receipt, and the PC's Bin says the phone never got it.
 #[tokio::test(flavor = "multi_thread")]
 async fn s17_executable_named_jpg_is_refused() {
     let r = Rig::new().await;
@@ -303,6 +303,8 @@ async fn s17_executable_named_jpg_is_refused() {
     assert!(r.phone.has_activity(ActivityAction::Refused));
     r.pc.clock.advance(30 * HOUR);
     r.pc.core.tick().unwrap();
-    assert_eq!(r.pc.view(id).unwrap().state, tugboat_core::ItemState::Waiting, "the PC keeps it");
+    // The PC no longer holds it back (0.2.0): it expires on time, and the Bin says the phone never got it.
+    assert!(matches!(r.pc.view(id).unwrap().state, tugboat_core::ItemState::Expired { .. }));
+    assert!(r.pc.bin().iter().any(|v| v.id == id && v.never_reached_peer), "the phone refused it: the PC's Bin says so");
     r.shutdown().await;
 }

@@ -10,7 +10,12 @@ message: string | null,
 /**
  * Set when the library folder looks cloud-synced.
  */
-cloud_warning: string | null, not_synced: Array<NotSyncedFile>, last_scan_at: number | null, 
+cloud_warning: string | null, not_synced: Array<NotSyncedFile>, 
+/**
+ * The library drive cannot keep the Mark-of-the-Web (FAT, exFAT): files from the phone wait
+ * instead of being saved unmarked.
+ */
+cannot_mark: boolean, last_scan_at: number | null, 
 /**
  * The first error of the last scan (an unreadable folder, a locked file), if any.
  */

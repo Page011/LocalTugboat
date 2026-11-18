@@ -397,7 +397,7 @@ impl Session {
             let sp = tx.savepoint()?;
             match merge::apply_remote(&sp, self.self_id, self.peer, r, now) {
                 Ok(a) => {
-                    // A new receipt moves every item with that hash (Waiting -> Live).
+                    // A new receipt changes what the UI shows for every item with that hash (the waiting count, "NOT ON PC" in the Bin); expiry itself never reads it.
                     let by_receipt = match a.changed {
                         Some(EntityKey::Receipt { hash, .. }) => store::item_ids_where(&sp, &format!("blob_hash = x'{}'", hex::encode(hash.0)))?,
                         _ => Vec::new(),

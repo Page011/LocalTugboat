@@ -7,7 +7,10 @@
 //! fixes the file). Ops never emit events; the facade does.
 //!
 //! Rules per op (PLAN Folders and expiry):
-//! O1 add_local_file: sniff the head (names::check_media) -> NotMedia refuses the file;
+//! O1 add_local_file: an always-refused name -> Refused before anything is read; the head is
+//!    classified (names::classify): a photo/video extension must match its bytes (else NotMedia,
+//!    a renamed program never poses as a photo), any other safe extension or none is a plain File
+//!    (no thumbnail, nothing promoted); a file over Settings.max_blob_bytes -> Refused("TOO LARGE ...");
 //!    hash with streamed BLAKE3 (never whole file in memory); create an ItemRecord with all
 //!    groups at ONE new version; location = (folder or Inbox, entered_at = now);
 //!    placement.adopt; file_ref; own receipt (hash, self, now) logged as a change;
@@ -22,8 +25,9 @@
 //!    deleted -> else Invalid. Same folder -> no-op. Activity Moved "from -> to". An item in
 //!    the Bin must be restored first -> Invalid.
 //! O4 rename_item: name group; name cleaned with names::clean_stem rules for the stem
-//!    (display name must be storable on the PC); the stored name is "<stem>.<ext>";
-//!    Activity Renamed.
+//!    (display name must be storable on the PC); the stored name is "<stem>.<ext>" ("<stem>"
+//!    when the item has no extension); the extension is the record's own and never changes; a
+//!    result that is an always-refused name (stem "desktop" + ext "ini") -> Refused; Activity Renamed.
 //! O5 delete_item: deleted = Some(now); if pinned, also pinned = false in the same op
 //!    (a user delete is the later intent). Activity Deleted. An item already in the Bin is a no-op.
 //! O6 restore_item (PLAN: "Restoring from the Bin puts the item back with a fresh full
@@ -32,8 +36,9 @@
 //!    Local Purged -> Pending ("If only the other device still has the file, it is fetched
 //!    from there"). Not in the Bin -> Invalid. Activity Restored.
 //! O7 content_changed (PC edit): re-hash; same hash -> no-op; else content group with the
-//!    new hash/size (ext unchanged, thumb None until a new one is supplied); own receipt for
-//!    the new hash. Activity Edited. Expiry now waits for the peer's receipt of the new hash.
+//!    new hash/size (kind and ext unchanged, thumb None until a new one is supplied); own receipt for
+//!    the new hash. Activity Edited. A photo/video whose new bytes no longer match -> NotMedia.
+//!    Expiry does not look at receipts (0.2.0): the edit keeps the item's due time.
 //! O8 Folder ops: create (clean_folder_name, retention > 0 or Keep), rename, set_retention
 //!    (folders::retention_preview is the caller's confirmation step), delete (folders F5).
 //!    Default folders: delete -> Invalid; the Keep folder's retention cannot be changed.
@@ -109,13 +114,26 @@ fn folder_name(c: &Connection, id: FolderId) -> String {
     folders::effective_folder(c, id).map(|f| f.name.val).unwrap_or_default()
 }
 
-/// Name-rule failures that mean "not a photo or video" refuse the file; the rest are name errors.
+/// Name-rule failures: an always-refused name is `Refused` (final, visible, never retried); a
+/// photo/video extension whose content is not a photo or video is `NotMedia` (a renamed
+/// program); the rest are name errors.
 fn media_err(e: names::NameError) -> CoreError {
     match e {
-        names::NameError::ExtensionNotAllowed(_) | names::NameError::NotMedia | names::NameError::MagicMismatch { .. } => {
+        names::NameError::Refused(_) => CoreError::Refused(names::REFUSED_TEXT.to_string()),
+        names::NameError::NotMedia | names::NameError::MagicMismatch { .. } | names::NameError::KindMismatch(_) => {
             CoreError::NotMedia(e.to_string())
         }
         other => CoreError::Name(other),
+    }
+}
+
+/// "TOO LARGE - over 16 GB": the one-line refusal for a file above `Settings.max_blob_bytes`.
+pub fn too_large_text(max_blob_bytes: u64) -> String {
+    let gb = max_blob_bytes / (1024 * 1024 * 1024);
+    if gb >= 1 {
+        format!("TOO LARGE - over {gb} GB")
+    } else {
+        format!("TOO LARGE - over {} MB", max_blob_bytes / (1024 * 1024))
     }
 }
 
@@ -136,7 +154,8 @@ fn read_head(path: &Path) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Point `file_ref` at a new path, keeping the NTFS identity (a rename on one volume keeps it).
+/// Point `file_ref` at a new path, keeping the NTFS identity (a rename on one volume keeps it)
+/// and the recorded modified time (a move keeps the file's bytes and mtime).
 fn update_path(c: &Connection, item: ItemId, path: &Path) -> Result<()> {
     let old = store::get_file_ref(c, item)?;
     store::put_file_ref(
@@ -146,6 +165,7 @@ fn update_path(c: &Connection, item: ItemId, path: &Path) -> Result<()> {
             path: path.to_string_lossy().into_owned(),
             volume_serial: old.as_ref().and_then(|o| o.volume_serial),
             file_id: old.as_ref().and_then(|o| o.file_id),
+            mtime_ms: old.as_ref().and_then(|o| o.mtime_ms),
         },
     )
 }
@@ -186,23 +206,35 @@ pub fn hash_file(path: &Path) -> Result<(BlobHash, u64)> {
 
 // ---------- O1 ----------
 
-/// O1. `thumb` = the facade's copy of `f.thumb` (see NewLocalFile::thumb).
+/// O1. `thumb` = the facade's copy of `f.thumb` (see NewLocalFile::thumb); dropped for a File.
 pub fn add_local_file(c: &mut Connection, ctx: &Ctx<'_>, f: &NewLocalFile, thumb: Option<Thumb>) -> Result<ItemId> {
+    // Always-refused names are turned away before anything is read.
+    if names::is_refused_name(&f.name) {
+        return Err(CoreError::Refused(names::REFUSED_TEXT.to_string()));
+    }
     let head = read_head(&f.src)?;
-    // Extension: from the name when it has one; a name without one is typed by its bytes.
-    let name_ext = f.name.rsplit_once('.').map(|(_, e)| e.to_string()).filter(|e| !e.is_empty());
-    let ext_in = match name_ext {
-        Some(e) => e,
-        None => names::sniff(&head).map(|fam| fam.default_ext().to_string()).ok_or_else(|| CoreError::NotMedia(names::NameError::NotMedia.to_string()))?,
-    };
-    let (ext, family) = names::check_media(&ext_in, &head).map_err(media_err)?;
+    // Extension: the name's own (no promotion: "Makefile" with JPEG bytes stays a plain file).
+    let name = names::prep(&f.name);
+    let (kind, ext) = names::classify(&names::ext_of(&name), &head).map_err(media_err)?;
+    // A file over the size limit is refused here, once and visibly: the other device would refuse
+    // it and ask again for ever.
+    let max = store::load_settings(c)?.max_blob_bytes;
+    let len = std::fs::metadata(&f.src).map_err(|e| CoreError::io(&f.src, e))?.len();
+    if len > max {
+        return Err(CoreError::Refused(too_large_text(max)));
+    }
     let (hash, size) = hash_file(&f.src)?;
+    let thumb = if kind == MediaKind::File { None } else { thumb };
 
     let folder = live_folder(c, f.folder.unwrap_or(INBOX_ID))?;
     let id = ItemId::new(ctx.now);
-    let stem: String = names::strip_ext(&f.name, &ext).chars().filter(|ch| !ch.is_control()).take(250).collect();
+    let stem: String = names::strip_ext(&name, &ext).chars().take(250).collect();
     let stem = if stem.trim().is_empty() { names::fallback_stem(f.captured_at) } else { stem };
-    let display = format!("{stem}.{ext}");
+    let display = names::join_ext(&stem, &ext);
+    // The record's name is what the other device builds its file name from.
+    if names::is_refused_name(&display) {
+        return Err(CoreError::Refused(names::REFUSED_TEXT.to_string()));
+    }
 
     // Place the file first: no record without a file.
     let mut target = placement_target(id, hash, &display, &ext, f.captured_at, &folder);
@@ -218,7 +250,7 @@ pub fn add_local_file(c: &mut Connection, ctx: &Ctx<'_>, f: &NewLocalFile, thumb
             origin: ctx.self_id,
             geo: f.geo,
             name: Versioned { v, val: display.clone() },
-            content: Versioned { v, val: Content { hash, size, kind: family.kind(), ext: ext.clone(), thumb: thumb.clone() } },
+            content: Versioned { v, val: Content { hash, size, kind, ext: ext.clone(), thumb: thumb.clone() } },
             location: Versioned { v, val: Location { folder: folder.id, entered_at: ctx.now } },
             pinned: Versioned { v, val: false },
             deleted: Versioned { v, val: None },
@@ -226,7 +258,7 @@ pub fn add_local_file(c: &mut Connection, ctx: &Ctx<'_>, f: &NewLocalFile, thumb
         store::insert_item(&tx, &rec, LocalFileState::Present, ctx.now)?;
         store::put_file_ref(
             &tx,
-            &store::FileRef { item: id, path: path.to_string_lossy().into_owned(), volume_serial: f.ntfs.map(|n| n.0), file_id: f.ntfs.map(|n| n.1) },
+            &store::FileRef { item: id, path: path.to_string_lossy().into_owned(), volume_serial: f.ntfs.map(|n| n.0), file_id: f.ntfs.map(|n| n.1), mtime_ms: None },
         )?;
         log_item(&tx, id, group::ALL, v)?;
         own_receipt(&tx, ctx, hash, v.lamport)?;
@@ -328,7 +360,16 @@ pub fn rename_item(c: &mut Connection, ctx: &Ctx<'_>, id: ItemId, name: &str) ->
         let (rec, _) = load_item(&tx, id)?;
         let ext = rec.content.val.ext.clone();
         let stem = names::clean_stem(names::strip_ext(name, &ext))?;
-        let display = format!("{stem}.{ext}");
+        let display = names::join_ext(&stem, &ext);
+        // A name that would be one of the always-refused ones (stem "desktop" + ext "ini") never starts.
+        if names::is_refused_name(&display) {
+            return Err(CoreError::Refused(names::REFUSED_TEXT.to_string()));
+        }
+        // A plain file without an extension cannot take a photo/video name: it would be placed
+        // under it and open as a photo.
+        if !names::plain_name_ok(&display, &ext) {
+            return Err(media_err(names::NameError::NotMedia));
+        }
         if display == rec.name.val {
             return Ok(());
         }
@@ -420,11 +461,20 @@ pub fn content_changed(c: &mut Connection, ctx: &Ctx<'_>, id: ItemId, path: &Pat
     if rec.content.val.hash == hash {
         return Ok(());
     }
-    let head = read_head(path)?;
-    let (_, family) = names::check_media(&rec.content.val.ext, &head).map_err(media_err)?;
+    // The kind never changes with an edit: a File stays a File; a photo or video whose new bytes
+    // no longer match its type is refused as NotMedia (a program saved over a photo).
+    let kind = rec.content.val.kind;
+    if kind != MediaKind::File {
+        let head = read_head(path)?;
+        names::verify_received(kind, &rec.content.val.ext, &head).map_err(media_err)?;
+    }
+    let max = store::load_settings(&tx)?.max_blob_bytes;
+    if size > max {
+        return Err(CoreError::Refused(too_large_text(max)));
+    }
     let v = store::next_version(&tx, ctx.self_id)?;
     let mut new = rec.clone();
-    new.content = Versioned { v, val: Content { hash, size, kind: family.kind(), ext: rec.content.val.ext.clone(), thumb: None } };
+    new.content = Versioned { v, val: Content { hash, size, kind, ext: rec.content.val.ext.clone(), thumb: None } };
     store::update_item(&tx, &new)?;
     log_item(&tx, id, group::CONTENT, v)?;
     own_receipt(&tx, ctx, hash, v.lamport)?;
@@ -707,6 +757,11 @@ pub fn blob_committed(c: &mut Connection, ctx: &Ctx<'_>, id: ItemId, hash: BlobH
     }
     store::set_local_state(&tx, id, LocalFileState::Present, ctx.now)?;
     update_path(&tx, id, path)?;
+    // A freshly downloaded file has no recorded modified time yet (the PC watcher stamps it).
+    if let Some(mut fr) = store::get_file_ref(&tx, id)? {
+        fr.mtime_ms = None;
+        store::put_file_ref(&tx, &fr)?;
+    }
     own_receipt(&tx, ctx, hash, store::max_lamport(&tx)?)?;
     activity::log(&tx, ctx.now, Some(from), Some(id), ActivityAction::Received, &folder_name(&tx, rec.location.val.folder))?;
     tx.commit()?;
@@ -792,7 +847,7 @@ mod tests {
         assert!(src.exists(), "source left for the caller");
         // Own receipt exists, is logged, and does not qualify as a PEER receipt.
         assert!(store::get_receipt(&r.db.conn, rec.content.val.hash, p()).unwrap().is_some());
-        assert_eq!(store::peer_receipt_seen_at(&r.db.conn, rec.content.val.hash).unwrap(), None);
+        assert!(!store::peer_has_receipt(&r.db.conn, rec.content.val.hash, f()).unwrap(), "no receipt from the peer");
         assert_eq!(log_rows(&r.db.conn), vec![row("item", "all"), row("receipt", "all")]);
         assert_eq!(r.actions(), vec![ActivityAction::Captured]);
         // Two shares of the same bytes: two items, one receipt row.
@@ -801,15 +856,16 @@ mod tests {
         assert_eq!(groups(&r.db.conn, "receipt").len(), 1, "no second receipt for the same hash");
     }
 
-    // L19: exe renamed .jpg -> NotMedia, nothing stored anywhere.
+    // L19: an exe renamed .jpg -> NotMedia, nothing stored anywhere. An exe under its own name is
+    // simply a file now (any file type syncs) and never gets a photo kind.
     #[test]
-    fn add_refuses_non_media_and_leaves_no_trace() {
+    fn add_refuses_a_program_posing_as_a_photo_and_leaves_no_trace() {
         let mut r = Rig::new();
         let src = r.dir.path().join("evil.jpg");
         std::fs::write(&src, b"MZ\x90\0\x03\0\0\0\x04\0\0\0\xff\xff\0\0").unwrap();
         let now = r.now();
         let mk = |name: &str, src: &Path| NewLocalFile { src: src.to_path_buf(), name: name.into(), folder: None, captured_at: now, geo: None, thumb: None, how: AddKind::Added, ntfs: None };
-        for name in ["evil.jpg", "evil.exe", "evil"] {
+        for name in ["evil.jpg", "EVIL.JPEG", "evil.png", "evil.mp4", "evil.heic"] {
             let e = r.run(|c, x| add_local_file(c, x, &mk(name, &src), None)).unwrap_err();
             assert!(matches!(e, CoreError::NotMedia(_)), "{name}: {e}");
         }
@@ -819,10 +875,16 @@ mod tests {
         // Missing source: an Io error, not a panic.
         let gone = r.dir.path().join("gone.jpg");
         assert!(matches!(r.run(|c, x| add_local_file(c, x, &mk("gone.jpg", &gone), None)), Err(CoreError::Io { .. })));
-        // A name without an extension is typed by its bytes.
+        // The same bytes under honest names are plain files.
+        let id = r.run(|c, x| add_local_file(c, x, &mk("evil.exe", &src), None)).unwrap();
+        assert_eq!((r.rec(id).content.val.kind, r.rec(id).content.val.ext.clone()), (MediaKind::File, "exe".to_string()));
+        let id = r.run(|c, x| add_local_file(c, x, &mk("evil", &src), None)).unwrap();
+        assert_eq!((r.rec(id).content.val.kind, r.rec(id).content.val.ext.clone()), (MediaKind::File, String::new()));
+        // A photo with no extension in its name is NOT promoted any more: it stays a plain file.
         let ok = r.write_jpeg("noext");
         let id = r.run(|c, x| add_local_file(c, x, &mk("noext", &ok), None)).unwrap();
-        assert_eq!(r.rec(id).name.val, "noext.jpg");
+        assert_eq!(r.rec(id).name.val, "noext");
+        assert_eq!(r.rec(id).content.val.kind, MediaKind::File);
         // An empty / hostile display name still stores; the record never carries control chars.
         let id = r.run(|c, x| add_local_file(c, x, &mk("a\u{202E}b\0c.JPG", &ok), None)).unwrap();
         assert!(!r.rec(id).name.val.contains('\0'));
@@ -973,9 +1035,10 @@ mod tests {
         assert_eq!(r.rec(id).name.val, "Other.jpg");
     }
 
-    // L20: a PC edit gets a new hash and waits for a NEW receipt even though the old hash had one.
+    // L20: a PC edit gets a new hash. Expiry does not wait for any receipt (0.2.0): the edit keeps
+    // the item's due time, and the new hash simply has no receipt from the peer yet.
     #[test]
-    fn content_change_waits_for_a_new_receipt() {
+    fn content_change_does_not_hold_the_expiry() {
         let mut r = Rig::new();
         let id = r.add("a");
         r.confirm(id);
@@ -994,22 +1057,22 @@ mod tests {
         assert_ne!(rec.content.val.hash, old_hash);
         assert_eq!(rec.content.val.hash.0, *blake3::hash(&bytes).as_bytes());
         assert_eq!(rec.content.val.size, bytes.len() as u64);
+        assert_eq!(rec.content.val.kind, MediaKind::Image, "an edit never changes the kind");
         assert_eq!(rec.content.val.thumb, None);
         assert_eq!(&log_rows(&r.db.conn)[before..], &[row("item", "content"), row("receipt", "all")]);
         assert_eq!(*r.actions().first().unwrap(), ActivityAction::Edited);
-        // Long past the retention: still Waiting, because the peer has not confirmed the new bytes.
-        r.clock.advance(10 * DAY_MS);
-        assert_eq!(state(&r, r.now()), ItemState::Waiting);
-        assert!(r.sweep().to_bin.is_empty());
-        // The peer confirms the new hash: now it expires.
-        store::insert_receipt(&r.db.conn, &ReceiptRecord { hash: rec.content.val.hash, device: f(), received_at: 1 }, r.now()).unwrap();
-        assert!(matches!(state(&r, r.now()), ItemState::Expired { .. }));
+        // The peer has no receipt for the new bytes, and the item still expires on time.
+        assert!(!store::peer_has_receipt(&r.db.conn, rec.content.val.hash, f()).unwrap());
         // Same bytes again: no-op.
         let rec_before = r.rec(id);
         let n = log_rows(&r.db.conn).len();
         r.run(|c, x| content_changed(c, x, id, &path)).unwrap();
         assert_eq!(r.rec(id), rec_before);
         assert_eq!(log_rows(&r.db.conn).len(), n);
+        // Ten days later it expired on time and the sweep bins it.
+        r.clock.advance(10 * DAY_MS);
+        assert!(matches!(state(&r, r.now()), ItemState::Expired { .. }));
+        assert_eq!(r.sweep().to_bin, vec![id]);
     }
 
     #[test]
@@ -1024,48 +1087,131 @@ mod tests {
         assert_eq!(r.rec(id), before);
     }
 
-    // L12: receipt qualification through the whole stack; never paired -> Waiting after 1 year.
+    // 0.2.0: expiry never reads receipts. Through the whole stack: never paired, paired with no
+    // receipt, a receipt from a stranger: the item is binned at its due time in every case.
     #[test]
-    fn nothing_expires_without_a_qualifying_receipt() {
+    fn items_expire_on_time_whatever_the_receipts_say() {
         let dir = tempfile::tempdir().unwrap();
         let pl = crate::placement::AppStorage::new(dir.path().join("s")).unwrap();
         let mut db = Db::open_in_memory().unwrap();
         store::ensure_self(&db.conn, p(), "PC", Role::Pc).unwrap();
-        let mut t = T0;
+        let t = T0;
         let src = dir.path().join("a.jpg");
         std::fs::write(&src, [0xFF, 0xD8, 0xFF, 0xE0, 1, 2, 3]).unwrap();
         let ctx = Ctx { self_id: p(), now: t, placement: &pl };
         let id = add_local_file(&mut db.conn, &ctx, &NewLocalFile { src, name: "a.jpg".into(), folder: None, captured_at: t, geo: None, thumb: None, how: AddKind::Added, ntfs: None }, None).unwrap();
         let hash = store::get_item(&db.conn, id).unwrap().unwrap().0.content.val.hash;
-        // Zero devices ever paired: one year later still Waiting, nothing binned.
-        t += 365 * DAY_MS;
-        let rep = bin::sweep(&mut db.conn, &pl, p(), t).unwrap();
-        assert!(rep.to_bin.is_empty());
         let state = |db: &Db, t| bin::derive_state(&db.conn, &store::get_item(&db.conn, id).unwrap().unwrap().0, t).unwrap();
-        assert_eq!(state(&db, t), ItemState::Waiting);
-        // A receipt from a device we never paired with does not count.
+        // Never paired: live before due, expired at due (it used to wait for ever).
+        assert!(matches!(state(&db, t + 24 * HOUR_MS - 1), ItemState::Live { .. }));
+        assert_eq!(state(&db, t + 24 * HOUR_MS), ItemState::Expired { binned_at: t + 24 * HOUR_MS });
+        // A receipt from a device that was never paired changes nothing.
         store::insert_receipt(&db.conn, &ReceiptRecord { hash, device: f(), received_at: 1 }, t).unwrap();
-        assert_eq!(state(&db, t), ItemState::Waiting);
-        // Pair it: the stored receipt now qualifies (it is the same device).
+        assert_eq!(state(&db, t + 24 * HOUR_MS), ItemState::Expired { binned_at: t + 24 * HOUR_MS });
+        // Paired: still the same state, receipt or not.
         let peer = DeviceRow { id: f(), name: "Phone".into(), is_self: false, role: Role::Phone, paired_at: None, unpaired_at: None, last_seen_at: None, addresses: vec![] };
         pairing_completed(&mut db.conn, &Ctx { now: t, ..ctx }, &peer).unwrap();
-        assert!(matches!(state(&db, t), ItemState::Expired { .. }));
-        // Unpaired but was paired: still qualifies.
-        unpair(&mut db.conn, &Ctx { now: t, ..ctx }, f()).unwrap();
-        assert!(matches!(state(&db, t), ItemState::Expired { .. }));
-        // Re-paired with a NEW key (reinstalled phone): the old key's receipt still counts for the old file...
+        assert_eq!(state(&db, t + 24 * HOUR_MS), ItemState::Expired { binned_at: t + 24 * HOUR_MS });
+        // A year late: the sweep bins it at once; the Bin clock starts then.
+        let late = t + 365 * DAY_MS;
+        let rep = bin::sweep(&mut db.conn, &pl, p(), late).unwrap();
+        assert_eq!(rep.to_bin, vec![id]);
+        assert!(rep.purged.is_empty());
+        // The new phone (re-paired with another key) has never confirmed any file: it is the
+        // "waiting" and "never reached" logic that notices, not the expiry.
         let new_phone = DeviceRow { id: dev(0xCC), ..peer.clone() };
-        pairing_completed(&mut db.conn, &Ctx { now: t, ..ctx }, &new_phone).unwrap();
-        assert!(matches!(state(&db, t), ItemState::Expired { .. }), "PLAN: receipt from a device this one is or was paired with");
-        // ...but a file the old phone never confirmed waits for the NEW key.
-        let src2 = dir.path().join("b.jpg");
-        std::fs::write(&src2, [0xFF, 0xD8, 0xFF, 0xE0, 9, 9]).unwrap();
-        let id2 = add_local_file(&mut db.conn, &Ctx { now: t, ..ctx }, &NewLocalFile { src: src2, name: "b.jpg".into(), folder: None, captured_at: t, geo: None, thumb: None, how: AddKind::Added, ntfs: None }, None).unwrap();
-        let rec2 = store::get_item(&db.conn, id2).unwrap().unwrap().0;
-        let st2 = |db: &Db, t| bin::derive_state(&db.conn, &rec2, t).unwrap();
-        assert_eq!(st2(&db, t + 400 * DAY_MS), ItemState::Waiting);
-        store::insert_receipt(&db.conn, &ReceiptRecord { hash: rec2.content.val.hash, device: dev(0xCC), received_at: 1 }, t).unwrap();
-        assert!(matches!(st2(&db, t + 400 * DAY_MS), ItemState::Expired { .. }));
+        pairing_completed(&mut db.conn, &Ctx { now: late, ..ctx }, &new_phone).unwrap();
+        assert_eq!(bin::missing_at_peer(&db.conn, hash).unwrap(), Some("phone"));
+    }
+
+    // O1/O4/O7 for a file that is not a photo or video.
+    #[test]
+    fn any_file_type_is_added_renamed_and_edited_as_a_plain_file() {
+        let mut r = Rig::new();
+        let now = r.now();
+        let mk = |name: &str, src: &Path, thumb: bool| NewLocalFile { src: src.to_path_buf(), name: name.into(), folder: None, captured_at: now, geo: None, thumb: thumb.then(|| src.to_path_buf()), how: AddKind::Added, ntfs: None };
+        let pdf = r.dir.path().join("src-report");
+        std::fs::write(&pdf, b"%PDF-1.7 body").unwrap();
+        // A thumbnail passed for a File is not stored.
+        let thumb = Thumb { hash: BlobHash([9; 32]), size: 5 };
+        let id = r.run(|c, x| add_local_file(c, x, &mk("Report.PDF", &pdf, true), Some(thumb))).unwrap();
+        let rec = r.rec(id);
+        assert_eq!(rec.content.val.kind, MediaKind::File);
+        assert_eq!(rec.content.val.ext, "pdf");
+        assert_eq!(rec.name.val, "Report.pdf");
+        assert_eq!(rec.content.val.thumb, None, "no thumbnail for a File");
+        assert!(r.path(id).unwrap().exists());
+        // No extension at all, even with JPEG bytes inside: a plain file, not promoted.
+        let jpeg = r.write_jpeg("makefile-body");
+        let id2 = r.run(|c, x| add_local_file(c, x, &mk("Makefile", &jpeg, false), None)).unwrap();
+        let rec2 = r.rec(id2);
+        assert_eq!((rec2.content.val.kind, rec2.content.val.ext.as_str(), rec2.name.val.as_str()), (MediaKind::File, "", "Makefile"));
+        assert_eq!(r.path(id2).unwrap().file_name().unwrap().to_string_lossy(), id2.0.hyphenated().to_string(), "no dot on a file with no extension");
+        // Rename keeps the (empty) extension; a result that is a refused name is refused.
+        r.run(|c, x| rename_item(c, x, id2, "Notes")).unwrap();
+        assert_eq!(r.rec(id2).name.val, "Notes");
+        // ... and it cannot take a photo/video name: the file would be placed under it.
+        for bad in ["holiday.jpg", "clip.MP4"] {
+            assert!(matches!(r.run(|c, x| rename_item(c, x, id2, bad)), Err(CoreError::NotMedia(_))), "{bad}");
+        }
+        assert_eq!(r.rec(id2).name.val, "Notes");
+        let ini = r.dir.path().join("src-ini");
+        std::fs::write(&ini, b"[x]").unwrap();
+        let id3 = r.run(|c, x| add_local_file(c, x, &mk("settings.ini", &ini, false), None)).unwrap();
+        assert!(matches!(r.run(|c, x| rename_item(c, x, id3, "desktop")), Err(CoreError::Refused(_))));
+        assert_eq!(r.rec(id3).name.val, "settings.ini");
+        // Edit: a File stays a File whatever the new bytes look like.
+        let path = r.path(id).unwrap();
+        std::fs::write(&path, [0xFF, 0xD8, 0xFF, 0xE0, 7]).unwrap();
+        r.run(|c, x| content_changed(c, x, id, &path)).unwrap();
+        assert_eq!(r.rec(id).content.val.kind, MediaKind::File);
+        // A zero-byte file is a file.
+        let empty = r.dir.path().join("src-empty");
+        std::fs::write(&empty, b"").unwrap();
+        let id4 = r.run(|c, x| add_local_file(c, x, &mk("empty.txt", &empty, false), None)).unwrap();
+        assert_eq!(r.rec(id4).content.val.size, 0);
+    }
+
+    // The always-refused names, before anything is read or written.
+    #[test]
+    fn refused_names_never_become_items() {
+        let mut r = Rig::new();
+        let src = r.dir.path().join("src-x");
+        std::fs::write(&src, b"anything").unwrap();
+        let now = r.now();
+        let mk = |name: &str| NewLocalFile { src: src.clone(), name: name.into(), folder: None, captured_at: now, geo: None, thumb: None, how: AddKind::Added, ntfs: None };
+        for name in ["x.lnk", "X.URL", "a.scf", "b.library-ms", "c.searchConnector-ms", "desktop.ini", "Desktop.Ini.", "autorun.inf ", "x.lnk::$DATA", "x.LNK. "] {
+            let e = r.run(|c, x| add_local_file(c, x, &mk(name), None)).unwrap_err();
+            assert!(matches!(&e, CoreError::Refused(t) if t == names::REFUSED_TEXT), "{name}: {e}");
+            assert_eq!(e.kind(), "refused");
+        }
+        assert_eq!(store::count_items(&r.db.conn).unwrap(), 0);
+        assert_eq!(store::head_seq(&r.db.conn).unwrap(), 0, "nothing logged");
+        assert!(std::fs::read_dir(r.pl.root.join("items")).unwrap().next().is_none());
+        // A missing source with a refused name is still "refused", not an io error: no read happens.
+        let gone = r.dir.path().join("gone.lnk");
+        assert!(matches!(r.run(|c, x| add_local_file(c, x, &mk_at(&gone, "gone.lnk", now), None)), Err(CoreError::Refused(_))));
+    }
+
+    fn mk_at(src: &Path, name: &str, now: i64) -> NewLocalFile {
+        NewLocalFile { src: src.to_path_buf(), name: name.into(), folder: None, captured_at: now, geo: None, thumb: None, how: AddKind::Added, ntfs: None }
+    }
+
+    // A file above Settings.max_blob_bytes is refused here, once, with a one-line reason.
+    #[test]
+    fn a_file_over_the_size_limit_is_refused_and_leaves_no_trace() {
+        let mut r = Rig::new();
+        store::save_settings(&r.db.conn, &Settings { max_blob_bytes: 1024 * 1024 * 1024, ..Settings::default() }).unwrap();
+        let src = r.dir.path().join("big.bin");
+        let f = std::fs::File::create(&src).unwrap();
+        f.set_len(1024 * 1024 * 1024 + 1).unwrap();
+        drop(f);
+        let now = r.now();
+        let e = r.run(|c, x| add_local_file(c, x, &mk_at(&src, "big.bin", now), None)).unwrap_err();
+        assert!(matches!(&e, CoreError::Refused(t) if t == "TOO LARGE - over 1 GB"), "{e}");
+        assert_eq!(store::count_items(&r.db.conn).unwrap(), 0);
+        assert_eq!(too_large_text(16 * 1024 * 1024 * 1024), "TOO LARGE - over 16 GB");
+        assert_eq!(too_large_text(500 * 1024 * 1024), "TOO LARGE - over 500 MB");
     }
 
     // L21: deleting a folder bins its items (files follow), refuses default folders.
@@ -1191,7 +1337,6 @@ mod tests {
         // Explicit unpair.
         r.run(|c, x| unpair(c, x, dev(0xCC))).unwrap();
         assert!(store::paired_peer(&r.db.conn).unwrap().is_none());
-        assert!(store::ever_paired(&r.db.conn).unwrap());
         assert!(matches!(r.run(|c, x| unpair(c, x, dev(0xDD))), Err(CoreError::NotFound { .. })));
         assert_eq!(r.lfs(id), LocalFileState::Present);
     }

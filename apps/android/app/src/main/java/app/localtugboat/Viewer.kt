@@ -112,6 +112,19 @@ fun ViewerScreen(vm: SnapViewModel, ui: UiState, route: Route.Viewer) {
     }
     val item = rows.getOrNull(pager.currentPage) ?: return
 
+    fun openFile(i: ItemInfo) {
+        scope.launch {
+            val intent = vm.openIntent(i) ?: return@launch
+            try {
+                ctx.startActivity(intent)
+            } catch (e: android.content.ActivityNotFoundException) {
+                vm.say(FileRules.noAppText(i.ext))
+            } catch (e: Exception) {
+                vm.reportFailure("Open", e)
+            }
+        }
+    }
+
     fun after(job: kotlinx.coroutines.Job) {
         scope.launch {
             job.join()
@@ -129,13 +142,13 @@ fun ViewerScreen(vm: SnapViewModel, ui: UiState, route: Route.Viewer) {
         }
         HorizontalPager(pager, Modifier.weight(1f).fillMaxWidth(), userScrollEnabled = !zoomed, key = { model.rows.getOrNull(it)?.id ?: it }) { page ->
             val row = model.rows.getOrNull(page)
-            if (row != null) ViewerPage(row, active = page == pager.currentPage, bin = route.bin) { z -> if (page == pager.currentPage) zoomed = z }
+            if (row != null) ViewerPage(row, active = page == pager.currentPage, bin = route.bin, onOpen = { openFile(row) }) { z -> if (page == pager.currentPage) zoomed = z }
         }
         Column(Modifier.fillMaxWidth().navigationBarsPadding().padding(bottom = 4.dp)) {
             val cell = UiLogic.cell(item, nowMs, binDays, route.bin)
             val folder = folders.firstOrNull { it.id == item.folderId }?.name
             Text(
-                listOfNotNull(UiLogic.capturedAt(item.capturedAtMs, ZoneId.systemDefault()), folder, UiLogic.bytes(item.size.toLong()), cell.label).joinToString("  -  "),
+                listOfNotNull(UiLogic.capturedAt(item.capturedAtMs, ZoneId.systemDefault()), folder, if (item.kind == MediaKind.FILE) null else FileRules.sizeText(item.size.toLong()), cell.label).joinToString("  -  "),
                 color = Color.White, style = MaterialTheme.typography.bodySmall, textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp),
             )
             val held = UiLogic.fileHeld(item)
@@ -147,7 +160,8 @@ fun ViewerScreen(vm: SnapViewModel, ui: UiState, route: Route.Viewer) {
                     ViewerAction(if (cell.kept) R.drawable.ic_star_fill1 else R.drawable.ic_star, if (cell.kept) "Kept" else "Keep", !folderKeep) { after(vm.keep(item.id, !item.pinned)) }
                     ViewerAction(R.drawable.ic_drive_file_move, "Move", true) { moving = true }
                     ViewerAction(R.drawable.ic_share, "Share", held) { scope.launch { vm.shareIntent(item)?.let { i -> ctx.startActivity(i) } } }
-                    ViewerAction(R.drawable.ic_download, "Save", held) { vm.saveToGallery(item) }
+                    // Only photos and videos go to the phone gallery. A file has no Save: its one Open is the big button on its page (its size is there too).
+                    if (item.kind != MediaKind.FILE) ViewerAction(R.drawable.ic_download, "Save", held) { vm.saveToGallery(item) }
                     ViewerAction(R.drawable.ic_delete, "Delete", true) { after(vm.delete(item.id)) } // Shell offers Undo once it succeeded
                 }
             }
@@ -182,13 +196,31 @@ private fun RowScope.ViewerAction(icon: Int, label: String, enabled: Boolean, on
 }
 
 @Composable
-private fun ViewerPage(item: ItemInfo, active: Boolean, bin: Boolean, onZoomed: (Boolean) -> Unit) {
+private fun ViewerPage(item: ItemInfo, active: Boolean, bin: Boolean, onOpen: () -> Unit, onZoomed: (Boolean) -> Unit) {
     val note = UiLogic.fileNote(item.local, bin)
     val path = item.path
     when {
+        item.kind == MediaKind.FILE -> FilePage(item, note ?: if (path == null) "FILE MISSING on this phone" else null, bin, onOpen)
         note != null || path == null -> NoFile(item, note ?: "FILE MISSING on this phone")
         item.kind == MediaKind.VIDEO -> if (active) VideoPlayer(path) else ThumbImage(item.thumbPath, "Video", Modifier.fillMaxSize(), ContentScale.Fit)
         else -> PhotoPage(path, item.name, onZoomed)
+    }
+}
+
+/** A file that is not a photo or video: type icon, real name, "PDF, 1.2 MB" and Open. In the Bin: Restore first. */
+@Composable
+private fun FilePage(item: ItemInfo, note: String?, bin: Boolean, onOpen: () -> Unit) {
+    Column(Modifier.fillMaxSize().padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
+        Ico(fileIcon(item.ext), null, tint = Color.White, size = 72)
+        Spacer(Modifier.height(12.dp))
+        Text(FileRules.displayName(item.name, item.ext), color = Color.White, style = MaterialTheme.typography.titleLarge, textAlign = TextAlign.Center, maxLines = 4, overflow = TextOverflow.Ellipsis)
+        Text(FileRules.meta(item.ext, item.size.toLong()), color = Color.White, style = MaterialTheme.typography.bodyMedium, textAlign = TextAlign.Center)
+        Spacer(Modifier.height(20.dp))
+        when {
+            note != null -> Text(note, color = Color.White, style = MaterialTheme.typography.titleMedium, textAlign = TextAlign.Center)
+            bin -> Text("Restore it to open it", color = Color.White, style = MaterialTheme.typography.titleMedium, textAlign = TextAlign.Center)
+            else -> ActionButton(onClick = onOpen, modifier = Modifier.defaultMinSize(minHeight = 56.dp)) { Text("Open") }
+        }
     }
 }
 
@@ -259,12 +291,30 @@ private fun ZoomableImage(bitmap: ImageBitmap, desc: String, onZoomed: (Boolean)
     }
 }
 
+/**
+ * Decoder fallback on: if a phone's first-choice decoder cannot be set up, the next one is tried (often the software decoder).
+ * Debug builds also skip the Android emulator's own "goldfish" decoders: on the emulator image used for QA they fail for any
+ * third-party app (SELinux denies the codec service the app's shared-memory queue, see notes/plans/0.2.0-android-notes.md),
+ * so without this no recorded video could be played there. Release builds never touch the decoder list.
+ */
+@androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
+private fun renderersFactory(ctx: android.content.Context): androidx.media3.exoplayer.DefaultRenderersFactory {
+    val f = androidx.media3.exoplayer.DefaultRenderersFactory(ctx).setEnableDecoderFallback(true)
+    if (BuildConfig.DEBUG) {
+        f.setMediaCodecSelector { mime, secure, tunneling ->
+            androidx.media3.exoplayer.mediacodec.MediaCodecSelector.DEFAULT.getDecoderInfos(mime, secure, tunneling).filterNot { it.name.contains("goldfish") }
+        }
+    }
+    return f
+}
+
 /** Media3 player for the current page only: created when the page settles, released when it leaves. */
+@androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
 @Composable
 private fun VideoPlayer(path: String) {
     val ctx = LocalContext.current
     val player = remember(path) {
-        ExoPlayer.Builder(ctx).build().apply {
+        ExoPlayer.Builder(ctx, renderersFactory(ctx)).build().apply {
             setMediaItem(MediaItem.fromUri(Uri.fromFile(File(path))))
             prepare()
         }

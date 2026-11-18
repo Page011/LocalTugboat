@@ -25,9 +25,14 @@ pub enum CoreError {
     /// Input that violates a rule (empty folder name, retention 0, move into a deleted folder).
     #[error("invalid: {0}")]
     Invalid(String),
-    /// A file that is not an allowed photo/video (extension or magic bytes).
+    /// A photo/video extension whose content is not a photo or video (a renamed program).
     #[error("not a supported photo or video: {0}")]
     NotMedia(String),
+    /// Refused on purpose, never synced: an always-refused name ("REFUSED - shortcut and
+    /// folder-setting files never sync") or a file over the size limit ("TOO LARGE - over 16 GB").
+    /// The text is the one-line message for the user.
+    #[error("{0}")]
+    Refused(String),
     /// Restore or fetch of a file neither device holds any more.
     #[error("file no longer on either device")]
     FileGone,
@@ -70,6 +75,7 @@ impl CoreError {
             CoreError::Name(_) => "name",
             CoreError::Invalid(_) => "invalid",
             CoreError::NotMedia(_) => "not_media",
+            CoreError::Refused(_) => "refused",
             CoreError::FileGone => "file_gone",
             CoreError::NotPaired => "not_paired",
             CoreError::AlreadyPaired => "already_paired",
@@ -97,6 +103,7 @@ mod tests {
             CoreError::Name(NameError::Empty),
             CoreError::Invalid("x".into()),
             CoreError::NotMedia("x".into()),
+            CoreError::Refused("x".into()),
             CoreError::FileGone,
             CoreError::NotPaired,
             CoreError::AlreadyPaired,

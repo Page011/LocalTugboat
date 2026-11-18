@@ -264,6 +264,13 @@ class SnapViewModel(app: Application) : AndroidViewModel(app) {
         _pairing.value = PairUi.Dialing
         viewModelScope.launch(Dispatchers.IO) {
             core.hold("pairing").join() // pairing needs the endpoint up
+            // The code's expiry (the PC's stamp, compared with this phone's clock) is read before dialing: a failure
+            // after it means "expired", whatever words the PC's newer window used to refuse the old secret.
+            val expiresAt = try {
+                inspectPairingPayload(payload).expiresAtMs
+            } catch (e: Exception) {
+                null
+            }
             try {
                 val pc = core.phone().pairWith(payload)
                 _pairing.value = PairUi.Done(pc.name)
@@ -271,7 +278,7 @@ class SnapViewModel(app: Application) : AndroidViewModel(app) {
                 ServiceGate.startIfWanted(ctx, "paired")
                 refresh()
             } catch (e: Exception) {
-                val line = Texts.pairFailure(e, Perms.localNetworkAllowed(ctx))
+                val line = Texts.pairFailure(e, Perms.localNetworkAllowed(ctx), codeExpired = expiresAt != null && System.currentTimeMillis() >= expiresAt)
                 // The onboarding screen shows this failure; a banner after a later success would be stale, so log only.
                 KLog.log(ctx, "pairing failed: $line")
                 _pairing.value = PairUi.Failed(line)
@@ -369,6 +376,16 @@ class SnapViewModel(app: Application) : AndroidViewModel(app) {
             ItemExport.shareIntent(ctx, item)
         } catch (e: Exception) {
             fail("Share", e)
+            null
+        }
+    }
+
+    /** ACTION_VIEW intent for a held file (content URI, read grant), or null (with a message) when it cannot be opened. */
+    suspend fun openIntent(item: ItemInfo): Intent? = withContext(Dispatchers.IO) {
+        try {
+            ItemFileProvider.openIntent(ctx, item)
+        } catch (e: Exception) {
+            fail("Open", e)
             null
         }
     }

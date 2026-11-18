@@ -5,8 +5,9 @@
 // Events carry ids, not rows, so a screen that shows rows watches `app.itemsRev` / `activityRev`
 // and re-reads. If the event stream lags (`resync`) everything is re-read.
 
-import { api, ApiError, onCoreEvent, onFirewallStatus, onLibraryStatus, onResync, pickFolder } from "./api";
-import type { AppInfo, FirewallInfo, FolderView, LibraryStatus, PairedDevice, Settings, SyncStatus } from "./api";
+import { api, ApiError, onCoreEvent, onDropProgress, onDropResult, onDropState, onFirewallStatus, onLibraryStatus, onResync, pickFolder } from "./api";
+import type { AppInfo, DropProgress, DropReport, FirewallInfo, FolderView, LibraryStatus, PairedDevice, Settings, SyncStatus } from "./api";
+import { dropBanner, dropSummary, type DropEnter } from "./drop";
 import { nextPairPhase, type PairInput, type PairPhase } from "./pairing";
 
 export type Screen = "gallery" | "bin" | "activity" | "pair" | "settings";
@@ -32,7 +33,33 @@ export const app = $state({
   notSyncedOpen: false,
   itemsRev: 0,
   activityRev: 0,
+  /** Files dragged onto the window: the overlay (`over`), the copy in progress and the success line. */
+  drop: {
+    over: null as DropEnter | null,
+    progress: null as DropProgress | null,
+    /** Progress shows only for a copy that runs longer than 300 ms. */
+    showProgress: false,
+    note: null as { text: string; until: number } | null,
+  },
+  /** What the last drop left behind (refused or failed files): a banner until dismissed. */
+  dropReport: null as DropReport | null,
 });
+
+const PROGRESS_AFTER_MS = 300;
+const NOTE_FOR_MS = 5000;
+let progressTimer: ReturnType<typeof setTimeout> | undefined;
+
+function dropFinished(r: DropReport): void {
+  clearTimeout(progressTimer);
+  progressTimer = undefined;
+  app.drop.over = null;
+  app.drop.progress = null;
+  app.drop.showProgress = false;
+  const text = dropSummary(r);
+  app.drop.note = text === null ? null : { text, until: Date.now() + NOTE_FOR_MS };
+  // A refused or failed file is never silent: the banner stays until the user dismisses it.
+  app.dropReport = dropBanner(r) === null ? app.dropReport : r;
+}
 
 /** Show a failure as the red banner. Errors are never swallowed. */
 export function fail(e: unknown): void {
@@ -91,7 +118,10 @@ export async function start(): Promise<() => void> {
       switch (e.t) {
         case "sync": {
           const { t: _t, ...s } = e;
+          const changed = app.sync?.state !== s.state;
           app.sync = s;
+          // The core writes "last seen" at the first hello and when a session ends: re-read it on every state change.
+          if (changed) refreshPaired();
           break;
         }
         case "items_changed":
@@ -120,12 +150,19 @@ export async function start(): Promise<() => void> {
       }
     }),
     await onLibraryStatus((s) => (app.library = s)),
+    await onDropState((s) => (app.drop.over = s.t === "enter" ? s : null)),
+    await onDropProgress((p) => {
+      if (app.drop.progress === null) progressTimer = setTimeout(() => (app.drop.showProgress = true), PROGRESS_AFTER_MS);
+      app.drop.progress = p;
+    }),
+    await onDropResult(dropFinished),
     await onFirewallStatus((s) => (app.firewall = s)),
     await onResync(() => void reload()),
   );
   await reload();
   const timer = setInterval(() => {
     app.now = Date.now();
+    if (app.drop.note !== null && app.now >= app.drop.note.until) app.drop.note = null;
     const p = app.pairing;
     // The QR stops working at expires_at (PC clock = this clock): close the window now rather
     // than leave a dead code on screen.

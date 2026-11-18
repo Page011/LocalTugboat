@@ -1,6 +1,6 @@
 //! M1 scenarios from PLAN "Milestones / M1 Core", run as two real cores over loopback:
 //! both directions, field conflicts, Keep vs expiry while apart, restore vs purge while apart,
-//! expiry blocked until a receipt (incl. zero paired devices and a re-paired device), a PC edit
+//! expiry on time whatever the receipts say (incl. zero paired devices and a re-paired device), a PC edit
 //! plus a phone move while apart, live latency. Design test ids S1-S6, S13, S18.
 
 mod common;
@@ -177,11 +177,11 @@ async fn s04_restore_beats_purge() {
     r.shutdown().await;
 }
 
-// S5a: nothing expires until the other device confirmed the file. The phone's item stays
-// Waiting past 24 h while the PC is away; the PC's receipt then expires it, and the Bin clock
-// starts at the receipt, not at the due time.
+// C-T5 (replaces S5a): expiry is on time. The phone's item expires at its due time while the PC
+// is away, no "waiting" state ever shows, the Bin and the activity row say it never reached the
+// PC, and a PC that comes back after the due time never downloads the expired item.
 #[tokio::test(flavor = "multi_thread")]
-async fn s05a_waiting_until_the_peer_confirms() {
+async fn c_t5_expiry_is_on_time_while_the_pc_is_away() {
     let r = Rig::unconnected();
     pair(&r.pc, &r.phone).await;
     r.settle().await;
@@ -189,40 +189,56 @@ async fn s05a_waiting_until_the_peer_confirms() {
     r.phone.wait_state(SyncState::Offline).await;
 
     let id = r.phone.add("late.jpg", 40, 6_000);
-    r.phone.clock.advance(30 * HOUR);
+    let hash = r.phone.record(id).unwrap().content.val.hash;
+    r.phone.clock.advance(23 * HOUR);
     r.phone.core.tick().unwrap();
     let v = r.phone.view(id).expect("still in the gallery");
-    assert_eq!(v.state, ItemState::Waiting, "no receipt: never expires");
-    assert_eq!(v.local, LocalFileState::Present);
-    assert_eq!(r.phone.core.status().waiting, 1, "the status counts it");
+    assert!(matches!(v.state, ItemState::Live { .. }), "before the due time it is live, not waiting: {:?}", v.state);
+    assert_eq!(r.phone.core.status().waiting, 1, "the PC has not confirmed it: the status counts it");
 
-    r.pc.start().await;
-    until("the PC's receipt expired it on the phone", 20, || r.phone.items().iter().all(|v| v.id != id)).await;
+    r.phone.clock.advance(HOUR);
+    r.phone.core.tick().unwrap();
+    assert!(r.phone.items().iter().all(|v| v.id != id), "gone from the gallery at its due time");
     let bin = r.phone.bin();
-    let ItemState::Expired { binned_at } = bin[0].state else { panic!("not expired: {:?}", bin[0].state) };
-    assert_eq!(binned_at, T0 + 30 * HOUR, "binned when the receipt arrived (late receipt), not at the due time");
-    assert_eq!(r.phone.core.status().waiting, 0);
+    assert_eq!(bin.len(), 1);
+    assert_eq!(bin[0].state, ItemState::Expired { binned_at: T0 + 24 * HOUR }, "binned at the due time");
+    assert!(bin[0].never_reached_peer, "the Bin says the PC never got it");
+    assert!(r.phone.activity_text().iter().any(|t| t.starts_with("Expired") && t.contains("never reached the PC")), "{:?}", r.phone.activity_text());
+    assert_eq!(r.phone.core.status().waiting, 0, "an expired item is not waiting");
+
+    // The PC comes back after the due time: it gets the record already expired and never downloads it.
+    r.pc.clock.advance(25 * HOUR);
+    r.pc.start().await;
+    until("the PC has the record", 20, || r.pc.has_item(id)).await;
+    r.phone.core.reconnect_now();
+    r.pc.core.tick().unwrap();
+    until("the PC dropped the expired item without downloading it", 20, || r.pc.local(id) == Some(LocalFileState::Purged)).await;
+    assert!(!r.pc.has_receipt(hash, r.pc.id), "the PC never held the file");
+    assert!(r.pc.bin().is_empty() || r.pc.view(id).is_some_and(|v| v.path.is_none()));
+    assert!(r.pc.items_dir().read_dir().map(|mut d| d.next().is_none()).unwrap_or(true), "nothing stored on the PC");
     r.shutdown().await;
 }
 
-// S5b: a device that was never paired: nothing expires, even a year later.
+// S5b (0.2.0): a device that was never paired expires on time too, a day later and a year later.
 #[tokio::test(flavor = "multi_thread")]
-async fn s05b_never_paired_nothing_expires() {
+async fn s05b_never_paired_expires_on_time() {
     let clock = TestClock::new(T0);
     let d = Dev::new(Role::Phone, "alone", &clock);
     let id = d.add("solo.jpg", 41, 3_000);
-    clock.advance(365 * DAY);
+    clock.advance(24 * HOUR - 1);
     d.core.tick().unwrap();
-    let v = d.view(id).expect("still in the gallery");
-    assert_eq!(v.state, ItemState::Waiting);
-    assert_eq!(v.local, LocalFileState::Present);
-    assert!(d.bin().is_empty());
+    assert!(matches!(d.view(id).unwrap().state, ItemState::Live { .. }));
+    clock.advance(1);
+    d.core.tick().unwrap();
+    assert!(d.view(id).is_some_and(|v| matches!(v.state, ItemState::Expired { .. }) && v.local == LocalFileState::Binned));
+    assert_eq!(d.core.status().waiting, 0, "nobody is paired: nothing waits on a peer");
+    assert!(!d.bin()[0].never_reached_peer, "no paired device, so no 'never reached' claim");
 }
 
-// S5c: a re-paired device. The old phone's receipt still counts ("is or was paired"): its item
-// expires. An item only the NEW phone has not confirmed waits for the new key's receipt.
+// S5c (0.2.0): a re-paired device. Both items expire on time. The Bin says which one the CURRENT
+// phone never confirmed: the old item reached phone two through the snapshot, the fresh one did not.
 #[tokio::test(flavor = "multi_thread")]
-async fn s05c_repaired_device_old_receipt_counts_new_item_waits() {
+async fn s05c_repaired_device_expires_on_time_and_says_what_never_reached_the_new_phone() {
     let pc_clock = TestClock::new(T0);
     let pc = Dev::new(Role::Pc, "TEST-PC", &pc_clock);
     let phone1 = Dev::new(Role::Phone, "phone one", &TestClock::new(T0));
@@ -250,8 +266,12 @@ async fn s05c_repaired_device_old_receipt_counts_new_item_waits() {
     pc_clock.advance(25 * HOUR);
     pc.core.tick().unwrap();
 
-    assert!(matches!(pc.view(old).unwrap().state, ItemState::Expired { .. }), "phone one's receipt still counts: expired");
-    assert_eq!(pc.view(fresh).unwrap().state, ItemState::Waiting, "the new phone has not confirmed it");
+    let bin = pc.bin();
+    let find = |id| bin.iter().find(|v| v.id == id).unwrap_or_else(|| panic!("{id:?} is not in the PC's Bin"));
+    assert!(matches!(find(old).state, ItemState::Expired { .. }));
+    assert!(matches!(find(fresh).state, ItemState::Expired { .. }), "nothing waits for the new phone");
+    assert!(!find(old).never_reached_peer, "phone two got the old item in the snapshot");
+    assert!(find(fresh).never_reached_peer, "phone two never confirmed the fresh item");
     pc.stop().await;
 }
 

@@ -14,7 +14,7 @@ class TextsTest {
     private val day = 24 * hour
 
     private fun status(state: SyncState, peer: String? = "NIGEL-PC", last: Long? = null, waiting: UInt = 0u, message: String? = null) =
-        SyncStatus(state, peer, last, waiting, 0u, message)
+        SyncStatus(state, peer, last, waiting, 0u, false, message)
 
     @Test fun duration_rounds_down_and_switches_unit() {
         assertEquals("<1m", Texts.duration(59_999))
@@ -37,7 +37,6 @@ class TextsTest {
     @Test fun expiry_labels() {
         val now = 1_000_000_000L
         assertEquals("Expires in 5h", Texts.expiryLabel(ItemStateInfo.Live(now + 5 * hour + 10 * min), now, 7u))
-        assertEquals("Waiting for PC", Texts.expiryLabel(ItemStateInfo.Waiting, now, 7u))
         assertEquals("Kept", Texts.expiryLabel(ItemStateInfo.Kept, now, 7u))
         assertEquals("Kept (folder)", Texts.expiryLabel(ItemStateInfo.FolderKeep, now, 7u))
     }
@@ -71,8 +70,8 @@ class TextsTest {
     @Test fun stopped_banner_uses_local_time() {
         // 2026-11-17 14:02:30 UTC shown in UTC and in Sydney (UTC+11 in November).
         val ms = java.time.ZonedDateTime.of(2026, 11, 17, 14, 2, 30, 0, ZoneId.of("UTC")).toInstant().toEpochMilli()
-        assertEquals("Tugboat was stopped at 14:02.", Texts.stoppedAt(ms, ZoneId.of("UTC")))
-        assertEquals("Tugboat was stopped at 01:02.", Texts.stoppedAt(ms, ZoneId.of("Australia/Sydney")))
+        assertEquals("STOPPED at 14:02 - Tugboat was not running", Texts.stoppedAt(ms, ZoneId.of("UTC")))
+        assertEquals("STOPPED at 01:02 - Tugboat was not running", Texts.stoppedAt(ms, ZoneId.of("Australia/Sydney")))
     }
 
     @Test fun pair_failures_name_the_cause() {
@@ -80,5 +79,36 @@ class TextsTest {
         assertEquals("PC NOT FOUND - same Wi-Fi as the PC?", Texts.pairFailure(SnapException.NetTimeout("t"), true))
         assertEquals("LOCAL NETWORK BLOCKED - allow it, then scan again", Texts.pairFailure(SnapException.NetUnreachable("u"), false))
         assertEquals("PAIRING CODE EXPIRED - show a new QR", Texts.pairFailure(SnapException.PairExpired("PAIRING CODE EXPIRED - show a new QR"), true))
+    }
+
+    @Test fun an_old_qr_never_reads_as_not_a_tugboat_code() {
+        // Known bug 0.1.x: a QR older than 2 minutes said "That is not a Tugboat code". Only a payload the core cannot parse says that.
+        assertEquals("PAIRING CODE EXPIRED - show a new QR", Texts.pairFailure(SnapException.PairExpired("PAIRING CODE EXPIRED - show a new QR"), false))
+        assertEquals("Pairing is not open on the PC", Texts.pairFailure(SnapException.PairNotOpen("Pairing is not open on the PC"), true))
+        assertEquals("Update Tugboat on the PC", Texts.pairFailure(SnapException.PairVersionMismatch("Update Tugboat on the PC"), true))
+        assertEquals("That is not a Tugboat code", Texts.pairFailure(SnapException.PairBadPayload("bad"), true))
+    }
+
+    @Test fun an_old_qr_refused_by_the_pcs_newer_window_reads_expired() {
+        // Measured on the emulator: after 2 minutes the PC opens a new window, so the old QR comes back as a wrong secret.
+        assertEquals("WRONG PAIRING CODE - scan the QR again", Texts.pairFailure(SnapException.PairBadSecret("WRONG PAIRING CODE - scan the QR again"), true))
+        assertEquals("PAIRING CODE EXPIRED - show a new QR", Texts.pairFailure(SnapException.PairBadSecret("WRONG PAIRING CODE - scan the QR again"), true, codeExpired = true))
+        assertEquals("PAIRING CODE EXPIRED - show a new QR", Texts.pairFailure(SnapException.PairNotOpen("Pairing is not open on the PC"), true, codeExpired = true))
+        // A refusal that has nothing to do with the code's age keeps its words.
+        assertEquals("Update Tugboat on the PC", Texts.pairFailure(SnapException.PairVersionMismatch("Update Tugboat on the PC"), true, codeExpired = true))
+    }
+
+    @Test fun storage_low_text_counts_what_waits_on_the_pc() {
+        assertEquals("PHONE STORAGE LOW - 37 items wait on the PC", Texts.storageLow(37u))
+        assertEquals("PHONE STORAGE LOW - 2 items wait on the PC", Texts.storageLow(2u))
+        assertEquals("PHONE STORAGE LOW - 1 item waits on the PC", Texts.storageLow(1u))
+        assertEquals("PHONE STORAGE LOW", Texts.storageLow(0u))
+    }
+
+    @Test fun expiry_labels_have_no_waiting_state() {
+        val now = 100 * day
+        for (st in listOf(ItemStateInfo.Kept, ItemStateInfo.FolderKeep, ItemStateInfo.Live(now + hour), ItemStateInfo.Deleted(now), ItemStateInfo.Expired(now))) {
+            assertEquals(false, Texts.expiryLabel(st, now, 7u).contains("aiting"))
+        }
     }
 }

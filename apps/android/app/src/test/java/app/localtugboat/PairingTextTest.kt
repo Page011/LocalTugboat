@@ -54,9 +54,9 @@ class PairingTextTest {
     }
 
     @Test fun share_extension_comes_from_the_content_not_the_name() {
-        assertEquals("photo.heic", ShareNames.finalName("photo.jpg", Media.HEIF, "fb"))
-        assertEquals("photo.mp4", ShareNames.finalName("photo", Media.MP4, "fb"))
-        assertEquals("fb.png", ShareNames.finalName(null, Media.PNG, "fb"))
+        assertEquals("photo.heic", ShareNames.finalName("photo.jpg", Media.HEIF, null, "fb", AnyFileTest.FakeRules))
+        assertEquals("photo.mp4", ShareNames.finalName("photo", Media.MP4, null, "fb", AnyFileTest.FakeRules))
+        assertEquals("fb.png", ShareNames.finalName(null, Media.PNG, null, "fb", AnyFileTest.FakeRules))
     }
 
     @Test fun share_accepts_only_foreign_content_uris() {
@@ -72,8 +72,8 @@ class PairingTextTest {
 
     @Test fun share_summary() {
         assertEquals("2 added to Inbox", ShareResult(2, emptyList(), "Inbox").summary())
-        assertEquals("1 added to Work. Not synced: a.zip (not a photo or video)", ShareResult(1, listOf("a.zip (not a photo or video)"), "Work").summary())
-        assertEquals("Not synced: a.zip (not a photo or video)", ShareResult(0, listOf("a.zip (not a photo or video)"), "Inbox").summary())
+        assertEquals("1 added to Work. NOT SYNCED: a.zip (not a photo or video)", ShareResult(1, listOf("a.zip (not a photo or video)"), "Work").summary())
+        assertEquals("NOT SYNCED: a.zip (not a photo or video)", ShareResult(0, listOf("a.zip (not a photo or video)"), "Inbox").summary())
         assertEquals("Nothing to add", ShareResult(0, emptyList(), "Inbox").summary())
     }
 }

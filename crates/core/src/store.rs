@@ -48,6 +48,7 @@ fn media_str(k: MediaKind) -> &'static str {
     match k {
         MediaKind::Image => "image",
         MediaKind::Video => "video",
+        MediaKind::File => "file",
     }
 }
 
@@ -55,6 +56,7 @@ fn media_parse(idx: usize, s: &str) -> rusqlite::Result<MediaKind> {
     match s {
         "image" => Ok(MediaKind::Image),
         "video" => Ok(MediaKind::Video),
+        "file" => Ok(MediaKind::File),
         _ => Err(bad(idx, Type::Text, "unknown media kind")),
     }
 }
@@ -252,11 +254,14 @@ pub fn is_paired(c: &Connection, id: DeviceId) -> Result<bool> {
     Ok(n > 0)
 }
 
-/// True if any non-self device row has ever had paired_at set (expiry: zero ever-paired
-/// devices = nothing expires).
-pub fn ever_paired(c: &Connection) -> Result<bool> {
-    let n: i64 = c.query_row("SELECT count(*) FROM device WHERE is_self = 0 AND paired_at IS NOT NULL", [], |r| r.get(0))?;
-    Ok(n > 0)
+/// Move `last_seen_at` of a peer to `now` without touching its stored addresses (the session
+/// ended; the hello already stored the addresses). Never moves the time backwards.
+pub fn touch_last_seen(c: &Connection, peer: DeviceId, now: i64) -> Result<()> {
+    c.execute(
+        "UPDATE device SET last_seen_at = MAX(COALESCE(last_seen_at, 0), ?2) WHERE id = ?1 AND is_self = 0",
+        params![&peer.0[..], now],
+    )?;
+    Ok(())
 }
 
 pub fn set_last_seen(c: &Connection, peer: DeviceId, now: i64, addresses: &[String]) -> Result<()> {
@@ -694,16 +699,17 @@ pub fn insert_receipt(c: &Connection, r: &ReceiptRecord, seen_at: i64) -> Result
     Ok(n == 1)
 }
 
-/// Earliest `seen_at` of a receipt for `hash` from a device that is in the device table,
-/// is not self, and has ever been paired (paired_at NOT NULL). None = no qualifying receipt.
-/// PLAN: "a receipt for that file's hash from a device this one is or was paired with".
-pub fn peer_receipt_seen_at(c: &Connection, hash: BlobHash) -> Result<Option<i64>> {
-    Ok(c.query_row(
-        "SELECT MIN(r.seen_at) FROM receipt r JOIN device d ON d.id = r.device_id
-         WHERE r.blob_hash = ?1 AND d.is_self = 0 AND d.paired_at IS NOT NULL",
-        [&hash.0[..]],
+/// True if `peer` has confirmed holding the file with `hash` (a receipt row from that device).
+/// Receipts are per file hash, forever: a NEW item with the same bytes as an old one counts the
+/// old receipt. Expiry never reads this (0.2.0: items expire on time); it only feeds the
+/// "waiting" count and the "never reached the other device" note.
+pub fn peer_has_receipt(c: &Connection, hash: BlobHash, peer: DeviceId) -> Result<bool> {
+    let n: i64 = c.query_row(
+        "SELECT count(*) FROM receipt WHERE blob_hash = ?1 AND device_id = ?2",
+        params![&hash.0[..], &peer.0[..]],
         |r| r.get(0),
-    )?)
+    )?;
+    Ok(n > 0)
 }
 
 // ---------- change log and cursors ----------
@@ -853,6 +859,9 @@ pub struct FileRef {
     pub path: String,
     pub volume_serial: Option<u64>,
     pub file_id: Option<[u8; 16]>,
+    /// PC: modified time (unix ms) of the held file when the watcher last recorded it. None =
+    /// not recorded yet (a new download, or a library from before 0.2.0).
+    pub mtime_ms: Option<i64>,
 }
 
 fn file_ref_from_row(r: &Row) -> rusqlite::Result<FileRef> {
@@ -867,12 +876,13 @@ fn file_ref_from_row(r: &Row) -> rusqlite::Result<FileRef> {
             None => None,
             Some(v) => Some(v.try_into().map_err(|_| bad(3, Type::Blob, "expected 16 bytes"))?),
         },
+        mtime_ms: r.get(4)?,
     })
 }
 
 pub fn get_file_ref(c: &Connection, item: ItemId) -> Result<Option<FileRef>> {
     Ok(c.query_row(
-        "SELECT item_id, path, volume_serial, file_id FROM file_ref WHERE item_id = ?1",
+        "SELECT item_id, path, volume_serial, file_id, mtime_ms FROM file_ref WHERE item_id = ?1",
         [item.0.as_bytes().as_slice()],
         file_ref_from_row,
     )
@@ -881,12 +891,13 @@ pub fn get_file_ref(c: &Connection, item: ItemId) -> Result<Option<FileRef>> {
 
 pub fn put_file_ref(c: &Connection, r: &FileRef) -> Result<()> {
     c.execute(
-        "INSERT OR REPLACE INTO file_ref (item_id, path, volume_serial, file_id) VALUES (?1, ?2, ?3, ?4)",
+        "INSERT OR REPLACE INTO file_ref (item_id, path, volume_serial, file_id, mtime_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
         params![
             r.item.0.as_bytes().as_slice(),
             r.path,
             r.volume_serial.map(|v| v as i64),
             r.file_id.map(|f| f.to_vec()),
+            r.mtime_ms,
         ],
     )?;
     Ok(())
@@ -911,12 +922,14 @@ pub struct HeldFile {
     pub ext: String,
     pub folder: FolderId,
     pub captured_at: i64,
+    /// `file_ref.mtime_ms` (see `FileRef`).
+    pub mtime_ms: Option<i64>,
 }
 
 /// Every Present item that has a file_ref (one SQL pass; the PC rescan's view of "what we hold").
 pub fn held_files(c: &Connection) -> Result<Vec<HeldFile>> {
     let mut st = c.prepare(
-        "SELECT f.item_id, f.path, f.volume_serial, f.file_id, i.blob_hash, i.size, i.name, i.ext, i.folder_id, i.captured_at
+        "SELECT f.item_id, f.path, f.volume_serial, f.file_id, i.blob_hash, i.size, i.name, i.ext, i.folder_id, i.captured_at, f.mtime_ms
          FROM file_ref f JOIN item i ON i.id = f.item_id
          WHERE i.local_file_state = 'present'",
     )?;
@@ -938,6 +951,7 @@ pub fn held_files(c: &Connection) -> Result<Vec<HeldFile>> {
             ext: r.get(7)?,
             folder: FolderId(Uuid::from_bytes(b16(r, 8)?)),
             captured_at: r.get(9)?,
+            mtime_ms: r.get(10)?,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -954,6 +968,16 @@ pub fn set_file_identity(c: &Connection, item: ItemId, volume_serial: u64, file_
         "UPDATE file_ref SET volume_serial = ?2, file_id = ?3 WHERE item_id = ?1",
         params![item.0.as_bytes().as_slice(), volume_serial as i64, &file_id[..]],
     )?;
+    if n == 0 {
+        return Err(CoreError::NotFound { what: "file_ref", id: item.0.to_string() });
+    }
+    Ok(())
+}
+
+/// Record the modified time of the file an item holds (the PC watcher saw it at its current
+/// path). Errors when the item holds no file_ref, so a caller never believes it stamped nothing.
+pub fn set_file_mtime(c: &Connection, item: ItemId, mtime_ms: i64) -> Result<()> {
+    let n = c.execute("UPDATE file_ref SET mtime_ms = ?2 WHERE item_id = ?1", params![item.0.as_bytes().as_slice(), mtime_ms])?;
     if n == 0 {
         return Err(CoreError::NotFound { what: "file_ref", id: item.0.to_string() });
     }
@@ -1278,7 +1302,6 @@ mod tests {
     fn pairing_rows() {
         let db = Db::open_in_memory().unwrap();
         ensure_self(&db.conn, p(), "PC", Role::Pc).unwrap();
-        assert!(!ever_paired(&db.conn).unwrap());
         assert!(paired_peer(&db.conn).unwrap().is_none());
         let peer = DeviceRow { id: f(), name: "Phone".into(), is_self: false, role: Role::Phone, paired_at: None, unpaired_at: None, last_seen_at: None, addresses: vec!["10.0.0.2:5000".into()] };
         set_paired(&db.conn, &peer, T0).unwrap();
@@ -1293,7 +1316,6 @@ mod tests {
         set_unpaired(&db.conn, f(), T0 + 10).unwrap();
         assert!(!is_paired(&db.conn, f()).unwrap());
         assert!(paired_peer(&db.conn).unwrap().is_none());
-        assert!(ever_paired(&db.conn).unwrap(), "row stays: was paired");
         assert!(set_unpaired(&db.conn, dev(9), T0).is_err());
         // Re-pair clears unpaired_at.
         set_paired(&db.conn, &peer, T0 + 20).unwrap();
@@ -1372,33 +1394,55 @@ mod tests {
         assert_eq!(all_places(&db.conn).unwrap(), vec![pl]);
     }
 
-    // L8: receipts grow-only; duplicate -> false.
+    // L8: receipts grow-only; duplicate -> false. A receipt counts for ONE named device.
     #[test]
-    fn receipts_grow_only_and_qualify_only_from_paired_devices() {
+    fn receipts_grow_only_and_are_matched_per_device() {
         let db = Db::open_in_memory().unwrap();
         ensure_self(&db.conn, p(), "PC", Role::Pc).unwrap();
         let rec = |d: DeviceId, at| ReceiptRecord { hash: hash(1), device: d, received_at: at };
         assert!(insert_receipt(&db.conn, &rec(f(), 5), T0 + 1).unwrap());
         assert!(!insert_receipt(&db.conn, &rec(f(), 6), T0 + 2).unwrap(), "duplicate is ignored");
         assert_eq!(get_receipt(&db.conn, hash(1), f()).unwrap().unwrap().received_at, 5, "first copy kept");
-        // Unknown device (not in the device table): does not qualify.
-        assert_eq!(peer_receipt_seen_at(&db.conn, hash(1)).unwrap(), None);
-        // Own receipt does not qualify.
+        assert!(peer_has_receipt(&db.conn, hash(1), f()).unwrap());
+        assert!(!peer_has_receipt(&db.conn, hash(1), dev(9)).unwrap(), "another device's receipt does not count");
+        assert!(!peer_has_receipt(&db.conn, hash(2), f()).unwrap(), "another file does not count");
+        // Own receipt is a receipt of the own device only.
         insert_receipt(&db.conn, &rec(p(), 5), T0 + 3).unwrap();
-        assert_eq!(peer_receipt_seen_at(&db.conn, hash(1)).unwrap(), None);
-        // A device row that was never paired does not qualify.
-        db.conn
-            .execute("INSERT INTO device (id, name, is_self, role) VALUES (?1, 'x', 0, 'phone')", [&f().0[..]])
-            .unwrap();
-        assert_eq!(peer_receipt_seen_at(&db.conn, hash(1)).unwrap(), None);
-        // Paired: qualifies, earliest seen_at.
-        let peer = DeviceRow { id: f(), name: "Phone".into(), is_self: false, role: Role::Phone, paired_at: None, unpaired_at: None, last_seen_at: None, addresses: vec![] };
-        set_paired(&db.conn, &peer, T0).unwrap();
-        assert_eq!(peer_receipt_seen_at(&db.conn, hash(1)).unwrap(), Some(T0 + 1));
-        // Unpaired but was paired: still qualifies.
-        set_unpaired(&db.conn, f(), T0 + 9).unwrap();
-        assert_eq!(peer_receipt_seen_at(&db.conn, hash(1)).unwrap(), Some(T0 + 1));
-        assert_eq!(peer_receipt_seen_at(&db.conn, hash(2)).unwrap(), None);
+        assert!(peer_has_receipt(&db.conn, hash(1), p()).unwrap());
+        assert!(!peer_has_receipt(&db.conn, hash(3), p()).unwrap());
+    }
+
+    #[test]
+    fn file_mtime_is_stored_per_file_ref_and_listed() {
+        let db = Db::open_in_memory().unwrap();
+        let it = item(1, p(), v(1, p()));
+        insert_item(&db.conn, &it, LocalFileState::Present, T0).unwrap();
+        assert!(matches!(set_file_mtime(&db.conn, it.id, 5), Err(CoreError::NotFound { .. })), "no file_ref yet");
+        let fr = FileRef { item: it.id, path: "C:/lib/a.jpg".into(), volume_serial: None, file_id: None, mtime_ms: None };
+        put_file_ref(&db.conn, &fr).unwrap();
+        assert_eq!(held_files(&db.conn).unwrap()[0].mtime_ms, None);
+        set_file_mtime(&db.conn, it.id, 1_234_567).unwrap();
+        assert_eq!(get_file_ref(&db.conn, it.id).unwrap().unwrap().mtime_ms, Some(1_234_567));
+        assert_eq!(held_files(&db.conn).unwrap()[0].mtime_ms, Some(1_234_567));
+        // put_file_ref writes exactly what it is given (callers carry the old value on a move).
+        put_file_ref(&db.conn, &FileRef { mtime_ms: Some(9), ..fr.clone() }).unwrap();
+        assert_eq!(get_file_ref(&db.conn, it.id).unwrap().unwrap().mtime_ms, Some(9));
+        put_file_ref(&db.conn, &fr).unwrap();
+        assert_eq!(get_file_ref(&db.conn, it.id).unwrap().unwrap().mtime_ms, None);
+    }
+
+    #[test]
+    fn file_kind_roundtrips_through_the_item_table() {
+        let db = Db::open_in_memory().unwrap();
+        let mut it = item(2, p(), v(1, p()));
+        it.content.val.kind = MediaKind::File;
+        it.content.val.ext = String::new();
+        it.name.val = "Makefile".into();
+        insert_item(&db.conn, &it, LocalFileState::Pending, T0).unwrap();
+        let (got, _) = get_item(&db.conn, it.id).unwrap().unwrap();
+        assert_eq!(got.content.val.kind, MediaKind::File);
+        assert_eq!(got.content.val.ext, "");
+        assert_eq!(got, it);
     }
 
     // L28: change_log rows, dedupe, paging, trim, head, unacked.
@@ -1509,7 +1553,7 @@ mod tests {
     fn file_refs_and_ntfs_lookup() {
         let db = Db::open_in_memory().unwrap();
         let id = ItemId(Uuid::from_u128(1));
-        let fr = FileRef { item: id, path: "C:\\lib\\a.jpg".into(), volume_serial: Some(0xDEAD_BEEF_u64), file_id: Some([7; 16]) };
+        let fr = FileRef { item: id, path: "C:\\lib\\a.jpg".into(), volume_serial: Some(0xDEAD_BEEF_u64), file_id: Some([7; 16]), mtime_ms: Some(42) };
         put_file_ref(&db.conn, &fr).unwrap();
         assert_eq!(get_file_ref(&db.conn, id).unwrap(), Some(fr.clone()));
         assert_eq!(item_by_file_id(&db.conn, 0xDEAD_BEEF, [7; 16]).unwrap(), Some(id));

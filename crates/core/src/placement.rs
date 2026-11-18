@@ -5,7 +5,8 @@
 //! `AppStorage` (here): phone app-private storage and every core test.
 //!
 //! ```text
-//! <root>/items/<item id>.<ext>   held files (name independent of record name/folder)
+//! <root>/items/<item id>.<ext>   held files (name independent of record name/folder; no dot
+//!                                when the file has no extension)
 //! <root>/bin/<item id>.<ext>     files in the Bin
 //! <root>/parts/<hash hex>.part   in-progress downloads (same volume as items/)
 //! ```
@@ -22,7 +23,15 @@
 //! ```
 //!
 //! Contract every implementation keeps:
-//! C1 Core calls these only with files that passed BLAKE3 and `names::check_media`.
+//! C1 Core calls these only with files that passed BLAKE3 and the type check
+//!    (`names::verify_received`: photos and videos match their bytes, everything else is a plain
+//!    file; the always-refused names and extensions never reach a placement). `FileTarget.ext`
+//!    may be "": build names with `names::join_ext` and test extensions with `names::is_safe_ext`.
+//! C7 PC only: `PcLibrary::commit` marks every file RECEIVED from the other device as downloaded
+//!    (Mark-of-the-Web: NTFS stream `<part>:Zone.Identifier` = "[ZoneTransfer]" + CRLF + "ZoneId=3" + CRLF)
+//!    on the part BEFORE the final hard link / rename, so the file is never visible unmarked, and
+//!    fails closed (nothing appears in the library) when the mark cannot be written. Adopted
+//!    (user's own) files and drag-and-drop copies are never given a mark.
 //! C2 `commit` and `adopt` never overwrite a different item's file (disambiguate); for the
 //!    SAME item (new content) they replace its old file.
 //! C3 Every method returns the resulting path so core keeps `file_ref` accurate.
@@ -99,13 +108,17 @@ impl AppStorage {
         Ok(AppStorage { root })
     }
 
-    /// <dir>/<item id>.<ext>. The extension comes from a synced record, so it is checked
-    /// against the allowlist before it becomes part of a path.
+    /// <dir>/<item id>.<ext> (no dot when the ext is empty). The extension comes from a synced
+    /// record, so it must be a safe one (`names::is_safe_ext`) and not a refused one before it
+    /// becomes part of a path.
     fn file_in(&self, dir: &str, t: &FileTarget) -> Result<PathBuf> {
-        if names::ext_family(&t.ext).is_none() {
-            return Err(CoreError::Invalid(format!("extension '{}' is not allowed", t.ext)));
+        if names::is_refused_ext(&t.ext) {
+            return Err(CoreError::Refused(names::REFUSED_TEXT.to_string()));
         }
-        Ok(self.root.join(dir).join(format!("{}.{}", t.item.0.hyphenated(), t.ext.to_ascii_lowercase())))
+        if !names::is_safe_ext(&t.ext) {
+            return Err(CoreError::Invalid(format!("extension '{}' cannot be used", t.ext)));
+        }
+        Ok(self.root.join(dir).join(names::join_ext(&t.item.0.hyphenated().to_string(), &t.ext)))
     }
 
     fn items_path(&self, t: &FileTarget) -> Result<PathBuf> {
@@ -319,11 +332,21 @@ mod tests {
         let (dir, s) = rig();
         let src = dir.path().join("a.jpg");
         std::fs::write(&src, b"1").unwrap();
-        for ext in ["exe", "jpg/../../evil", "..", "", "jpg\\x", "jpg:stream"] {
+        for ext in ["jpg/../../evil", "..", "jpg\\x", "jpg:stream", "JPG", "a.b", "a b"] {
             let t = target(7, ext);
             assert!(matches!(s.adopt(&src, &t), Err(CoreError::Invalid(_))), "{ext:?}");
             assert!(matches!(s.to_bin(&t), Err(CoreError::Invalid(_))));
             assert!(matches!(s.purge(&t), Err(CoreError::Invalid(_))));
+        }
+        // A refused extension is refused (not just invalid); a plain extension, or none, is fine.
+        let t = target(7, "lnk");
+        assert!(matches!(s.adopt(&src, &t), Err(CoreError::Refused(_))));
+        for ext in ["exe", "", "pdf"] {
+            let t = target(8, ext);
+            let p = s.adopt(&src, &t).unwrap();
+            assert!(p.starts_with(&s.root), "{ext:?}");
+            assert_eq!(p.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_default(), ext);
+            s.purge(&t).unwrap();
         }
         // Nothing escaped the storage root.
         assert!(!dir.path().join("evil").exists());

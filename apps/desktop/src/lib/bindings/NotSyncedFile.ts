@@ -5,6 +5,6 @@
  */
 export type NotSyncedFile = { path: string, name: string, 
 /**
- * One short line, uppercase key word ("NOT A PHOTO OR VIDEO").
+ * One short line, uppercase key word ("REFUSED - ...", "IN PROGRESS - ...").
  */
 reason: string, };

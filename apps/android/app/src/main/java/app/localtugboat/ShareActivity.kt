@@ -29,7 +29,7 @@ object ShareRuns {
 }
 
 /**
- * Share > Tugboat (ACTION_SEND / ACTION_SEND_MULTIPLE for any image or video type). Stays open until the
+ * Share > Tugboat (ACTION_SEND / ACTION_SEND_MULTIPLE, any file type; a share with no stream, such as a link, saves nothing). Stays open until the
  * copy is done: the sender's temporary read grant lives only as long as this activity.
  *
  * The import runs on the process scope and ends the activity through [ShareRuns], not through `this`: if the
@@ -51,16 +51,17 @@ class ShareActivity : ComponentActivity() {
         if (savedInstanceState == null) {
             val uris = sharedUris(intent)
             if (uris.isEmpty()) {
-                Toast.makeText(this, "Nothing to add", Toast.LENGTH_LONG).show()
+                Toast.makeText(this, "NOTHING TO SAVE - share a file", Toast.LENGTH_LONG).show()
                 finish()
                 return
             }
             val app = applicationContext
+            val type = intent.type
             ShareRuns.active.update { it + 1 }
             // Process scope, not the activity's: a rotation or a back press must not stop a half-copied video.
             app.core.scope.launch {
                 val text = try {
-                    ShareImporter.run(app, uris).summary()
+                    ShareImporter.run(app, uris, type).summary()
                 } catch (e: Exception) {
                     app.core.reportError("share failed: ${e.message}")
                     "Could not add: ${e.message}"

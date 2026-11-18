@@ -82,16 +82,20 @@ fn sort_key(f: &FolderRecord) -> (u8, String) {
     (rank, f.name.val.to_lowercase())
 }
 
-/// Live folders with item counts (not in the Bin), Inbox first, then Keep, Unsorted, then
+/// Live folders with item counts (not in the Bin; `hide_refused` leaves out files this device refused:
+/// the PC lists them under Not synced instead), Inbox first, then Keep, Unsorted, then
 /// user folders by name (case-insensitive).
-pub fn folder_views(c: &Connection, now: i64) -> Result<Vec<FolderView>> {
+pub fn folder_views(c: &Connection, now: i64, hide_refused: bool) -> Result<Vec<FolderView>> {
     let folders = store::all_folders(c)?;
     let map: HashMap<FolderId, FolderRecord> = folders.iter().map(|f| (f.id, f.clone())).collect();
     let mut counts: HashMap<FolderId, u32> = HashMap::new();
     // Items effectively deleted are in the Bin whatever the rest says: only items that are not
     // deleted, or that carry a pin (which may outrank an older delete), can be outside it.
     for id in store::item_ids_where(c, "deleted_at IS NULL OR pinned = 1")? {
-        let Some((rec, _)) = store::get_item(c, id)? else { continue };
+        let Some((rec, lfs)) = store::get_item(c, id)? else { continue };
+        if hide_refused && lfs == LocalFileState::Refused {
+            continue;
+        }
         let state = bin::derive_state_in(c, &map, &rec, now)?;
         if !expiry::in_bin(state) {
             // E2: an item in a deleted or unknown folder shows under Unsorted.
@@ -106,7 +110,7 @@ pub fn folder_views(c: &Connection, now: i64) -> Result<Vec<FolderView>> {
     live.sort_by_key(|f| sort_key(f));
     Ok(live
         .into_iter()
-        .map(|f| FolderView { id: f.id, kind: f.kind, name: f.name.val.clone(), retention: f.retention.val, count: counts.get(&f.id).copied().unwrap_or(0) })
+        .map(|f| FolderView { id: f.id, kind: f.kind, name: crate::names::display_name(&f.name.val, ""), retention: f.retention.val, count: counts.get(&f.id).copied().unwrap_or(0) })
         .collect())
 }
 
@@ -202,21 +206,21 @@ mod tests {
         let mut it2 = store::get_item(&db.conn, ItemId(uuid::Uuid::from_u128(0x1002))).unwrap().unwrap().0;
         it2.deleted = Versioned { v: v(5, p()), val: Some(T0) };
         store::update_item(&db.conn, &it2).unwrap();
-        let views = folder_views(&db.conn, T0).unwrap();
+        let views = folder_views(&db.conn, T0, false).unwrap();
         let names: Vec<&str> = views.iter().map(|v| v.name.as_str()).collect();
         assert_eq!(names, vec!["Inbox", "Keep", "Unsorted", "Apple", "zebra"]);
         let count = |n: &str| views.iter().find(|v| v.name == n).unwrap().count;
         assert_eq!((count("Inbox"), count("Apple"), count("zebra"), count("Keep")), (1, 1, 1, 0));
         // Deleting Apple deletes its item too; the folder disappears from the views.
         ops::delete_folder(&mut db.conn, &Ctx { now: T0 + 1, ..ctx }, a).unwrap();
-        let views = folder_views(&db.conn, T0 + 1).unwrap();
+        let views = folder_views(&db.conn, T0 + 1, false).unwrap();
         assert!(views.iter().all(|v| v.name != "Apple"));
         assert_eq!(views.iter().map(|v| v.count).sum::<u32>(), 2, "Inbox 1 + zebra 1");
         // An item that arrives pointing at a deleted folder is shown under Unsorted.
         let mut stray = item(9, f(), v(2, f()));
         stray.location.val.folder = a;
         store::insert_item(&db.conn, &stray, LocalFileState::Pending, T0).unwrap();
-        let views = folder_views(&db.conn, T0 + 1).unwrap();
+        let views = folder_views(&db.conn, T0 + 1, false).unwrap();
         assert_eq!(views.iter().find(|v| v.id == UNSORTED_ID).unwrap().count, 1);
     }
 

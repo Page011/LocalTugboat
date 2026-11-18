@@ -124,11 +124,11 @@ object Capture {
      * SnapException / IOException. [src] is deleted only when the core took it: after a failure the file
      * stays, so a photo is never lost to a transient error (the screen says so, [recover] retries).
      */
-    fun add(c: Context, src: File, name: String, folderId: String?, capturedAtMs: Long, geo: GeoFix?, imported: Boolean, video: Boolean): String {
+    fun add(c: Context, src: File, name: String, folderId: String?, capturedAtMs: Long, geo: GeoFix?, imported: Boolean, video: Boolean, thumbnail: Boolean = true): String {
         // One hand-off per file: [recover] must not take a file a slow hand-off is still working on.
         if (!inFlight.add(src.path)) throw IOException("${src.name} is already being added")
         try {
-            return addNow(c, src, name, folderId, capturedAtMs, geo, imported, video)
+            return addNow(c, src, name, folderId, capturedAtMs, geo, imported, video, thumbnail)
         } finally {
             inFlight.remove(src.path)
         }
@@ -136,9 +136,10 @@ object Capture {
 
     private val inFlight: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet()
 
-    private fun addNow(c: Context, src: File, name: String, folderId: String?, capturedAtMs: Long, geo: GeoFix?, imported: Boolean, video: Boolean): String {
+    private fun addNow(c: Context, src: File, name: String, folderId: String?, capturedAtMs: Long, geo: GeoFix?, imported: Boolean, video: Boolean, thumbnail: Boolean): String {
+        // Only photos and videos get a thumbnail: any other file is a tile with an icon.
         val thumbDir = File(c.cacheDir, "thumbs").apply { mkdirs() }
-        val thumb = Thumbs.make(c, src, video, File(thumbDir, "${UUID.randomUUID()}.jpg"))
+        val thumb = if (thumbnail) Thumbs.make(c, src, video, File(thumbDir, "${UUID.randomUUID()}.jpg")) else null
         try {
             val id = c.core.phone().addFile(
                 NewFile(
@@ -185,21 +186,43 @@ object Capture {
 
 /** What a Share > Tugboat run did, in the words the user reads. */
 class ShareResult(val added: Int, val refused: List<String>, val folderName: String) {
-    /** One line: "2 added to Inbox" or "1 added to Inbox. Not synced: x.zip (not a photo or video)". */
+    /** One line that fits a toast: "2 added to Inbox" or "1 added to Inbox. NOT SYNCED: x.lnk (shortcut file)". The full reason is kept in the error list. */
     fun summary(): String {
         val ok = if (added > 0) "$added added to $folderName" else ""
-        val bad = if (refused.isNotEmpty()) "Not synced: ${refused.joinToString("; ")}" else ""
+        val bad = if (refused.isNotEmpty()) "NOT SYNCED: ${refused.joinToString("; ")}" else ""
         return listOf(ok, bad).filter { it.isNotEmpty() }.joinToString(". ").ifEmpty { "Nothing to add" }
     }
 }
 
-/** Share > Tugboat: streamed copy of each shared URI into app storage, type by magic bytes, then the core. */
+/** Thrown by [Streams.copyWithin] when the source is longer than the room left. */
+class OutOfRoom : IOException("phone storage low")
+
+object Streams {
+    /**
+     * Copy [input] to [output], at most [maxBytes]. A source that streams on past the room left (a provider that gave
+     * no size, or lied) stops at once with [OutOfRoom]: one shared file must never fill the phone.
+     * Returns the bytes copied.
+     */
+    fun copyWithin(input: java.io.InputStream, output: java.io.OutputStream, maxBytes: Long): Long {
+        val buf = ByteArray(64 * 1024)
+        var total = 0L
+        while (true) {
+            val n = input.read(buf)
+            if (n < 0) return total
+            total += n
+            if (total > maxBytes) throw OutOfRoom()
+            output.write(buf, 0, n)
+        }
+    }
+}
+
+/** Share > Tugboat: streamed copy of each shared URI into app storage, then the core. Any file type. */
 object ShareImporter {
     /** Keep this much free after the copy: a full phone breaks more than Tugboat. */
     private const val FREE_MARGIN = 64L * 1024 * 1024
 
-    /** Blocking. One bad file never stops the others; each refusal is named in the result. */
-    fun run(c: Context, uris: List<Uri>): ShareResult {
+    /** Blocking. One bad file never stops the others; each refusal is named in the result. [intentType] = the share intent's MIME type. */
+    fun run(c: Context, uris: List<Uri>, intentType: String? = null): ShareResult {
         val target = Capture.importTarget(c)
         val importDir = File(c.cacheDir, "import").apply { mkdirs() }
         var added = 0
@@ -208,11 +231,15 @@ object ShareImporter {
             val label = displayName(c, uri) ?: "a file"
             try {
                 if (!ShareNames.acceptableUri(uri.scheme, uri.authority, "${c.packageName}.fileprovider")) throw Refusal("not a shared file")
-                if (importOne(c, uri, label, importDir, target.folderId)) added++
+                // Shortcut and folder-setting files never sync: say so before a single byte is copied.
+                if (ShareNames.refused(label)) throw Refusal(ShareNames.REFUSED_SHORT)
+                if (importOne(c, uri, label, intentType, importDir, target.folderId)) added++
             } catch (e: Refusal) {
+                // The toast is gone in seconds: the refusal also goes to the error list, which stays until dismissed.
+                c.core.reportError("share $label: ${if (e.message == ShareNames.REFUSED_SHORT) ShareNames.REFUSED_WHY else e.message}")
                 refused += "$label (${e.message})"
             } catch (e: Exception) {
-                // Core errors (NotMedia, Io, Invalid) carry a readable one-line message.
+                // Core errors (Refused, NotMedia, Io, Invalid) carry a readable one-line message.
                 c.core.reportError("share $label: ${e.message}")
                 refused += "$label (${e.message})"
             }
@@ -222,13 +249,13 @@ object ShareImporter {
 
     private class Refusal(msg: String) : Exception(msg)
 
-    private fun importOne(c: Context, uri: Uri, label: String, dir: File, folderId: String): Boolean {
+    private fun importOne(c: Context, uri: Uri, label: String, intentType: String?, dir: File, folderId: String): Boolean {
         val resolver = c.contentResolver
         val declared = size(c, uri)
         val free = c.core.phone().freeSpaceBytes().toLong()
         if (declared != null && declared + FREE_MARGIN > free) throw Refusal("phone storage low")
         val tmp = File(dir, "${UUID.randomUUID()}.tmp")
-        val media: Media
+        var media: Media? = null
         try {
             val input = resolver.openInputStream(uri) ?: throw Refusal("cannot be opened")
             input.use { ins ->
@@ -239,21 +266,26 @@ object ShareImporter {
                     if (r < 0) break
                     n += r
                 }
-                media = MagicBytes.sniff(head, n) ?: throw Refusal("not a photo or video")
+                // A photo or video is known by its first bytes (and a name that does not say otherwise: an
+                // .m4a is audio); anything else is a plain file.
+                media = ShareNames.mediaFor(label, MagicBytes.sniff(head, n))
                 tmp.outputStream().use { out ->
                     out.write(head, 0, n)
-                    ins.copyTo(out)
+                    Streams.copyWithin(ins, out, free - FREE_MARGIN - n)
                 }
             }
         } catch (e: Exception) {
             tmp.delete()
             if (e is Refusal) throw e
+            if (e is OutOfRoom) throw Refusal(e.message ?: "phone storage low")
             throw IOException("could not be read: ${e.message}", e)
         }
         val fallback = "Shared_${System.currentTimeMillis()}"
-        val name = ShareNames.finalName(label, media, fallback)
+        val mime = ShareQuery.type(resolver, uri) ?: intentType
+        val name = ShareNames.finalName(label, media, if (media == null) FileRules.extFromMime(mime, PlatformMime.extOf) else null, fallback)
         try {
-            Capture.add(c, tmp, name, folderId, System.currentTimeMillis(), null, imported = true, video = media.video)
+            if (ShareNames.refused(name)) throw Refusal(ShareNames.REFUSED_SHORT)
+            Capture.add(c, tmp, name, folderId, System.currentTimeMillis(), null, imported = true, video = media?.video == true, thumbnail = media != null)
         } catch (e: Exception) {
             tmp.delete() // the sender still has the original; our temp copy is only clutter
             throw e

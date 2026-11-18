@@ -170,6 +170,8 @@ pub enum Retention {
 pub enum MediaKind {
     Image,
     Video,
+    /// Any other file (0.2.0: any file type syncs). No thumbnail, no photo/video content check.
+    File,
 }
 
 /// Local-only: what this device physically holds for an item. Never synced.
@@ -188,7 +190,8 @@ pub enum LocalFileState {
     /// Wanted, but the peer answered "not found". Soft: asked again on every connect and every few
     /// minutes, because the answer is often momentary (renamed in Explorer, drive briefly away).
     Lost,
-    /// The received file failed the type check (extension/magic); deleted, never stored.
+    /// The received file failed the type check (extension/magic) or is an always-refused name;
+    /// deleted or never downloaded, never stored.
     Refused,
 }
 
@@ -213,7 +216,8 @@ pub struct Content {
     pub hash: BlobHash,
     pub size: u64,
     pub kind: MediaKind,
-    /// Lowercase extension without the dot, from the allowlist (`names`).
+    /// Lowercase extension without the dot (`names::is_safe_ext`); may be empty (a file with no
+    /// extension). Photos and videos carry one of the media extensions, every other kind never does.
     pub ext: String,
     pub thumb: Option<Thumb>,
 }
@@ -387,9 +391,6 @@ pub enum ItemState {
     Kept,
     /// In a folder whose retention is Keep (or an unknown/deleted folder). Label "Keep".
     FolderKeep,
-    /// Would expire, but the other device has not confirmed holding the file.
-    /// Label "Waiting for PC" / "Waiting for phone".
-    Waiting,
     /// Label "Expires in 5h".
     Live { expires_at: i64 },
 }
@@ -411,8 +412,11 @@ pub struct ItemView {
     pub local: LocalFileState,
     /// Local path of the held file (library or Bin), when held.
     pub path: Option<String>,
-    /// Local path of the thumbnail, when held.
+    /// Local path of the thumbnail, when held. Always None for a File.
     pub thumb_path: Option<String>,
+    /// In the Bin because it EXPIRED, and the paired device never confirmed holding this file:
+    /// the item may now exist on this device only (shown as "NOT ON PC" / "NOT ON PHONE").
+    pub never_reached_peer: bool,
 }
 
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]

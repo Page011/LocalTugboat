@@ -21,8 +21,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::*;
 
-/// Sync protocol version (the N in "localtugboat/N").
-pub const PROTO: u32 = 1;
+/// Sync protocol version, sent in Hello. 2 since 0.2.0: records may be `MediaKind::File` with any
+/// safe extension, and expiry no longer waits for receipts. A 0.1.x peer (proto 1) would drop
+/// those records as Protocol errors and its digest would never match, so the handshake refuses
+/// a mismatch on BOTH sides ("Update Tugboat on the <device with the lower number>") before any
+/// record moves. The ALPN stays `localtugboat/1` on purpose: an ALPN change would make an old
+/// peer fail the TLS handshake and show no message at all. (PLAN says "bump localtugboat/N";
+/// this deviation is recorded in notes/core-design.md section 12.)
+pub const PROTO: u32 = 2;
 
 /// Max records per Changes / Records page, keys per Fetch, entries per List.
 /// Keeps every frame far below tugboat-net frame::MAX_FRAME (8 MiB): a full item record

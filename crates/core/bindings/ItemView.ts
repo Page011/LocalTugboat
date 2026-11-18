@@ -12,6 +12,11 @@ export type ItemView = { id: ItemId, name: string, folder: FolderId, kind: Media
  */
 path: string | null, 
 /**
- * Local path of the thumbnail, when held.
+ * Local path of the thumbnail, when held. Always None for a File.
  */
-thumb_path: string | null, };
+thumb_path: string | null, 
+/**
+ * In the Bin because it EXPIRED, and the paired device never confirmed holding this file:
+ * the item may now exist on this device only (shown as "NOT ON PC" / "NOT ON PHONE").
+ */
+never_reached_peer: boolean, };

@@ -2,6 +2,7 @@
 //! attribute, cloud-sync detection. Everything else in the crate stays platform-neutral std.
 
 use std::{
+    ffi::c_void,
     fs::OpenOptions,
     io,
     os::windows::{
@@ -16,8 +17,9 @@ use windows::{
     Win32::{
         Foundation::HANDLE,
         Storage::FileSystem::{
-            GetFileInformationByHandle, GetFileInformationByHandleEx, SetFileAttributesW, BY_HANDLE_FILE_INFORMATION,
-            FILE_ATTRIBUTE_HIDDEN, FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_INFO, FileIdInfo,
+            CopyFileExW, GetFileInformationByHandle, MoveFileExW, MOVEFILE_COPY_ALLOWED, GetFileInformationByHandleEx, GetVolumeInformationW, GetVolumePathNameW, SetFileAttributesW,
+            BY_HANDLE_FILE_INFORMATION, COPYFILE_FLAGS, COPYPROGRESSROUTINE_PROGRESS, COPY_FILE_FAIL_IF_EXISTS, FILE_ATTRIBUTE_HIDDEN,
+            FILE_ATTRIBUTE_NORMAL, FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_INFO, FileIdInfo, LPPROGRESS_ROUTINE_CALLBACK_REASON, PROGRESS_CONTINUE,
         },
     },
 };
@@ -78,6 +80,95 @@ pub fn hide(path: &Path) -> io::Result<()> {
     let wide: Vec<u16> = path.as_os_str().to_string_lossy().encode_utf16().chain(std::iter::once(0)).collect();
     unsafe { SetFileAttributesW(PCWSTR(wide.as_ptr()), FILE_ATTRIBUTE_HIDDEN) }
         .map_err(|e| io::Error::other(format!("could not hide {}: {e}", path.display())))
+}
+
+fn wide(p: &Path) -> Vec<u16> {
+    p.as_os_str().to_string_lossy().encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// Windows' own text for "this file came from another computer" (Mark-of-the-Web, zone 3 = Internet).
+pub const ZONE_TEXT: &str = "[ZoneTransfer]\r\nZoneId=3\r\n";
+const ZONE_STREAM: &str = ":Zone.Identifier";
+
+fn zone_path(path: &Path) -> PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(ZONE_STREAM);
+    PathBuf::from(s)
+}
+
+/// Mark `path` as downloaded: write the `Zone.Identifier` alternate data stream and read it back.
+/// Err = the file is NOT reliably marked (a volume without named streams, a failed read-back).
+pub fn write_zone_mark(path: &Path) -> io::Result<()> {
+    let stream = zone_path(path);
+    std::fs::write(&stream, ZONE_TEXT)?;
+    if std::fs::read(&stream)? != ZONE_TEXT.as_bytes() {
+        return Err(io::Error::other("the mark did not read back"));
+    }
+    Ok(())
+}
+
+/// The text of the file's `Zone.Identifier` stream, None when it has none.
+pub fn read_zone_mark(path: &Path) -> Option<String> {
+    std::fs::read_to_string(zone_path(path)).ok()
+}
+
+/// Can the volume holding `path` keep NTFS named streams (the Mark-of-the-Web)? FAT and exFAT cannot.
+pub fn supports_named_streams(path: &Path) -> io::Result<bool> {
+    const FILE_NAMED_STREAMS: u32 = 0x0004_0000;
+    let w = wide(path);
+    let mut root = [0u16; 261];
+    unsafe { GetVolumePathNameW(PCWSTR(w.as_ptr()), &mut root) }.map_err(|e| io::Error::other(format!("volume of {}: {e}", path.display())))?;
+    let mut flags = 0u32;
+    unsafe { GetVolumeInformationW(PCWSTR(root.as_ptr()), None, None, None, Some(&mut flags), None) }
+        .map_err(|e| io::Error::other(format!("volume information of {}: {e}", path.display())))?;
+    Ok(flags & FILE_NAMED_STREAMS != 0)
+}
+
+/// Clear hidden, system and read-only on `path` (a copy of a hidden file must not stay hidden: the
+/// library scan skips hidden files, then calls them missing).
+pub fn clear_attributes(path: &Path) -> io::Result<()> {
+    let w = wide(path);
+    unsafe { SetFileAttributesW(PCWSTR(w.as_ptr()), FILE_ATTRIBUTE_NORMAL) }
+        .map_err(|e| io::Error::other(format!("could not clear attributes of {}: {e}", path.display())))
+}
+
+unsafe extern "system" fn copy_progress(
+    total: i64,
+    done: i64,
+    _stream_size: i64,
+    _stream_done: i64,
+    _stream_no: u32,
+    _reason: LPPROGRESS_ROUTINE_CALLBACK_REASON,
+    _src: HANDLE,
+    _dst: HANDLE,
+    data: *const c_void,
+) -> COPYPROGRESSROUTINE_PROGRESS {
+    // SAFETY: `data` is the `&mut &mut dyn FnMut` that `copy_file` keeps alive for the whole call.
+    let cb = unsafe { &mut *(data as *mut &mut dyn FnMut(u64, u64)) };
+    cb(done.max(0) as u64, total.max(0) as u64);
+    PROGRESS_CONTINUE
+}
+
+/// Copy `src` to a NEW file `dst` (fails when `dst` exists) with CopyFileExW: the source is only read,
+/// its streams (an existing Mark-of-the-Web) and its modified time come along. `progress(done, total)`
+/// is called as bytes move.
+pub fn copy_file(src: &Path, dst: &Path, progress: &mut dyn FnMut(u64, u64)) -> io::Result<()> {
+    let (s, d) = (wide(src), wide(dst));
+    let mut cb: &mut dyn FnMut(u64, u64) = progress;
+    let data = &mut cb as *mut &mut dyn FnMut(u64, u64) as *const c_void;
+    let flags: COPYFILE_FLAGS = COPY_FILE_FAIL_IF_EXISTS;
+    // SAFETY: both paths are NUL-terminated and outlive the call; `data` points at `cb`, which does too.
+    unsafe { CopyFileExW(PCWSTR(s.as_ptr()), PCWSTR(d.as_ptr()), Some(copy_progress), Some(data), None, flags) }
+        .map_err(|e| io::Error::from_raw_os_error((e.code().0 as u32 & 0xFFFF) as i32))
+}
+
+/// Move `from` to `to` WITHOUT replacing: when `to` exists the call fails with `AlreadyExists`
+/// (`std::fs::rename` replaces on Windows). Across drives it copies and deletes (MOVEFILE_COPY_ALLOWED).
+pub fn move_no_replace(from: &Path, to: &Path) -> io::Result<()> {
+    let (f, t) = (wide(from), wide(to));
+    // SAFETY: both paths are NUL-terminated and outlive the call.
+    unsafe { MoveFileExW(PCWSTR(f.as_ptr()), PCWSTR(t.as_ptr()), MOVEFILE_COPY_ALLOWED) }
+        .map_err(|e| io::Error::from_raw_os_error((e.code().0 as u32 & 0xFFFF) as i32))
 }
 
 /// Hidden or system file (desktop.ini, Thumbs.db, .tmp markers): never listed as "not synced".
@@ -174,6 +265,21 @@ mod tests {
         assert!(open_exclusive(&p).is_err());
         drop(writer);
         assert!(open_exclusive(&p).is_ok());
+    }
+
+    #[test]
+    fn move_no_replace_never_overwrites() {
+        let d = tempfile::tempdir().unwrap();
+        let (a, b, c) = (d.path().join("a.txt"), d.path().join("b.txt"), d.path().join("c.txt"));
+        std::fs::write(&a, b"new").unwrap();
+        std::fs::write(&b, b"someone else's").unwrap();
+        let e = move_no_replace(&a, &b).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&b).unwrap(), b"someone else's", "the existing file is untouched");
+        assert!(a.exists(), "the source stays after a refused move");
+        move_no_replace(&a, &c).unwrap();
+        assert!(!a.exists());
+        assert_eq!(std::fs::read(&c).unwrap(), b"new");
     }
 
     #[test]

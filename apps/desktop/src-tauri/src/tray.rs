@@ -114,7 +114,7 @@ mod tests {
     use super::*;
 
     fn status(state: SyncState, waiting: u32, downloading: u32) -> SyncStatus {
-        SyncStatus { state, peer_name: Some("Pixel".into()), last_synced_at: None, waiting, downloading, message: None }
+        SyncStatus { state, peer_name: Some("Pixel".into()), last_synced_at: None, waiting, downloading, storage_low: false, message: None }
     }
 
     #[test]

@@ -183,8 +183,11 @@ fn n19_open_hello_after_expiry() {
 fn n19_open_hello_wrong_proto_stays_open() {
     let (mut w, phone) = win();
     let mut h = hello(&w.secret);
-    h.proto = 2;
-    assert_eq!(w.on_hello(phone, &h, T0 + 1), Err(PairError::VersionMismatch { ours: PAIR_PROTO, theirs: 2 }));
+    // A 0.1.x phone (proto 1) and a phone from the future both get the mismatch, the window stays open.
+    h.proto = 1;
+    assert_eq!(w.on_hello(phone, &h, T0 + 1), Err(PairError::VersionMismatch { ours: PAIR_PROTO, theirs: 1 }));
+    h.proto = PAIR_PROTO + 1;
+    assert_eq!(w.on_hello(phone, &h, T0 + 1), Err(PairError::VersionMismatch { ours: PAIR_PROTO, theirs: PAIR_PROTO + 1 }));
     assert!(w.accepting() && w.cancelled().is_none());
     h.proto = PAIR_PROTO;
     assert!(w.on_hello(phone, &h, T0 + 2).is_ok());

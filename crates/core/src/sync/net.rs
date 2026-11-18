@@ -451,6 +451,13 @@ pub(crate) async fn run_session(core: Core, conn: Arc<PeerConn>, dialer: bool) {
     let peer = DeviceId(conn.peer());
     let (end, refused) = drive(&core, &conn, dialer, cmd_rx).await;
     conn.close(close::NORMAL, "session ended");
+    // "Last seen" is the last contact: written when the session ends too, not only at the hello,
+    // so a long session does not leave the time at its start (Settings showed "never" / stale).
+    if matches!(core.with_ctx(|c, _| crate::store::is_paired(c, peer)), Ok(true)) {
+        if let Err(e) = core.with_ctx(|c, ctx| crate::store::touch_last_seen(c, peer, ctx.now)) {
+            core.emit_error(e.kind(), &format!("could not save the last seen time: {e}"));
+        }
+    }
     let current = {
         let mut a = lock(&core.inner.active);
         let mine = a.as_ref().is_some_and(|x| x.gen == gen);
@@ -626,7 +633,7 @@ async fn drive(core: &Core, conn: &Arc<PeerConn>, dialer: bool, mut cmd_rx: mpsc
                     Ok(None) => {}
                     Err(e) => return (End::Core(e), refused),
                 }
-                // A new receipt or restore can change what is downloadable and what is Waiting.
+                // A new receipt or restore can change what is downloadable and the waiting count.
                 schedule(core, conn, peer, &mut fetcher, &fetch_tx);
                 evaluate(core, &sess, &refused);
             }
@@ -666,7 +673,9 @@ async fn drive(core: &Core, conn: &Arc<PeerConn>, dialer: bool, mut cmd_rx: mpsc
                 return (sent.map(|_| End::Clean).unwrap_or_else(End::Net), refused);
             }
             _ = ticker.tick() => {
-                if fetcher.has_backoff() || fetcher.lost_due() {
+                let guard_wait = std::time::Duration::from_millis(inner.guard_recheck_ms.load(std::sync::atomic::Ordering::SeqCst));
+                let guard_due = inner.storage_low.load(std::sync::atomic::Ordering::SeqCst) && fetcher.last_schedule.elapsed() >= guard_wait;
+                if fetcher.has_backoff() || fetcher.lost_due() || guard_due {
                     schedule(core, conn, peer, &mut fetcher, &fetch_tx);
                 }
                 if busy {
@@ -786,13 +795,30 @@ enum FetchOutcome {
     Dropped,
 }
 
-#[derive(Default)]
 struct Fetcher {
     in_flight: HashSet<ItemId>,
     hashes: HashSet<BlobHash>,
+    /// Running downloads: item -> (hash, declared size). The storage guard counts what they still
+    /// have to write.
+    sizes: HashMap<ItemId, (BlobHash, u64)>,
+    /// When `schedule` last ran: a queue blocked by the storage guard looks again after a while.
+    last_schedule: Instant,
     backoff: HashMap<ItemId, (u32, Instant)>,
     /// Lost items already asked for in this session -> earliest time to ask again.
     lost_tried: HashMap<ItemId, Instant>,
+}
+
+impl Default for Fetcher {
+    fn default() -> Self {
+        Fetcher {
+            in_flight: HashSet::new(),
+            hashes: HashSet::new(),
+            sizes: HashMap::new(),
+            last_schedule: Instant::now(),
+            backoff: HashMap::new(),
+            lost_tried: HashMap::new(),
+        }
+    }
 }
 
 impl Fetcher {
@@ -809,6 +835,7 @@ impl Fetcher {
     fn finish(&mut self, d: &FetchDone, base_ms: u64) {
         self.in_flight.remove(&d.id);
         self.hashes.remove(&d.hash);
+        self.sizes.remove(&d.id);
         match &d.outcome {
             FetchOutcome::Retry { .. } => {
                 let tries = self.backoff.get(&d.id).map(|b| b.0).unwrap_or(0) + 1;
@@ -825,20 +852,59 @@ impl Fetcher {
     }
 }
 
+/// What the storage guard knows about the free space in one scheduling pass.
+enum Space {
+    /// The PC: no guard.
+    Unlimited,
+    /// Phone: bytes that may still be written before the guard is reached (free space, minus what
+    /// the running downloads still have to write, minus the guard); `below` = free < guard now.
+    Known { spare: u64, below: bool, free: u64, guard: u64 },
+    /// `available_space()` failed: never read as "enough".
+    Unknown(String),
+}
+
 /// Start downloads for Pending items, oldest first, up to `MAX_PARALLEL_FETCH`.
+///
+/// Phone storage guard (R1, 0.2.0): `Settings.storage_guard_bytes` is enforced here, on the phone
+/// only. Nothing is downloaded while the free space is below the guard, and one item is skipped
+/// when `free - bytes still to come of the downloads running - this item's remaining bytes` would
+/// drop below the guard (a 3 GB video never eats the margin). A part file that already exists
+/// counts as used, so a resumed download only needs the rest. When `available_space()` fails the
+/// queue is blocked too and the error is shown: an unknown amount of space is never "enough".
+/// A blocked queue is never silent: `SyncStatus.storage_low` is set, one activity row is written
+/// when the guard turns on, and the queue looks again after `guard_recheck_ms` (30 s) and on kick.
 fn schedule(core: &Core, conn: &Arc<PeerConn>, peer: DeviceId, f: &mut Fetcher, done_tx: &mpsc::UnboundedSender<FetchDone>) {
     if lock(&core.inner.paused).is_some() || f.in_flight.len() >= MAX_PARALLEL_FETCH || !conn.is_open() {
         return;
     }
     let now = core.now();
     let t = Instant::now();
+    f.last_schedule = t;
     // Walk the oldest Pending items lazily and stop as soon as the free slots are filled: a
     // first sync of a big library must not re-read every pending item after each download.
     let slots = MAX_PARALLEL_FETCH - f.in_flight.len();
-    let picked: Result<Vec<(ItemId, BlobHash)>> = (|| {
+    let phone = core.inner.cfg.role == Role::Phone;
+    let placement = core.inner.placement.clone();
+    // Set when the guard held an item back in this pass: why.
+    let mut held_back: Option<String> = None;
+    let picked: Result<Vec<(ItemId, BlobHash, u64)>> = (|| {
         let db = lock(&core.inner.db);
         let c = &db.conn;
-        let mut out: Vec<(ItemId, BlobHash)> = Vec::new();
+        let mut out: Vec<(ItemId, BlobHash, u64)> = Vec::new();
+        let mut space = Space::Unlimited;
+        let settings = crate::store::load_settings(c)?;
+        let max_blob = settings.max_blob_bytes;
+        if phone {
+            let guard = settings.storage_guard_bytes;
+            space = match placement.available_space() {
+                Ok(free) => {
+                    let still_coming: u64 =
+                        f.sizes.values().map(|(h, size)| size.saturating_sub(part_len(&*placement, h))).fold(0u64, |a, b| a.saturating_add(b));
+                    Space::Known { spare: free.saturating_sub(still_coming).saturating_sub(guard), below: free < guard, free, guard }
+                }
+                Err(e) => Space::Unknown(e.to_string()),
+            };
+        }
         // Pending first; Lost items only once per LOST_RETRY (and once at session start).
         let mut candidates = crate::store::items_in_state(c, &[LocalFileState::Pending], 500)?;
         if candidates.len() < slots.max(1) {
@@ -857,17 +923,40 @@ fn schedule(core: &Core, conn: &Arc<PeerConn>, peer: DeviceId, f: &mut Fetcher, 
             let Some((rec, _)) = crate::store::get_item(c, id)? else { continue };
             let hash = rec.content.val.hash;
             // Two items with the same file share one part file: one download at a time per hash.
-            if f.hashes.contains(&hash) || out.iter().any(|(_, h)| *h == hash) {
+            if f.hashes.contains(&hash) || out.iter().any(|(_, h, _)| *h == hash) {
                 continue;
             }
             // A Pending item that sits in the Bin is never downloaded: the sweep purges it.
             if expiry::in_bin(bin::derive_state(c, &rec, now)?) {
                 continue;
             }
-            out.push((id, hash));
+            // A record over max_blob_bytes is never stored: fetch_item refuses it once (TOO LARGE),
+            // so the space guard must not hold it back for ever behind a PHONE STORAGE LOW banner.
+            let oversize = rec.content.val.size > max_blob;
+            match &mut space {
+                Space::Unlimited => {}
+                _ if oversize => {}
+                Space::Unknown(e) => {
+                    held_back.get_or_insert_with(|| format!("cannot read the free space: {e}"));
+                    continue;
+                }
+                Space::Known { below: true, free, guard, .. } => {
+                    held_back.get_or_insert_with(|| format!("{} MB free, the guard is {} MB", *free / (1024 * 1024), *guard / (1024 * 1024)));
+                    continue;
+                }
+                Space::Known { spare, guard, .. } => {
+                    let need = rec.content.val.size.saturating_sub(part_len(&*placement, &hash));
+                    if need > *spare {
+                        held_back.get_or_insert_with(|| format!("a {} MB file does not fit above the {} MB guard", need / (1024 * 1024), *guard / (1024 * 1024)));
+                        continue;
+                    }
+                    *spare -= need;
+                }
+            }
+            out.push((id, hash, rec.content.val.size));
         }
         // Remember when each picked Lost item was asked, so it is not asked in a loop.
-        for (id, _) in &out {
+        for (id, _, _) in &out {
             if let Some((_, LocalFileState::Lost)) = crate::store::get_item(c, *id)? {
                 f.lost_tried.insert(*id, t + LOST_RETRY);
             }
@@ -881,14 +970,43 @@ fn schedule(core: &Core, conn: &Arc<PeerConn>, peer: DeviceId, f: &mut Fetcher, 
             return;
         }
     };
-    for (id, hash) in picked {
+    if phone {
+        set_storage_low(core, held_back);
+    }
+    for (id, hash, size) in picked {
         f.in_flight.insert(id);
         f.hashes.insert(hash);
+        f.sizes.insert(id, (hash, size));
         let (core, conn, tx) = (core.clone(), conn.clone(), done_tx.clone());
         tokio::spawn(async move {
             let outcome = fetch_item(&core, &conn, peer, id).await;
             let _ = tx.send(FetchDone { id, hash, outcome });
         });
+    }
+}
+
+/// Bytes of the in-progress part file of `hash` (0 when there is none).
+fn part_len(placement: &dyn crate::placement::Placement, hash: &BlobHash) -> u64 {
+    placement.part_path(hash).ok().and_then(|p| std::fs::metadata(p).ok()).map(|m| m.len()).unwrap_or(0)
+}
+
+/// Turn the storage-guard flag on or off. On the OFF -> ON edge: one activity row and one error
+/// event (never one per 30 s pass); every change refreshes the status the UIs show.
+fn set_storage_low(core: &Core, why: Option<String>) {
+    use std::sync::atomic::Ordering::SeqCst;
+    let low = why.is_some();
+    let was = core.inner.storage_low.swap(low, SeqCst);
+    if low && !was {
+        let text = "PHONE STORAGE LOW - downloads wait";
+        let detail = format!("{text} ({})", why.unwrap_or_default());
+        match core.with_ctx(|c, ctx| crate::activity::log(c, ctx.now, None, None, ActivityAction::SyncError, &detail)) {
+            Ok(_) => core.emit(Event::ActivityAdded),
+            Err(e) => core.emit_error(e.kind(), &format!("could not log the storage guard: {e}")),
+        }
+        core.emit_error("storage_low", text);
+    }
+    if low != was {
+        core.emit_status();
     }
 }
 
@@ -914,7 +1032,18 @@ async fn fetch_item(core: &Core, conn: &Arc<PeerConn>, peer: DeviceId, id: ItemI
     };
     let content = rec.content.val.clone();
 
-    if let Some(t) = &content.thumb {
+    // Refused records transfer nothing: not the thumbnail, not the file, no part file. The record
+    // itself was accepted (digests stay equal); this device just never holds the file.
+    if names::is_refused_record(&rec.name.val, &content.ext) {
+        return refuse(core, id, content.hash, "refused", names::REFUSED_TEXT.to_string());
+    }
+    if content.size > settings.max_blob_bytes {
+        // Declared too large by the record: one final refusal, not a retry loop.
+        return refuse(core, id, content.hash, "refused", ops::too_large_text(settings.max_blob_bytes));
+    }
+
+    // Thumbnails belong to photos and videos only; a File's thumbnail field is never fetched.
+    if let Some(t) = content.thumb.as_ref().filter(|_| content.kind != MediaKind::File) {
         let dest = core.thumb_path(t.hash);
         if !dest.exists() {
             if let Err(msg) = fetch_thumb(conn, t, &dest).await {
@@ -952,14 +1081,15 @@ async fn fetch_item(core: &Core, conn: &Arc<PeerConn>, peer: DeviceId, id: ItemI
         Ok(h) => h,
         Err(e) => return FetchOutcome::Retry { kind: e.kind().into(), message: e.to_string(), connection_lost: false },
     };
-    if let Err(e) = names::check_media(&content.ext, &head) {
+    // verify_received never re-derives kind or extension from the bytes: a photo must match its
+    // bytes, a File must not carry a photo extension, a refused extension never passes.
+    if let Err(e) = names::verify_received(content.kind, &content.ext, &head) {
         let _ = tokio::fs::remove_file(&part).await;
-        let reason = e.to_string();
-        return match core.with_ctx(|c, ctx| ops::blob_refused(c, ctx, id, content.hash, &reason)) {
-            Ok(false) => FetchOutcome::Dropped,
-            Ok(true) => FetchOutcome::Final { kind: "not_media".into(), message: format!("REFUSED a file from the other device: {reason}") },
-            Err(e) => FetchOutcome::Retry { kind: e.kind().into(), message: e.to_string(), connection_lost: false },
+        let (kind, text) = match e {
+            names::NameError::Refused(_) => ("refused", names::REFUSED_TEXT.to_string()),
+            other => ("not_media", format!("REFUSED a file from the other device: {other}")),
         };
+        return refuse(core, id, content.hash, kind, text);
     }
 
     let placed = core.with_ctx(|c, ctx| {
@@ -981,6 +1111,22 @@ async fn fetch_item(core: &Core, conn: &Arc<PeerConn>, peer: DeviceId, id: ItemI
             let _ = tokio::fs::remove_file(&part).await;
             FetchOutcome::Dropped
         }
+        // The placement refused the name this device would give the file (an always-refused final
+        // name, for example `desktop` + `ini`): final and visible, never an endless retry.
+        Err(CoreError::Refused(text)) => {
+            let _ = tokio::fs::remove_file(&part).await;
+            refuse(core, id, content.hash, "refused", text)
+        }
+        Err(e) => FetchOutcome::Retry { kind: e.kind().into(), message: e.to_string(), connection_lost: false },
+    }
+}
+
+/// Record the refusal (local state Refused, one activity row, the file never stored) and report it
+/// once. `Dropped` when the item changed or was handled elsewhere meanwhile.
+fn refuse(core: &Core, id: ItemId, hash: BlobHash, kind: &str, text: String) -> FetchOutcome {
+    match core.with_ctx(|c, ctx| ops::blob_refused(c, ctx, id, hash, &text)) {
+        Ok(false) => FetchOutcome::Dropped,
+        Ok(true) => FetchOutcome::Final { kind: kind.into(), message: text },
         Err(e) => FetchOutcome::Retry { kind: e.kind().into(), message: e.to_string(), connection_lost: false },
     }
 }
@@ -1022,6 +1168,7 @@ struct CoreBlobSource {
 
 impl BlobSource for CoreBlobSource {
     fn open(&self, hash: &str) -> Option<PathBuf> {
+        lock(&self.core.inner.blob_requests).push(hash.to_string());
         let raw: [u8; 32] = hex::decode(hash).ok()?.try_into().ok()?;
         let hash = BlobHash(raw);
         let from_items = {

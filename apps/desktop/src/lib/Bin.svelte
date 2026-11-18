@@ -4,7 +4,7 @@
   import { api } from "./api";
   import { act, app } from "./app.svelte";
   import Chip from "./Chip.svelte";
-  import { binLabel, fmtSize } from "./format";
+  import { binLabel, fmtSize, peerNote } from "./format";
   import ItemGrid from "./ItemGrid.svelte";
   import { PagedItems } from "./paged.svelte";
 
@@ -63,6 +63,7 @@
         <strong>{sel.name}</strong>
         <span class="muted">{fmtSize(sel.size)}</span>
         <Chip label={binLabel(sel, days, app.now)} />
+        {#if peerNote(sel)}<Chip label={{ text: peerNote(sel) ?? "", tone: "warn", icon: "alert" }} />{/if}
       </div>
       <button class="btn primary" onclick={restore}><Undo2 size={16} aria-hidden="true" /> Restore</button>
     </div>

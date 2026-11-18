@@ -51,10 +51,13 @@ pub struct SyncStatus {
     pub peer_name: Option<String>,
     /// PLAN silent-failure row "Sync stopped": shown as "last synced" on both apps.
     pub last_synced_at: Option<i64>,
-    /// Items in state Waiting (not confirmed by the other device).
+    /// Items held here (not in the Bin) that the paired device has not confirmed holding yet
+    /// ("PC not found, 3 waiting"). 0 while unpaired. Expiry never waits for them (0.2.0).
     pub waiting: u32,
-    /// Downloads queued.
+    /// Items that wait on the other device: Pending here (queued downloads).
     pub downloading: u32,
+    /// Phone: the storage guard (`Settings.storage_guard_bytes`) is holding downloads back.
+    pub storage_low: bool,
     /// One short line for Refused/Paused ("Update Tugboat on the PC").
     pub message: Option<String>,
 }

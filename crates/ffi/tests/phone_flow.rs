@@ -178,8 +178,9 @@ fn pair_send_receive_push_and_typed_errors() {
     let on_pc = pc.core.item(item_uuid).unwrap().unwrap();
     assert_eq!(std::fs::read(on_pc.path.as_ref().unwrap()).unwrap(), photo, "bytes identical on the PC");
     until("the thumbnail reaches the PC", 10, || pc.core.item(item_uuid).unwrap().is_some_and(|v| v.thumb_path.is_some()));
-    // The PC's receipt turns "Waiting for PC" into a countdown: Inbox is 24 hours from the capture here.
-    until("the item shows a countdown", 20, || matches!(phone.item(id.clone()).unwrap().unwrap().state, ItemStateInfo::Live { .. }));
+    // Items never wait for the PC any more: the countdown runs from the start (Inbox is 24 hours).
+    assert!(matches!(phone.item(id.clone()).unwrap().unwrap().state, ItemStateInfo::Live { .. }));
+    assert!(!phone.status().storage_low, "the storage guard is off");
     let after = now_ms();
     let ItemStateInfo::Live { expires_at_ms } = phone.item(id.clone()).unwrap().unwrap().state else { unreachable!() };
     assert!((before + DAY_MS..=after + DAY_MS).contains(&expires_at_ms), "expires 24 h after it entered Inbox: {expires_at_ms}");
@@ -228,13 +229,26 @@ fn pair_send_receive_push_and_typed_errors() {
         Err(SnapError::Io(m)) => assert!(m.contains("nope.jpg"), "the message names the file: {m}"),
         other => panic!("a missing file must be Io, got {other:?}"),
     }
+    // Any other file type is a plain file; the always-refused names are refused with their own error.
+    let pdf = phone.add_file(bad(write(&src, "plan.pdf", b"%PDF-1.7 plan"), "plan.pdf")).expect("a pdf is accepted");
+    let pdf_item = phone.item(pdf).unwrap().unwrap();
+    assert_eq!((pdf_item.kind, pdf_item.ext.as_str(), pdf_item.thumb_path.is_none()), (MediaKind::File, "pdf", true));
+    for refused in ["shortcut.lnk", "desktop.ini", "AUTORUN.INF", "page.url"] {
+        match phone.add_file(bad(write(&src, "refused-src", b"x"), refused)) {
+            Err(SnapError::Refused(m)) => assert_eq!(m, "REFUSED - shortcut and folder-setting files never sync", "{refused}"),
+            other => panic!("{refused} must be Refused, got {other:?}"),
+        }
+    }
+    assert!(tugboat_ffi::names_is_refused("x.LNK. ".into()) && !tugboat_ffi::names_is_refused("x.pdf".into()));
+    assert_eq!(tugboat_ffi::names_ext_of("Report.PDF".into()), "pdf");
+    assert_eq!(tugboat_ffi::names_ext_of("Makefile".into()), "");
     let exe = write(&src, "evil.jpg", b"MZ\x90\x00 this is a program, not a photo");
     assert!(matches!(phone.add_file(bad(exe, "evil.jpg")), Err(SnapError::NotMedia(_))), "an exe renamed .jpg is refused by its bytes");
     let gone_folder = uuid::Uuid::from_u128(0xdead).to_string();
     let to_nowhere = NewFile { folder_id: Some(gone_folder), ..bad(write(&src, "ok.jpg", &jpeg_bytes(4, 1000)), "ok.jpg") };
     assert!(matches!(phone.add_file(to_nowhere), Err(SnapError::Invalid(_))), "an unknown folder is refused");
     assert!(matches!(phone.add_file(NewFile { folder_id: Some("zzz".into()), ..bad(String::new(), "x.jpg") }), Err(SnapError::InvalidInput(_))));
-    assert_eq!(all_items(&phone).len(), count, "failed adds left no item behind");
+    assert_eq!(all_items(&phone).len(), count + 1, "failed adds left no item behind (only the pdf was added)");
 
     // ---- keep, move, delete (Bin), restore, activity ----
     phone.set_pinned(id.clone(), true).unwrap();

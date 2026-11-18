@@ -202,12 +202,20 @@ fn validate_remote(record: &Record) -> Result<()> {
     match record {
         Record::Item(r) => {
             check_name("item", &r.name.val)?;
-            // The extension is used to build paths: only allowlisted extensions pass.
-            if names::ext_family(&r.content.val.ext).is_none() {
-                return Err(proto(format!("item {} has extension '{}' which is not allowed", r.id.0, r.content.val.ext)));
+            // The extension is used to build paths: only safe ones pass (empty, or 1-16 lowercase
+            // a-z 0-9 - _). A record may carry any file type now, but kind and extension must agree
+            // (a File with a photo extension would skip the content check, a photo with a document
+            // extension would get a thumbnail). A record whose NAME or extension is one of the
+            // always-refused ones is still ACCEPTED as a record (both devices' digests must stay
+            // equal) and never downloaded (sync::net::fetch_item).
+            let ext = &r.content.val.ext;
+            if !names::is_safe_ext(ext) {
+                return Err(proto(format!("item {} has extension '{}' which cannot be used", r.id.0, ext)));
             }
-            if r.content.val.ext != r.content.val.ext.to_ascii_lowercase() {
-                return Err(proto("item extension must be lowercase"));
+            match (r.content.val.kind, names::ext_family(ext)) {
+                (MediaKind::File, None) => {}
+                (MediaKind::Image | MediaKind::Video, Some(fam)) if fam.kind() == r.content.val.kind => {}
+                _ => return Err(proto(format!("item {} has kind {:?} and extension '{}' which do not belong together", r.id.0, r.content.val.kind, ext))),
             }
             if r.content.val.size > i64::MAX as u64 || r.content.val.thumb.as_ref().is_some_and(|t| t.size > i64::MAX as u64) {
                 return Err(proto("item size out of range"));
@@ -759,11 +767,54 @@ mod tests {
         let r = Record::Receipt(ReceiptRecord { hash: hash(1), device: f(), received_at: 77 });
         let a = apply_remote(&d.conn, p(), f(), &r, T0).unwrap();
         assert_eq!(a.changed, Some(EntityKey::Receipt { hash: hash(1), device: f() }));
-        assert_eq!(store::peer_receipt_seen_at(&d.conn, hash(1)).unwrap(), Some(T0));
+        assert!(store::peer_has_receipt(&d.conn, hash(1), f()).unwrap());
         let a = apply_remote(&d.conn, p(), f(), &r, T0 + 5).unwrap();
         assert_eq!(a.changed, None, "duplicate");
-        assert_eq!(store::peer_receipt_seen_at(&d.conn, hash(1)).unwrap(), Some(T0), "seen_at not moved by a duplicate");
+        let seen: i64 = d.conn.query_row("SELECT seen_at FROM receipt", [], |r| r.get(0)).unwrap();
+        assert_eq!(seen, T0, "seen_at not moved by a duplicate");
         assert_eq!(store::head_seq(&d.conn).unwrap(), 0, "M9: remote-applied changes are not logged");
+    }
+
+    // 0.2.0: any file type. validate_remote accepts a File with a safe extension (or none), keeps
+    // kind and extension together, and still ACCEPTS a refused name (digests stay equal).
+    #[test]
+    fn validate_remote_for_any_file_type() {
+        let rec = |kind: MediaKind, ext: &str, name: &str| {
+            let mut it = item(3, f(), v(2, f()));
+            it.content.val.kind = kind;
+            it.content.val.ext = ext.into();
+            it.name.val = name.into();
+            Record::Item(it)
+        };
+        for (kind, ext, name) in [
+            (MediaKind::File, "pdf", "report.pdf"),
+            (MediaKind::File, "", "Makefile"),
+            (MediaKind::File, "tar-gz", "x.tar-gz"),
+            (MediaKind::File, "exe", "setup.exe"),
+            (MediaKind::Image, "jpg", "a.jpg"),
+            (MediaKind::Video, "mp4", "a.mp4"),
+            // Accepted as records, refused at download time.
+            (MediaKind::File, "lnk", "x.lnk"),
+            (MediaKind::File, "", "desktop.ini"),
+            (MediaKind::File, "", "AUTORUN.INF. "),
+        ] {
+            validate_remote(&rec(kind, ext, name)).unwrap_or_else(|e| panic!("{kind:?} {ext:?}: {e}"));
+        }
+        for (kind, ext) in [
+            (MediaKind::File, "PDF"),
+            (MediaKind::File, "pd f"),
+            (MediaKind::File, "../x"),
+            (MediaKind::File, "a.b"),
+            (MediaKind::File, "jpg"),
+            (MediaKind::File, "mp4"),
+            (MediaKind::Image, "pdf"),
+            (MediaKind::Image, ""),
+            (MediaKind::Video, "jpg"),
+            (MediaKind::Image, "mp4"),
+        ] {
+            assert!(validate_remote(&rec(kind, ext, "x")).is_err(), "{kind:?} with ext {ext:?} must be rejected");
+        }
+        assert!(validate_remote(&rec(MediaKind::File, &"x".repeat(17), "x")).is_err());
     }
 
     // L9: a new remote item is Pending; applying logs nothing (M9).

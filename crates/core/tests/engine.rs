@@ -241,7 +241,7 @@ fn a_message_before_hello_is_a_protocol_error() {
 #[test]
 fn version_mismatch_is_refused_on_both_sides_without_exchanging_records() {
     let (mut phone, mut pc) = pair_up();
-    phone.sess.proto = 2;
+    phone.sess.proto = 3;
     phone.folder("secret");
     let hello = phone.sess.hello(&phone.db.conn).unwrap();
     let step = pc.sess.handle(&mut pc.db.conn, hello, T0).unwrap();

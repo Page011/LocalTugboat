@@ -85,7 +85,7 @@ throw; every other method carries `@Throws(SnapException::class)` in the generat
 | `open` | Logging, database (backup, migrate; a newer database is refused with `NewerDatabase`), default folders Inbox / Keep / Unsorted, one Bin sweep, event pump, ticker (Bin sweep and pairing expiry at the core's next due time, at most 60 s apart). Does not touch the network. |
 | `deviceId` | This phone's public key, 64 hex chars. |
 | `logPath` | Current log file. `<path>.1` and `<path>.2` are the older rotated files (5 MB each, three kept). "Export log" shares all that exist, oldest first. |
-| `freeSpaceBytes` | Free bytes on the volume holding phone copies, for the storage guard banner against `Settings.storageGuardBytes`. Core does not enforce the guard yet (M4): the banner is the app's. |
+| `freeSpaceBytes` | Free bytes on the volume holding phone copies. Used for Settings' storage line and for refusing a shared file that does not fit. The storage guard itself is enforced by the core since 0.2.0 (downloads stop below `Settings.storageGuardBytes`); the banner follows `SyncStatus.storageLow`, not this number. |
 | `startNetwork(mdns)` | Starts the endpoint (binds `0.0.0.0`, random UDP port) and the connect loop to the paired PC (cached addresses first, `mdns` = then look it up by name). `Invalid` if already started. |
 | `stopNetwork` | Stops it. |
 | `reconnectNow` | Wi-Fi changed or app came to the front: dial the PC now instead of waiting out the back-off (up to 30 s). Safe any time. |
@@ -169,11 +169,11 @@ data class PairingPreview(
 
 data class NewFile(
     var srcPath: kotlin.String,        // file the app owns; core copies it, the caller deletes it
-    var name: kotlin.String,           // display name; extension and magic bytes must agree
+    var name: kotlin.String,           // display name. Any type: a photo/video extension must match its bytes, every other name (or none) is a plain File. Shortcut and folder-setting names are refused
     var folderId: kotlin.String?,      // null = Inbox
     var capturedAtMs: kotlin.Long,
     var geo: GeoFix?,
-    var thumbPath: kotlin.String?,     // JPEG, longest side 512 px, made by the app
+    var thumbPath: kotlin.String?,     // JPEG, longest side 512 px, made by the app. Photos and videos only: the core ignores it for a File
     var imported: kotlin.Boolean       // false = camera shot, true = Share > Tugboat
 )
 
@@ -188,8 +188,9 @@ data class SyncStatus(
     var state: SyncState,
     var peerName: kotlin.String?,
     var lastSyncedAt: kotlin.Long?,    // unix ms, "Synced 10s ago"
-    var waiting: kotlin.UInt,          // items waiting for the PC's receipt ("3 waiting")
-    var downloading: kotlin.UInt,
+    var waiting: kotlin.UInt,          // held here, not in the Bin, no receipt from the PC yet ("3 waiting"); nothing is held back for it: items expire on time
+    var downloading: kotlin.UInt,      // items that wait on the PC (Pending here)
+    var storageLow: kotlin.Boolean,    // 0.2.0: the storage guard is holding downloads back (red banner: "PHONE STORAGE LOW - 37 items wait on the PC")
     var message: kotlin.String?        // one line for REFUSED / PAUSED / "PC NOT TOLD YET ..."
 )
 
@@ -206,7 +207,7 @@ data class Settings(
 
 ```kotlin
 enum class FolderKind { INBOX, KEEP, UNSORTED, USER }
-enum class MediaKind { IMAGE, VIDEO }
+enum class MediaKind { IMAGE, VIDEO, FILE }   // FILE (0.2.0) = any other file type: icon tile, no thumbnail
 enum class LocalFileState { PENDING, PRESENT, BINNED, PURGED, LOST, REFUSED }
 enum class SyncState { UNPAIRED, OFFLINE, CONNECTING, SYNCING, SYNCED, PAUSED, REFUSED }
 enum class ActivityAction {
@@ -220,7 +221,6 @@ sealed class ItemStateInfo {
     data class Expired(val binnedAtMs: kotlin.Long) : ItemStateInfo()   // in the Bin, expired
     object Kept : ItemStateInfo()        // pinned: "Kept"
     object FolderKeep : ItemStateInfo()  // folder never expires: "Keep"
-    object Waiting : ItemStateInfo()     // PC has not confirmed the file: "Waiting for PC"
     data class Live(val expiresAtMs: kotlin.Long) : ItemStateInfo()     // "Expires in 5h"
 }
 
@@ -274,7 +274,8 @@ sealed class SnapException(message: String) : kotlin.Exception(message) {
     class NotFound(message: String)
     class InvalidName(message: String)
     class Invalid(message: String)             // rule broken: unknown/deleted folder, restore of a non-Bin item, bad setting
-    class NotMedia(message: String)            // not a supported photo/video (extension or magic bytes)
+    class NotMedia(message: String)            // a photo/video extension whose bytes are not one (an exe renamed .jpg)
+    class Refused(message: String)             // 0.2.0: always-refused name (.lnk .url .scf .library-ms .searchConnector-ms, desktop.ini, autorun.inf) or over 16 GB
     class FileGone(message: String)
     class NotPaired(message: String)
     class AlreadyPaired(message: String)
@@ -296,15 +297,26 @@ sealed class SnapException(message: String) : kotlin.Exception(message) {
     class Pairing(message: String)             // any other pairing failure
 }
 ```
-Onboarding mapping: `PairBadPayload` = "That is not a Tugboat code"; `PairExpired` = show a new
-QR on the PC; `PairSecretReused` = "already used"; `NetTimeout` / `NetUnreachable` =
+Onboarding mapping: `PairBadPayload` = "That is not a Tugboat code" (only this); `PairExpired` = the core's
+"PAIRING CODE EXPIRED - show a new QR". The PC opens a NEW pairing window when the old one runs out, so
+an old QR can also come back as `PairBadSecret` or `PairNotOpen`: the app reads the payload's expiry
+(`inspectPairingPayload`, before dialing) and shows the expired text when its time has passed by the
+phone's clock (`Texts.pairFailure(..., codeExpired)`); `PairSecretReused` = "already used"; `NetTimeout` / `NetUnreachable` =
 "PC not found: same Wi-Fi? Local network allowed?"; `PairConfirmTimeout`, `PairCancelled` =
 retry.
 
 Typed checks pinned by `crates/ffi/tests/phone_flow.rs`: `addFile` of a missing file is `Io`
-(message names the file), of an exe renamed `.jpg` is `NotMedia`, into an unknown folder is
+(message names the file), of an exe renamed `.jpg` is `NotMedia`, of `x.lnk` is `Refused`, into an unknown folder is
 `Invalid`; a malformed id is `InvalidInput`; junk to `pairWith` is `PairBadPayload`; `unpair`
 with nothing paired is `NotPaired`; `saveSettings` with `binDays = 0` is `Invalid`.
+
+## Name rules (0.2.0)
+
+Top-level functions, the same code the PC runs, so the app keeps no copy of the rules:
+`namesExtOf(name)` (lowercase extension or ""), `namesIsRefused(name)`, `namesRefusedText()`.
+`ShareNames` calls them through the `NameRules` interface (a JVM test cannot load the .so, so tests
+pass a stand-in). `ItemInfo.neverReachedPeer` = in the Bin because it expired before the PC confirmed it
+(shown as "NOT ON PC").
 
 ## Build
 
