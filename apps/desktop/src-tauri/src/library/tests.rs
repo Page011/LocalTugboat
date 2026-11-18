@@ -1896,8 +1896,10 @@ mod any_file_placement {
 
 mod dropping {
     use super::*;
+    use std::os::windows::fs::OpenOptionsExt;
+
     use crate::{
-        drop::{clean_stale, copy_dropped, DropReport, DropTarget, NativeDrop, FOLDERS_TEXT, NOTHING_TEXT},
+        drop::{clean_stale, copy_dropped, DropReport, DropTarget, NativeDrop, DRIVES_TEXT, EMPTY_TEXT, LINK_TEXT, NOTHING_TEXT, OWN_TEXT},
         winfs::{read_zone_mark, write_zone_mark},
     };
 
@@ -1980,27 +1982,189 @@ mod dropping {
         assert_eq!(r.items().len(), 3);
     }
 
+    /// Make a junction `link` -> `target` (mklink /J needs no privilege).
+    fn junction(link: &Path, target: &Path) {
+        let made = std::process::Command::new("cmd").args(["/c", "mklink", "/J"]).arg(link).arg(target).output().map(|o| o.status.success()).unwrap_or(false);
+        assert!(made, "mklink /J {} {}", link.display(), target.display());
+    }
+
+    /// A folder to drop: nested folders, an empty folder, a zero-byte file and a Unicode name.
+    fn trip(r: &Rig) -> PathBuf {
+        let dir = src_dir(r).join("Trip");
+        std::fs::create_dir_all(dir.join("day 1").join("raw")).unwrap();
+        std::fs::create_dir_all(dir.join("empty")).unwrap();
+        std::fs::write(dir.join("IMG_1.jpg"), jpeg(1, 5000)).unwrap();
+        std::fs::write(dir.join("zero.bin"), b"").unwrap();
+        std::fs::write(dir.join("day 1").join("notes.txt"), b"notes").unwrap();
+        std::fs::write(dir.join("day 1").join("raw").join("caf\u{e9} \u{65e5}\u{672c}.txt"), "unicode".as_bytes()).unwrap();
+        dir
+    }
+
+    fn staged(r: &Rig) -> Vec<String> {
+        std::fs::read_dir(r.root.join(".tugboat")).map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n.starts_with("drop-")).collect()).unwrap_or_default()
+    }
+
     #[test]
-    fn a_dropped_folder_copies_nothing_and_says_so_and_a_junction_counts_as_a_folder() {
+    fn a_dropped_folder_becomes_one_zip_in_the_viewed_folder_that_windows_reads_back_exactly() {
+        let mut r = Rig::new();
+        r.core.create_folder("Work", Retention::Keep).unwrap();
+        let folder = trip(&r);
+        let expected = crate::zipdrop::testing::tree(&folder);
+        // None of these may end up in the zip: Windows housekeeping files and a junction out of the folder.
+        std::fs::write(folder.join("desktop.ini"), b"x").unwrap();
+        std::fs::write(folder.join("day 1").join("Thumbs.db"), b"x").unwrap();
+        let outside = src_dir(&r).join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), b"x").unwrap();
+        junction(&folder.join("link"), &outside);
+
+        let work = target_of(&r, "Work");
+        let rep = copy(&r, std::slice::from_ref(&folder), &work);
+        assert_eq!(rep.copied, ["Trip.zip"], "{rep:?}");
+        assert!(rep.refused.is_empty() && rep.failed.is_empty(), "{rep:?}");
+        assert_eq!(rep.folder_name, "Work");
+        let zip = r.root.join("Work").join("Trip.zip");
+        assert!(zip.is_file());
+        assert!(staged(&r).is_empty(), "no temp copy left");
+        assert!(read_zone_mark(&zip).is_none(), "a drag copy gets no downloaded mark");
+
+        let item = r.item("Trip.zip");
+        assert_eq!(item.folder, work.id);
+        assert!(matches!(item.state, ItemState::FolderKeep), "{:?}", item.state);
+        // The watcher does not import it a second time, nor bin it.
+        r.lib.scan(true);
+        r.settle();
+        assert_eq!(r.items().len(), 1);
+        assert_eq!(r.deleted_count(), 0);
+
+        let dest = r._tmp.path().join("unzipped");
+        let diff = crate::zipdrop::testing::extract_with_dotnet(&zip, &dest, &src_dir(&r));
+        assert!(diff <= 2.0, "modified times are kept (DOS 2 s step), off by {diff} s");
+        assert_eq!(crate::zipdrop::testing::tree(&dest.join("Trip")), expected, "every file's bytes and the empty folders, nothing else");
+        assert!(dest.join("Trip").join("empty").is_dir());
+        // The source folder is only read.
+        assert!(folder.join("IMG_1.jpg").exists() && outside.join("secret.txt").exists());
+        let _ = std::fs::remove_dir(folder.join("link"));
+    }
+
+    #[test]
+    fn a_zip_name_that_exists_gets_a_unique_name() {
         let r = Rig::new();
-        let folder = src_dir(&r).join("Holiday");
-        std::fs::create_dir_all(&folder).unwrap();
-        std::fs::write(folder.join("inside.jpg"), jpeg(1, 100)).unwrap();
-        let rep = copy(&r, std::slice::from_ref(&folder), &inbox(&r));
-        assert!(rep.copied.is_empty());
-        assert_eq!(rep.refused.len(), 1);
-        assert_eq!((rep.refused[0].name.as_str(), rep.refused[0].reason.as_str()), ("Holiday", FOLDERS_TEXT));
-        assert!(files_in(&r.root).is_empty() && r.items().is_empty(), "nothing from inside it either");
-        // A junction to a folder is a folder (mklink /J needs no privilege).
-        let link = src_dir(&r).join("Link");
-        let made = std::process::Command::new("cmd").args(["/c", "mklink", "/J"]).arg(&link).arg(&folder).output().map(|o| o.status.success()).unwrap_or(false);
-        if made {
-            let rep = copy(&r, std::slice::from_ref(&link), &inbox(&r));
-            assert_eq!(rep.refused[0].reason, FOLDERS_TEXT);
-            assert!(r.items().is_empty());
-            let _ = std::fs::remove_dir(&link); // removes the junction, not its target
-        }
-        assert!(folder.join("inside.jpg").exists());
+        let folder = trip(&r);
+        assert_eq!(copy(&r, std::slice::from_ref(&folder), &inbox(&r)).copied, ["Trip.zip"]);
+        assert_eq!(copy(&r, std::slice::from_ref(&folder), &inbox(&r)).copied, ["Trip (2).zip"]);
+        assert_eq!(files_in(&r.root), ["Trip (2).zip", "Trip.zip"]);
+        assert_eq!(r.items().len(), 2);
+    }
+
+    #[test]
+    fn files_and_folders_in_one_drop_both_go_in_and_progress_counts_the_zip() {
+        let r = Rig::new();
+        let folder = trip(&r);
+        let file = src(&r, "plan.pdf", b"%PDF-1.4 plan");
+        let mut events = Vec::new();
+        let rep = copy_dropped(&r.lib, NativeDrop::from_native(&[file, folder]), &inbox(&r), &mut |p| events.push(p));
+        assert_eq!(rep.copied, ["plan.pdf", "Trip.zip"], "{rep:?}");
+        let zips: Vec<_> = events.iter().filter(|p| p.zip).collect();
+        assert!(zips.iter().all(|p| p.file == "Trip"), "{zips:?}");
+        // The first one is the folder being listed (no size yet), before anything is copied.
+        assert_eq!((zips[0].done_bytes, zips[0].total_bytes), (0, 0), "{zips:?}");
+        let zipping: Vec<_> = zips.iter().filter(|p| p.total_bytes > 0).collect();
+        assert!(!zipping.is_empty(), "the zip reported progress");
+        assert!(zipping.iter().all(|p| p.index == 2 && p.count == 2 && p.total_bytes == 5000 + 5 + 7 && p.done_bytes <= p.total_bytes), "{zips:?}");
+        assert_eq!(zipping.last().unwrap().done_bytes, 5000 + 5 + 7, "the last event is everything read");
+        assert!(events.iter().filter(|p| !p.zip).all(|p| p.file == "plan.pdf" && p.index == 1));
+    }
+
+    #[test]
+    fn a_folder_of_empty_files_still_reports_progress_and_goes_in() {
+        let r = Rig::new();
+        let dir = src_dir(&r).join("Blank");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), b"").unwrap();
+        let mut events = Vec::new();
+        let rep = copy_dropped(&r.lib, NativeDrop::from_native(&[dir]), &inbox(&r), &mut |p| events.push(p));
+        assert_eq!(rep.copied, ["Blank.zip"], "{rep:?}");
+        assert!(events.len() >= 2 && events.iter().all(|p| p.zip && p.file == "Blank" && p.done_bytes == 0), "{events:?}");
+    }
+
+    #[test]
+    fn the_librarys_own_hidden_folder_is_never_zipped_and_cannot_be_dropped() {
+        let r = Rig::new();
+        std::fs::write(r.root.join("keep.txt"), b"visible").unwrap();
+        let rep = copy(&r, std::slice::from_ref(&r.root), &inbox(&r));
+        assert_eq!(rep.copied.len(), 1, "{rep:?}");
+        let zip = r.root.join(&rep.copied[0]);
+        let dest = r._tmp.path().join("lib-unzipped");
+        crate::zipdrop::testing::extract_with_tar(&zip, &dest).unwrap();
+        let names: Vec<String> = crate::zipdrop::testing::tree(&dest).into_iter().map(|(n, _)| n).collect();
+        assert!(names.iter().all(|n| !n.contains(".tugboat")), "{names:?}");
+        assert!(names.iter().any(|n| n.ends_with("/keep.txt")), "{names:?}");
+
+        let rep = copy(&r, &[r.root.join(".tugboat")], &inbox(&r));
+        assert_eq!(rep.refused.len(), 1, "{rep:?}");
+        assert_eq!(rep.refused[0].reason, OWN_TEXT);
+        assert!(staged(&r).is_empty());
+    }
+
+    #[test]
+    fn the_overlay_counts_only_folders_that_will_be_zipped() {
+        let r = Rig::new();
+        let real = trip(&r);
+        let link = src_dir(&r).join("TripLink");
+        junction(&link, &real);
+        let file = src(&r, "a.txt", b"x");
+        let drive = PathBuf::from(format!("{}\\", std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into())));
+        assert_eq!(crate::drop::count_kinds(&[real, link.clone(), drive, file]), (3, 1));
+        let _ = std::fs::remove_dir(&link);
+    }
+
+    #[test]
+    fn a_folder_with_no_files_a_drive_and_a_folder_link_are_refused_and_nothing_is_staged() {
+        let r = Rig::new();
+        let empty = src_dir(&r).join("Nothing");
+        std::fs::create_dir_all(empty.join("inner")).unwrap();
+        let only_ini = src_dir(&r).join("OnlyIni");
+        std::fs::create_dir_all(&only_ini).unwrap();
+        std::fs::write(only_ini.join("desktop.ini"), b"x").unwrap();
+        let rep = copy(&r, &[empty.clone(), only_ini], &inbox(&r));
+        let lines: Vec<_> = rep.refused.iter().map(|l| (l.name.as_str(), l.reason.as_str())).collect();
+        assert_eq!(lines, [("Nothing", EMPTY_TEXT), ("OnlyIni", EMPTY_TEXT)]);
+        assert!(rep.copied.is_empty() && rep.failed.is_empty());
+
+        let drive = PathBuf::from(format!("{}\\", std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into())));
+        let rep = copy(&r, &[drive], &inbox(&r));
+        assert_eq!(rep.refused.len(), 1, "{rep:?}");
+        assert_eq!(rep.refused[0].reason, DRIVES_TEXT);
+
+        let real = trip(&r);
+        let link = src_dir(&r).join("TripLink");
+        junction(&link, &real);
+        let rep = copy(&r, std::slice::from_ref(&link), &inbox(&r));
+        assert_eq!((rep.refused[0].name.as_str(), rep.refused[0].reason.as_str()), ("TripLink", LINK_TEXT), "{rep:?}");
+        let _ = std::fs::remove_dir(&link); // the junction, not its target
+        assert!(real.join("IMG_1.jpg").exists());
+
+        assert!(files_in(&r.root).is_empty() && r.items().is_empty() && staged(&r).is_empty());
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_read_fails_that_folders_zip_and_leaves_nothing_but_other_items_go_in() {
+        let r = Rig::new();
+        let folder = trip(&r);
+        let busy = folder.join("day 1").join("notes.txt");
+        let ok = src(&r, "ok.txt", b"fine");
+        // Another process holding the file with no sharing: reading it fails.
+        let hold = std::fs::OpenOptions::new().read(true).share_mode(0).open(&busy).unwrap();
+        let rep = copy(&r, &[folder, ok], &inbox(&r));
+        drop(hold);
+        assert_eq!(rep.copied, ["ok.txt"], "{rep:?}");
+        assert!(rep.refused.is_empty());
+        assert_eq!(rep.failed.len(), 1, "{rep:?}");
+        assert!(rep.failed[0].reason.starts_with("ZIP FAILED - Trip: day 1/notes.txt "), "{}", rep.failed[0].reason);
+        assert_eq!(files_in(&r.root), ["ok.txt"], "no zip in the library");
+        assert!(staged(&r).is_empty(), "the temp zip is removed");
+        assert_eq!(r.items().len(), 1);
     }
 
     #[test]

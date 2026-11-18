@@ -69,11 +69,14 @@ describe("computeBanners", () => {
     expect(b.map((x) => x.id)).toEqual(["network", "error"]);
     expect(b[0]?.text).toBe("NETWORK DOWN - port 47300 in use");
   });
-  test("a drive that cannot hold the Mark-of-the-Web is a blocker with the count of waiting files", () => {
+  test("a drive that cannot hold the Mark-of-the-Web is a red blocker: move the folder to a permanent location, with the count of waiting files", () => {
     const b = computeBanners({ ...base, library: lib({ cannot_mark: true }), sync: { ...base.sync!, downloading: 4 } });
-    expect(b[0]).toMatchObject({ id: "cannot-mark", tone: "danger", text: "LIBRARY DRIVE CANNOT MARK DOWNLOADS - files from the phone wait (4)" });
-    expect(computeBanners({ ...base, library: lib({ cannot_mark: true }) })[0]?.text).toBe("LIBRARY DRIVE CANNOT MARK DOWNLOADS - files from the phone wait");
-    expect(b[0]?.actions.map((a) => a.id)).toEqual(["lib-choose"]);
+    expect(b[0]).toMatchObject({ id: "cannot-mark", tone: "danger", text: "MOVE THE TUGBOAT FOLDER - use a permanent location on this PC, not removable storage (4 waiting)" });
+    expect(computeBanners({ ...base, library: lib({ cannot_mark: true }) })[0]?.text).toBe("MOVE THE TUGBOAT FOLDER - use a permanent location on this PC, not removable storage");
+    expect(b[0]?.actions).toEqual([{ id: "lib-choose", label: "Choose another" }]);
+  });
+  test("a library on a drive that can hold the mark has no such banner", () => {
+    expect(computeBanners({ ...base, library: lib({ cannot_mark: false }) }).some((x) => x.id === "cannot-mark")).toBe(false);
   });
   test("a drop that left files behind stays as a banner until dismissed; a clean drop shows none", () => {
     const clean = { folder_name: "Inbox", copied: ["a.pdf"], refused: [], failed: [] };

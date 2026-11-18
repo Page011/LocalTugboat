@@ -10,19 +10,21 @@ describe("the drop overlay", () => {
     expect(dropTitle(enter())).toBe("Copy to Inbox");
     expect(dropTitle(enter({ target_name: "Work" }))).toBe("Copy to Work");
   });
-  test("a folder next to files gets one warning line, files alone get none", () => {
-    expect(dropSub(enter())).toBeNull();
-    expect(dropSub(enter({ folders: 1 }))).toBe("FOLDERS NOT COPIED - drop the files inside it");
-  });
-  test("only folders: the blocker is the headline, no copy promised", () => {
-    expect(dropTitle(enter({ files: 0, folders: 2 }))).toBe("FOLDERS NOT COPIED - drop the files inside it");
+  test("only folders: the headline says they are zipped, naming the real target", () => {
+    expect(dropTitle(enter({ files: 0, folders: 1 }))).toBe("Zip and copy to Inbox");
+    expect(dropTitle(enter({ files: 0, folders: 2, target_name: "Work" }))).toBe("Zip and copy to Work");
     expect(dropSub(enter({ files: 0, folders: 2 }))).toBeNull();
-    expect(dropTitle(enter({ files: 1, folders: 2 }))).toBe("Copy to Inbox");
+  });
+  test("a folder next to files: the headline stays a copy, one line says the folder is zipped; files alone get none", () => {
+    expect(dropSub(enter())).toBeNull();
+    expect(dropTitle(enter({ folders: 1 }))).toBe("Copy to Inbox");
+    expect(dropSub(enter({ folders: 1 }))).toBe("The folder is zipped first");
+    expect(dropSub(enter({ folders: 3 }))).toBe("Folders are zipped first");
   });
 });
 
 describe("progress", () => {
-  const p = (done: number, total: number, index = 1, count = 1) => ({ file: "big.mp4", index, count, done_bytes: done, total_bytes: total });
+  const p = (done: number, total: number, index = 1, count = 1, zip = false) => ({ file: "big.mp4", index, count, done_bytes: done, total_bytes: total, zip });
   test("percent rounds down, never passes 100 and is null for an unknown size", () => {
     expect(dropPercent(p(0, 100))).toBe(0);
     expect(dropPercent(p(999, 1000))).toBe(99);
@@ -34,6 +36,10 @@ describe("progress", () => {
     expect(dropProgressText(p(500, 1000))).toBe("Copying big.mp4, 50%");
     expect(dropProgressText(p(500, 1000, 2, 3))).toBe("Copying big.mp4 (2 of 3), 50%");
     expect(dropProgressText(p(5, 0))).toBe("Copying big.mp4");
+  });
+  test("a folder being zipped says so", () => {
+    expect(dropProgressText({ ...p(500, 1000), file: "Trip", zip: true })).toBe("Zipping Trip, 50%");
+    expect(dropProgressText({ ...p(500, 1000, 2, 2, true), file: "Trip" })).toBe("Zipping Trip (2 of 2), 50%");
   });
 });
 
@@ -51,8 +57,15 @@ describe("the result", () => {
     expect(b).toEqual({ tone: "warn", text: "REFUSED - shortcut and folder-setting files never sync", detail: "x.lnk" });
   });
   test("the same reason for several files stays one line with all the names", () => {
-    const b = dropBanner(report({ refused: [{ name: "a", reason: "FOLDERS NOT COPIED - drop the files inside it" }, { name: "b", reason: "FOLDERS NOT COPIED - drop the files inside it" }] }));
-    expect(b).toMatchObject({ text: "FOLDERS NOT COPIED - drop the files inside it", detail: "a, b" });
+    const b = dropBanner(report({ refused: [{ name: "a", reason: "FOLDER IS EMPTY - nothing to zip" }, { name: "b", reason: "FOLDER IS EMPTY - nothing to zip" }] }));
+    expect(b).toMatchObject({ text: "FOLDER IS EMPTY - nothing to zip", detail: "a, b" });
+  });
+  test("a folder that could not be zipped is one red line with the file and the reason, no separate name", () => {
+    const b = dropBanner(report({ failed: [{ name: "", reason: "ZIP FAILED - Trip: IMG_1.jpg The process cannot access the file because it is being used by another process." }] }));
+    expect(b).toEqual({ tone: "danger", text: "ZIP FAILED - Trip: IMG_1.jpg The process cannot access the file because it is being used by another process.", detail: undefined });
+  });
+  test("a zip that was made counts as a copied item in the success line", () => {
+    expect(dropSummary(report({ copied: ["Trip.zip"] }))).toBe("1 copied to Inbox");
   });
   test("different reasons are counted with one line per file and its own reason; any failure makes it red", () => {
     const b = dropBanner(report({ refused: [{ name: "a.lnk", reason: "REFUSED" }], failed: [{ name: "big.mp4", reason: "COPY FAILED - The device is not ready." }] }));

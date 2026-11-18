@@ -19,6 +19,7 @@ pub mod shell;
 pub mod thumbs;
 pub mod tray;
 pub mod winfs;
+pub mod zipdrop;
 
 #[cfg(test)]
 mod bindings;

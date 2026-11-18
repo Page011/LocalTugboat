@@ -69,9 +69,15 @@ export function computeBanners(i: BannerInput): Banner[] {
       });
     }
     if (lib.cannot_mark) {
-      // Received files are marked as downloaded; this drive cannot hold the mark, so they wait here instead of being saved unmarked.
+      // Received files are marked as downloaded; this drive (FAT/exFAT, usually a USB stick or SD card) cannot hold the
+      // mark, so they wait instead of being saved unmarked. The fix is a folder on a fixed drive of this PC.
       const n = i.sync?.downloading ?? 0;
-      out.push({ id: "cannot-mark", tone: "danger", text: `LIBRARY DRIVE CANNOT MARK DOWNLOADS - files from the phone wait${n > 0 ? ` (${n})` : ""}`, actions: [{ id: "lib-choose", label: "Choose another" }] });
+      out.push({
+        id: "cannot-mark",
+        tone: "danger",
+        text: `MOVE THE TUGBOAT FOLDER - use a permanent location on this PC, not removable storage${n > 0 ? ` (${n} waiting)` : ""}`,
+        actions: [{ id: "lib-choose", label: "Choose another" }],
+      });
     }
     if (lib.cloud_warning) {
       out.push({ id: "cloud", tone: "warn", text: `CLOUD FOLDER - ${lib.cloud_warning}`, actions: [{ id: "lib-choose", label: "Choose another" }] });

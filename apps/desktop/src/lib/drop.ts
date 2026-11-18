@@ -8,15 +8,13 @@ import type { DropState } from "./bindings/DropState";
 
 export type DropEnter = Extract<DropState, { t: "enter" }>;
 
-const FOLDERS_LINE = "FOLDERS NOT COPIED - drop the files inside it";
+/** The overlay's headline: names the real target. A drag of only folders says they will be zipped first. */
+export const dropTitle = (s: DropEnter): string => (s.files === 0 && s.folders > 0 ? `Zip and copy to ${s.target_name}` : `Copy to ${s.target_name}`);
 
-/** The overlay's headline: names the real target. A drag of only folders copies nothing, so it says that instead. */
-export const dropTitle = (s: DropEnter): string => (s.files === 0 && s.folders > 0 ? FOLDERS_LINE : `Copy to ${s.target_name}`);
+/** The overlay's second line: only when files AND a folder are in the drag (each folder becomes one .zip). */
+export const dropSub = (s: DropEnter): string | null => (s.files > 0 && s.folders > 0 ? (s.folders === 1 ? "The folder is zipped first" : "Folders are zipped first") : null);
 
-/** The overlay's second line: only when files AND a folder are in the drag (the folder is not copied). */
-export const dropSub = (s: DropEnter): string | null => (s.files > 0 && s.folders > 0 ? FOLDERS_LINE : null);
-
-/** Whole percent of the file being copied, null when its size is unknown. */
+/** Whole percent of the file (or folder) being copied, null when its size is unknown. */
 export function dropPercent(p: DropProgress): number | null {
   if (p.total_bytes <= 0) return null;
   return Math.min(100, Math.floor((p.done_bytes / p.total_bytes) * 100));
@@ -24,7 +22,7 @@ export function dropPercent(p: DropProgress): number | null {
 
 export function dropProgressText(p: DropProgress): string {
   const pct = dropPercent(p);
-  return `Copying ${p.file}${p.count > 1 ? ` (${p.index} of ${p.count})` : ""}${pct === null ? "" : `, ${pct}%`}`;
+  return `${p.zip ? "Zipping" : "Copying"} ${p.file}${p.count > 1 ? ` (${p.index} of ${p.count})` : ""}${pct === null ? "" : `, ${pct}%`}`;
 }
 
 /** The success line ("3 copied to Inbox"), null when nothing was copied. */

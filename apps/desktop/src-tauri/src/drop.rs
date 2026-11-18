@@ -1,4 +1,5 @@
-//! Drag files onto the Tugboat window: copy them into the folder being viewed.
+//! Drag files and folders onto the Tugboat window: copy them into the folder being viewed. A folder is
+//! zipped first (`zipdrop.rs`) and goes in as one "<folder name>.zip".
 //!
 //! Safety rules (the reason this module looks the way it does):
 //! - The paths come ONLY from the native window event (`NativeDrop::from_native`, called by
@@ -6,8 +7,8 @@
 //!   the app copy an arbitrary file; a test reads the sources to keep it that way.
 //! - The source is only ever read (CopyFileExW): a USB stick can be pulled right after "copied".
 //!   Its own Mark-of-the-Web, if it has one, comes along; none is added (the user's own file).
-//! - The copy is made in the hidden `.tugboat` folder under a temp name and only then placed in the
-//!   library with a free name (hard link or checked rename), so the library never lists a half file.
+//! - The copy (or the zip) is made in the hidden `.tugboat` folder under a temp name and only then placed in
+//!   the library with a free name (hard link or checked rename), so the library never lists a half file.
 //! - A failure is always a line in the report (refused or failed), never silent.
 
 use std::{
@@ -19,14 +20,21 @@ use serde::{Deserialize, Serialize};
 use tugboat_core::{names, CoreError, FolderId, FolderKind};
 use ts_rs::TS;
 
-use crate::{library::Library, winfs};
+use crate::{
+    library::Library,
+    winfs,
+    zipdrop::{self, Plan},
+};
 
 /// Room kept free on the library drive besides the files themselves.
 const SPACE_MARGIN: u64 = 64 * 1024 * 1024;
 /// Progress is reported at most this often.
 const PROGRESS_EVERY: Duration = Duration::from_millis(200);
 
-pub const FOLDERS_TEXT: &str = "FOLDERS NOT COPIED - drop the files inside it";
+pub const DRIVES_TEXT: &str = "DRIVES NOT COPIED - drop a folder or files";
+pub const LINK_TEXT: &str = "FOLDER LINK NOT COPIED - drop the real folder";
+pub const EMPTY_TEXT: &str = "FOLDER IS EMPTY - nothing to zip";
+pub const OWN_TEXT: &str = "TUGBOAT DATA NOT COPIED - drop your own files";
 pub const NOTHING_TEXT: &str = "NOTHING TO COPY - drop files from Explorer";
 
 /// The folder a drop lands in.
@@ -65,14 +73,17 @@ pub enum DropState {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 pub struct DropProgress {
+    /// The file being copied, or the folder being zipped.
     pub file: String,
-    /// 1-based position among the files being copied.
+    /// 1-based position among the items being copied (files and folders).
     pub index: u32,
     pub count: u32,
     #[ts(type = "number")]
     pub done_bytes: u64,
     #[ts(type = "number")]
     pub total_bytes: u64,
+    /// A folder being zipped (the bytes are those of the files read so far), not a file being copied.
+    pub zip: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -109,11 +120,13 @@ fn io_text(e: &std::io::Error) -> String {
     t.split(" (os error").next().unwrap_or(&t).to_string()
 }
 
-/// Count files and folders in a drag (the overlay's sub-line). A link to a folder counts as a folder.
+/// Count files and folders in a drag (the overlay's sub-line). Only a folder that would be zipped counts as
+/// one: a link to a folder and a drive are refused on the drop, so they are not promised a zip here.
 pub fn count_kinds(paths: &[PathBuf]) -> (u32, u32) {
     let (mut files, mut folders) = (0, 0);
     for p in paths {
-        if std::fs::metadata(p).map(|m| m.is_dir()).unwrap_or(false) {
+        let zippable = p.parent().is_some() && std::fs::symlink_metadata(p).map(|m| m.is_dir() && !winfs::is_link(p, &m)).unwrap_or(false);
+        if zippable {
             folders += 1;
         } else {
             files += 1;
@@ -122,8 +135,48 @@ pub fn count_kinds(paths: &[PathBuf]) -> (u32, u32) {
     (files, folders)
 }
 
-/// Copy the dropped files into `target`. Runs on the calling thread; `progress` is told how far the
-/// current file is. Everything that was not copied is in the report with its reason.
+/// One thing to bring in, judged before any copying starts.
+enum Job {
+    File { src: PathBuf, name: String, size: u64, mtime: i64 },
+    Folder { name: String, plan: Plan },
+}
+
+impl Job {
+    fn bytes(&self) -> u64 {
+        match self {
+            Job::File { size, .. } => *size,
+            // What the zip will take on the drive: the file bytes and its own records.
+            Job::Folder { plan, .. } => plan.bytes.saturating_add(plan.overhead),
+        }
+    }
+}
+
+/// Judge a dropped folder: its plan, or the line saying why it is not zipped (`true` = refused, `false` = failed).
+/// `hidden` is the library's own hidden folder (canonical): it is never zipped and never dropped itself.
+fn judge_folder(p: &Path, name: &str, hidden: Option<&Path>) -> Result<Plan, (bool, DropLine)> {
+    let refused = |reason: &str| Err((true, DropLine { name: name.to_string(), reason: reason.to_string() }));
+    if p.parent().is_none() {
+        return refused(DRIVES_TEXT);
+    }
+    if std::fs::symlink_metadata(p).map(|m| winfs::is_link(p, &m)).unwrap_or(false) {
+        return refused(LINK_TEXT);
+    }
+    if names::is_refused_name(&format!("{name}.zip")) {
+        return refused(names::REFUSED_TEXT);
+    }
+    if hidden.is_some_and(|h| std::fs::canonicalize(p).is_ok_and(|c| c.starts_with(h))) {
+        return refused(OWN_TEXT);
+    }
+    match zipdrop::plan_folder(p, hidden) {
+        Ok(plan) if plan.files == 0 => refused(EMPTY_TEXT),
+        Ok(plan) => Ok(plan),
+        // The whole line is the reason ("ZIP FAILED - Trip: IMG_1.jpg ..."): it names the folder itself.
+        Err(e) => Err((false, DropLine { name: String::new(), reason: e.text(name) })),
+    }
+}
+
+/// Copy the dropped files into `target`; a dropped folder goes in as one zip. Runs on the calling thread;
+/// `progress` is told how far the current item is. Everything that was not copied is in the report with its reason.
 pub fn copy_dropped(lib: &Library, drop: NativeDrop, target: &DropTarget, progress: &mut dyn FnMut(DropProgress)) -> DropReport {
     let mut rep = DropReport { folder_name: target.name.clone(), ..Default::default() };
     let whole = |rep: &mut DropReport, reason: String| rep.refused.push(DropLine { name: String::new(), reason });
@@ -141,8 +194,9 @@ pub fn copy_dropped(lib: &Library, drop: NativeDrop, target: &DropTarget, progre
         }
     };
 
-    // Judge every path first: folders, refused names and vanished files never reach the copy.
-    let mut todo: Vec<(PathBuf, String, u64, i64)> = Vec::new();
+    // Judge every path first: refused names, vanished files and folders that cannot be zipped never reach the copy.
+    let hidden = std::fs::canonicalize(root.join(crate::library::config::HIDDEN_DIR)).ok();
+    let mut todo: Vec<Job> = Vec::new();
     for p in &drop.paths {
         let name = file_name(p);
         let meta = match std::fs::metadata(p) {
@@ -153,19 +207,25 @@ pub fn copy_dropped(lib: &Library, drop: NativeDrop, target: &DropTarget, progre
             }
         };
         if meta.is_dir() {
-            rep.refused.push(DropLine { name, reason: FOLDERS_TEXT.into() });
+            // Listing a big tree on a slow drive takes a while: say so (no size yet) before it starts.
+            progress(DropProgress { file: name.clone(), index: 1, count: 1, done_bytes: 0, total_bytes: 0, zip: true });
+            match judge_folder(p, &name, hidden.as_deref()) {
+                Ok(plan) => todo.push(Job::Folder { name, plan }),
+                Err((true, line)) => rep.refused.push(line),
+                Err((false, line)) => rep.failed.push(line),
+            }
         } else if names::is_refused_name(&name) {
             rep.refused.push(DropLine { name, reason: names::REFUSED_TEXT.into() });
         } else {
             let mtime = meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_millis() as i64);
-            todo.push((p.clone(), name, meta.len(), mtime));
+            todo.push(Job::File { src: p.clone(), name, size: meta.len(), mtime });
         }
     }
     if todo.is_empty() {
         return rep;
     }
 
-    let total: u64 = todo.iter().map(|t| t.2).sum();
+    let total: u64 = todo.iter().map(Job::bytes).sum();
     match fs4::available_space(&root) {
         Ok(free) if free < total.saturating_add(SPACE_MARGIN) => {
             whole(&mut rep, format!("NOT ENOUGH SPACE on {} - nothing copied", drive_of(&root)));
@@ -186,27 +246,51 @@ pub fn copy_dropped(lib: &Library, drop: NativeDrop, target: &DropTarget, progre
     };
 
     let count = todo.len() as u32;
-    for (i, (src, name, size, mtime)) in todo.into_iter().enumerate() {
+    for (i, job) in todo.into_iter().enumerate() {
         let tmp = staging.join(format!("drop-{}.tmp", uuid::Uuid::now_v7()));
         let mut last = Instant::now().checked_sub(PROGRESS_EVERY).unwrap_or_else(Instant::now);
-        let mut on_bytes = |done: u64, all: u64| {
-            if last.elapsed() >= PROGRESS_EVERY || (all > 0 && done >= all) {
-                last = Instant::now();
-                progress(DropProgress { file: name.clone(), index: i as u32 + 1, count, done_bytes: done, total_bytes: all.max(size) });
+        let index = i as u32 + 1;
+        let (name, mtime) = match job {
+            Job::File { src, name, size, mtime } => {
+                let mut on_bytes = |done: u64, all: u64| {
+                    if last.elapsed() >= PROGRESS_EVERY || (all > 0 && done >= all) {
+                        last = Instant::now();
+                        progress(DropProgress { file: name.clone(), index, count, done_bytes: done, total_bytes: all.max(size), zip: false });
+                    }
+                };
+                if let Err(e) = winfs::copy_file(&src, &tmp, &mut on_bytes) {
+                    let _ = std::fs::remove_file(&tmp);
+                    rep.failed.push(DropLine { name, reason: format!("COPY FAILED - {}", io_text(&e)) });
+                    continue;
+                }
+                // A copy of a hidden or read-only file must be an ordinary file: the library scan skips hidden
+                // ones and would then call the item missing.
+                if let Err(e) = winfs::clear_attributes(&tmp) {
+                    let _ = std::fs::remove_file(&tmp);
+                    rep.failed.push(DropLine { name, reason: format!("COPY FAILED - {}", io_text(&e)) });
+                    continue;
+                }
+                (name, mtime)
+            }
+            Job::Folder { name, plan } => {
+                let all = plan.bytes;
+                // Also the only event a folder of empty files ever gets.
+                progress(DropProgress { file: name.clone(), index, count, done_bytes: 0, total_bytes: all, zip: true });
+                let mut on_bytes = |done: u64| {
+                    if last.elapsed() >= PROGRESS_EVERY || done >= all {
+                        last = Instant::now();
+                        progress(DropProgress { file: name.clone(), index, count, done_bytes: done, total_bytes: all, zip: true });
+                    }
+                };
+                if let Err(e) = zipdrop::write_zip(&tmp, &plan.entries, &mut on_bytes) {
+                    let _ = std::fs::remove_file(&tmp);
+                    rep.failed.push(DropLine { name: String::new(), reason: e.text(&name) });
+                    continue;
+                }
+                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64);
+                (format!("{name}.zip"), now)
             }
         };
-        if let Err(e) = winfs::copy_file(&src, &tmp, &mut on_bytes) {
-            let _ = std::fs::remove_file(&tmp);
-            rep.failed.push(DropLine { name, reason: format!("COPY FAILED - {}", io_text(&e)) });
-            continue;
-        }
-        // A copy of a hidden or read-only file must be an ordinary file: the library scan skips hidden
-        // ones and would then call the item missing.
-        if let Err(e) = winfs::clear_attributes(&tmp) {
-            let _ = std::fs::remove_file(&tmp);
-            rep.failed.push(DropLine { name, reason: format!("COPY FAILED - {}", io_text(&e)) });
-            continue;
-        }
         match lib.inner.place_dropped(&tmp, &name, target, mtime) {
             Ok(final_name) => rep.copied.push(final_name),
             Err(CoreError::Refused(why)) => {

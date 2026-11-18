@@ -7,7 +7,7 @@
 </script>
 
 <!-- Files over the window: names the folder they will be copied to. It never takes the pointer, so the native drop reaches the window.
-     A polite live region that is always in the page (so a screen reader hears the target and "FOLDERS NOT COPIED" the moment it fills). Progress and the result line live in the status bar. -->
+     A polite live region that is always in the page (so a screen reader hears the target and "Zip and copy to ..." the moment it fills). Progress and the result line live in the status bar. -->
 <div class="sr" role="status" aria-live="polite">{over ? [dropTitle(over), dropSub(over)].filter(Boolean).join(". ") : ""}</div>
 
 {#if over}
@@ -15,7 +15,7 @@
     <div class="msg">
       <Upload size={32} aria-hidden="true" />
       <h2>{dropTitle(over)}</h2>
-      {#if dropSub(over)}<p class="warn">{dropSub(over)}</p>{/if}
+      {#if dropSub(over)}<p class="sub">{dropSub(over)}</p>{/if}
     </div>
   </div>
 {/if}
@@ -57,12 +57,8 @@
   .msg h2 {
     margin: 0;
   }
-  .warn {
+  .sub {
     margin: 0;
-    padding: 2px 10px;
-    border-radius: 999px;
-    background: var(--warn-bg);
-    color: var(--warn);
-    font-weight: 600;
+    color: var(--fg-muted);
   }
 </style>

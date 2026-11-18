@@ -17,8 +17,8 @@ use windows::{
     Win32::{
         Foundation::HANDLE,
         Storage::FileSystem::{
-            CopyFileExW, GetFileInformationByHandle, MoveFileExW, GetFileInformationByHandleEx, GetVolumeInformationW, GetVolumePathNameW, SetFileAttributesW,
-            BY_HANDLE_FILE_INFORMATION, COPYFILE_FLAGS, COPYPROGRESSROUTINE_PROGRESS, COPY_FILE_FAIL_IF_EXISTS, FILE_ATTRIBUTE_HIDDEN,
+            CopyFileExW, FindClose, FindFirstFileW, GetFileInformationByHandle, MoveFileExW, GetFileInformationByHandleEx, GetVolumeInformationW, GetVolumePathNameW, SetFileAttributesW,
+            BY_HANDLE_FILE_INFORMATION, WIN32_FIND_DATAW, COPYFILE_FLAGS, COPYPROGRESSROUTINE_PROGRESS, COPY_FILE_FAIL_IF_EXISTS, FILE_ATTRIBUTE_HIDDEN,
             FILE_ATTRIBUTE_NORMAL, FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_INFO, FileIdInfo, LPPROGRESS_ROUTINE_CALLBACK_REASON, MOVE_FILE_FLAGS, PROGRESS_CONTINUE,
         },
     },
@@ -122,6 +122,29 @@ pub fn supports_named_streams(path: &Path) -> io::Result<bool> {
     unsafe { GetVolumeInformationW(PCWSTR(root.as_ptr()), None, None, None, Some(&mut flags), None) }
         .map_err(|e| io::Error::other(format!("volume information of {}: {e}", path.display())))?;
     Ok(flags & FILE_NAMED_STREAMS != 0)
+}
+
+/// Is this a link to somewhere else: a symlink or a junction (mount point)? `meta` is `symlink_metadata(path)`.
+/// Other reparse points (OneDrive placeholders, deduplicated files) are real data and say no. If the tag cannot be
+/// read, a folder counts as a link (never walk into what cannot be vouched for) and a file does not.
+pub fn is_link(path: &Path, meta: &std::fs::Metadata) -> bool {
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
+    const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
+    if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+        return false;
+    }
+    let w = wide(path);
+    let mut data = WIN32_FIND_DATAW::default();
+    // SAFETY: `w` is NUL-terminated and outlives the call; `data` is a plain out-parameter.
+    match unsafe { FindFirstFileW(PCWSTR(w.as_ptr()), &mut data) } {
+        Ok(h) => {
+            let _ = unsafe { FindClose(h) };
+            // For a reparse point FindFirstFile puts the reparse tag in dwReserved0.
+            matches!(data.dwReserved0, IO_REPARSE_TAG_MOUNT_POINT | IO_REPARSE_TAG_SYMLINK)
+        }
+        Err(_) => meta.is_dir(),
+    }
 }
 
 /// Clear hidden, system and read-only on `path` (a copy of a hidden file must not stay hidden: the
