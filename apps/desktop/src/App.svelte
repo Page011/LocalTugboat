@@ -141,7 +141,7 @@
     border-right: 1px solid var(--border);
     --mark-fg: #ffffff;
   }
-  /* Small logo, then the word, on one line (owner 2026-11-18: "[Logo] Tugboat ... so the logo is nice and small"). */
+  /* Small logo, then the word, on one line. */
   .brand {
     display: flex;
     align-items: center;

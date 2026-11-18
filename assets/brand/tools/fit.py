@@ -209,8 +209,8 @@ print("R", round(R, 3))
 for c in circles:
     print("porthole", [round(v, 2) for v in c], "web below", round(web(c[0], c[1]), 2), "web above", round(web_top(c[0], c[1]), 2))
 print("leftmost original: web below", round(web(cx0, cy0), 2), "web above", round(web_top(cx0, cy0), 2))
-# OWNER DECISION 2026-11-18 (Nigel): the leftmost porthole cut open by the hull's bottom edge is a deliberate,
-# signature part of the design ("no one else has that"). Keep it exactly as drawn in the PNG: the hull outline
+# The leftmost porthole cut open by the hull's bottom edge is a deliberate,
+# signature part of the design. Keep it exactly as drawn in the PNG: the hull outline
 # keeps its traced notch, nothing is bridged or moved, and only the other three portholes are separate circles.
 # Never "fix" this.
 KEEP_ORIGINAL_PORTHOLE = True

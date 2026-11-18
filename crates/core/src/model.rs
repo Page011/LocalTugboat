@@ -1,8 +1,8 @@
 //! Data model shared by every core module and (as JSON) by the wire protocol and the UIs.
-//! Owner: logic builder. Types here are the contract; add fields only by updating
-//! notes/core-design.md first.
+//! Types here are the contract: a new field changes the wire format and the generated UI
+//! types.
 //!
-//! Field groups (PLAN Sync model): each synced record is merged per field group, each group
+//! Field groups: each synced record is merged per field group, each group
 //! carrying its own `Version = (lamport, device)`. The higher version wins; versions compare
 //! by lamport first, then by device key bytes (total order, so both devices pick the same
 //! winner).
@@ -340,13 +340,13 @@ pub struct DeviceRow {
     pub addresses: Vec<String>,
 }
 
-/// Local settings (`setting` table). PLAN question 9: business rules are settings, not constants.
+/// Local settings (`setting` table). Business rules are settings, not constants.
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub struct Settings {
     /// Days an item stays in the Bin before this device deletes its copy. Default 7.
     pub bin_days: u32,
-    /// Phone: stop downloading below this many free bytes. Default 2 GiB (M4).
+    /// Phone: stop downloading below this many free bytes. Default 2 GiB.
     #[cfg_attr(feature = "ts", ts(type = "number"))]
     pub storage_guard_bytes: u64,
     /// PC rescan: pause when more than this many files are missing. Default 20.
@@ -519,7 +519,7 @@ mod tests {
         Version { lamport: l, device: DeviceId([b; 32]) }
     }
 
-    // L1: version order = lamport, then device bytes; GENESIS is the lowest.
+    // Version order = lamport, then device bytes; GENESIS is the lowest.
     #[test]
     fn version_order() {
         assert!(dv(2, 0x01) > dv(1, 0xFF), "lamport first");

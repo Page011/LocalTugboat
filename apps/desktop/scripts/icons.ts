@@ -1,7 +1,7 @@
 // Regenerates the Windows/Tauri app icons from the logo kit in assets/brand.
 //   bun scripts/icons.ts
-//  - icon.ico   = assets/brand/ico/tugboat-app.ico copied as is: the owner's artwork on the sea tile, drawn from the
-//                 vector at 256, 64, 48, 40, 32, 24, 20 and 16 px (owner 2026-11-18: no simplified pixel boat).
+//  - icon.ico   = assets/brand/ico/tugboat-app.ico copied as is: the boat artwork on the sea tile, drawn from the
+//                 vector at 256, 64, 48, 40, 32, 24, 20 and 16 px (the full artwork at every size, no simplified small boat).
 //                 The exe icon resource and the window/taskbar icon come from this file.
 //  - 32x32.png, 128x128.png, 128x128@2x.png, icon.png = tugboat-tile-1024.svg rendered by `tauri icon`.
 // `tauri icon` also writes Android and iOS sets and Store logos we do not ship, so it runs into a temp dir and

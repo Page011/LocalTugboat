@@ -1,6 +1,6 @@
 //! 0.2.0: any file type syncs both ways, always-refused names never move, items expire on time,
 //! the phone storage guard, the old-protocol refusal, an expired QR, a v1 database that migrates
-//! and syncs. Test ids C-T1 .. C-T14 of notes/plans/0.2.0.md. Everything binds 127.0.0.1.
+//! and syncs. Everything binds 127.0.0.1.
 
 mod common;
 
@@ -30,10 +30,10 @@ fn present(d: &Dev, id: ItemId) -> bool {
     d.local(id) == Some(LocalFileState::Present)
 }
 
-// C-T1: a pdf and a file with no extension go phone -> PC, a csv goes PC -> phone. Kind File, the
+// A pdf and a file with no extension go phone -> PC, a csv goes PC -> phone. Kind File, the
 // extension kept (or empty), bytes equal, no thumbnail, receipts on both sides.
 #[tokio::test(flavor = "multi_thread")]
-async fn c_t1_any_file_type_flows_both_ways() {
+async fn any_file_type_flows_both_ways() {
     let r = Rig::new().await;
     let pdf_bytes = b"%PDF-1.7\nreport body\n%%EOF".to_vec();
     let mk_bytes = b"all:\n\techo hi\n".to_vec();
@@ -68,11 +68,11 @@ async fn c_t1_any_file_type_flows_both_ways() {
     r.shutdown().await;
 }
 
-// C-T2: always-refused names from a peer. The records are accepted (digests stay equal) and never
+// Always-refused names from a peer. The records are accepted (digests stay equal) and never
 // downloaded: zero blob and thumbnail requests reach the sender, nothing is stored, a REFUSED
 // state, an activity row and an error event on the receiver, and `refused_items` lists them.
 #[tokio::test(flavor = "multi_thread")]
-async fn c_t2_refused_names_never_cross_the_wire() {
+async fn refused_names_never_cross_the_wire() {
     let r = Rig::new().await;
     let cases: Vec<(&str, &str)> = vec![
         ("x.lnk", "lnk"),
@@ -114,7 +114,7 @@ async fn c_t2_refused_names_never_cross_the_wire() {
 
 // ... and a refused name can never be made on the sending side either.
 #[tokio::test(flavor = "multi_thread")]
-async fn c_t2b_a_refused_name_is_refused_when_adding() {
+async fn a_refused_name_is_refused_when_adding() {
     let clock = TestClock::new(T0);
     let d = Dev::new(Role::Phone, "alone", &clock);
     for name in ["x.lnk", "desktop.ini", "AUTORUN.INF", "a.url"] {
@@ -124,10 +124,10 @@ async fn c_t2b_a_refused_name_is_refused_when_adding() {
     assert!(d.items().is_empty());
 }
 
-// C-T3: a program posing as a photo is still refused (S17 covers the sync path); a pdf that holds
+// A program posing as a photo is still refused (S17 covers the sync path); a pdf that holds
 // JPEG bytes is just a File, with no thumbnail.
 #[tokio::test(flavor = "multi_thread")]
-async fn c_t3_a_pdf_holding_jpeg_bytes_is_a_plain_file() {
+async fn a_pdf_holding_jpeg_bytes_is_a_plain_file() {
     let r = Rig::new().await;
     let id = add(&r.pc, "doc.pdf", &jpeg_bytes(7, 500));
     until("on the phone", 20, || present(&r.phone, id)).await;
@@ -140,10 +140,10 @@ async fn c_t3_a_pdf_holding_jpeg_bytes_is_a_plain_file() {
     r.shutdown().await;
 }
 
-// C-T4: an old (0.1.x) phone. Sync: both devices say "Update Tugboat on the phone". Pairing: the
+// An old (0.1.x) phone. Sync: both devices say "Update Tugboat on the phone". Pairing: the
 // phone is told while pairing, with the same text; a phone newer than the PC says "on the PC".
 #[tokio::test(flavor = "multi_thread")]
-async fn c_t4_an_old_peer_is_told_to_update_at_sync_and_at_pairing() {
+async fn an_old_peer_is_told_to_update_at_sync_and_at_pairing() {
     // Sync, phone speaks protocol 1.
     let r = Rig::unconnected();
     r.phone.core.debug_set_proto(1);
@@ -176,12 +176,12 @@ async fn c_t4_an_old_peer_is_told_to_update_at_sync_and_at_pairing() {
     r.shutdown().await;
 }
 
-// C-T6: the phone storage guard. Below the guard nothing downloads, the status says so, one
+// The phone storage guard. Below the guard nothing downloads, the status says so, one
 // activity row is written; with space again everything arrives. A file that would eat the margin
 // is skipped on its own; two files that do not both fit above the guard: the second waits;
 // an unreadable free space blocks and is shown, never read as "enough".
 #[tokio::test(flavor = "multi_thread")]
-async fn c_t6_the_storage_guard_holds_downloads_back_and_says_so() {
+async fn the_storage_guard_holds_downloads_back_and_says_so() {
     let pc = Dev::new(Role::Pc, "TEST-PC", &TestClock::new(T0));
     let (phone, free, fail) = Dev::phone_with_space("Test phone", &TestClock::new(T0), 1_000);
     // A tiny guard so the test needs no big files: the guard is 1000 bytes.
@@ -246,9 +246,9 @@ async fn c_t6_the_storage_guard_holds_downloads_back_and_says_so() {
     rig.shutdown().await;
 }
 
-// C-T7: the waiting count = held here, not in the Bin, no receipt from the paired device.
+// The waiting count = held here, not in the Bin, no receipt from the paired device.
 #[tokio::test(flavor = "multi_thread")]
-async fn c_t7_waiting_counts_items_the_peer_has_not_confirmed() {
+async fn waiting_counts_items_the_peer_has_not_confirmed() {
     let r = Rig::new().await;
     assert_eq!(r.pc.core.status().waiting, 0);
     r.apart().await;
@@ -263,9 +263,9 @@ async fn c_t7_waiting_counts_items_the_peer_has_not_confirmed() {
     r.shutdown().await;
 }
 
-// C-T9: "last seen" is written when the session ends, not only at the hello.
+// "Last seen" is written when the session ends, not only at the hello.
 #[tokio::test(flavor = "multi_thread")]
-async fn c_t9_last_seen_follows_the_session_to_its_end() {
+async fn last_seen_follows_the_session_to_its_end() {
     let r = Rig::new().await;
     let hello_time = r.pc.core.paired_device().unwrap().unwrap().last_seen_at.expect("set at the hello");
     r.pc.clock.advance(10 * 60_000);
@@ -279,9 +279,9 @@ async fn c_t9_last_seen_follows_the_session_to_its_end() {
     r.pc.stop().await;
 }
 
-// C-T10: Keep, Move, Rename, Delete and Restore on a File item reach the other device.
+// Keep, Move, Rename, Delete and Restore on a File item reach the other device.
 #[tokio::test(flavor = "multi_thread")]
-async fn c_t10_item_actions_work_on_files() {
+async fn item_actions_work_on_files() {
     let r = Rig::new().await;
     let id = add(&r.phone, "plan.docx", b"PK\x03\x04 pretend docx");
     until("on the PC", 20, || present(&r.pc, id)).await;
@@ -302,11 +302,11 @@ async fn c_t10_item_actions_work_on_files() {
     r.shutdown().await;
 }
 
-// C-T14: a QR older than its expiry. Reproduced first: the PC's window closed, the phone's dial
+// A QR older than its expiry. Reproduced first: the PC's window closed, the phone's dial
 // failed and the old code answered "not_open" ("Pairing is not open on the PC"), which the phone
 // app then showed as "That is not a Tugboat code". Now the phone says the code expired.
 #[tokio::test(flavor = "multi_thread")]
-async fn c_t14_an_expired_qr_says_expired() {
+async fn an_expired_qr_says_expired() {
     let r = Rig::unconnected();
     r.pc.start().await;
     r.phone.start().await;
@@ -343,10 +343,10 @@ async fn c_t14_an_expired_qr_says_expired() {
     r.shutdown().await;
 }
 
-// C-T8: a database written by 0.1.x (schema v1, items held on disk) opens as v2, keeps its rows,
+// A database written by 0.1.x (schema v1, items held on disk) opens as v2, keeps its rows,
 // leaves a .bak-1, and syncs with a fresh peer to equal digests.
 #[tokio::test(flavor = "multi_thread")]
-async fn c_t8_a_v1_database_migrates_and_syncs() {
+async fn a_v1_database_migrates_and_syncs() {
     let clock = TestClock::new(T0);
     let secret = random_secret();
     let id_dev = tugboat_core::facade::device_id_from_secret(&secret);
@@ -401,7 +401,7 @@ async fn c_t8_a_v1_database_migrates_and_syncs() {
 // A record that declares a file over Settings.max_blob_bytes is refused once and visibly, not retried
 // for ever; nothing is requested from the sender.
 #[tokio::test(flavor = "multi_thread")]
-async fn c_t2c_a_record_declaring_a_huge_file_is_refused_once() {
+async fn a_record_declaring_a_huge_file_is_refused_once() {
     let r = Rig::new().await;
     r.apart().await;
     let id = r.phone.core.debug_add_record("huge.iso", "iso", MediaKind::File, None, LocalFileState::Refused).unwrap();
@@ -418,7 +418,7 @@ async fn c_t2c_a_record_declaring_a_huge_file_is_refused_once() {
 
 // A File record's thumbnail field is stored unchanged but never fetched, served or shown.
 #[tokio::test(flavor = "multi_thread")]
-async fn c_t3b_a_files_thumbnail_is_never_fetched_or_shown() {
+async fn a_files_thumbnail_is_never_fetched_or_shown() {
     let r = Rig::new().await;
     let thumb = Thumb { hash: BlobHash([5; 32]), size: 10 };
     let id = r.phone.core.debug_add_record("scan.pdf", "pdf", MediaKind::File, Some(thumb), LocalFileState::Present).unwrap();

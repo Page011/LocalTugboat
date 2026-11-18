@@ -1,6 +1,6 @@
-//! Derived expiry. Owner: logic builder. Pure: no DB, no clock.
+//! Derived expiry. Pure: no DB, no clock.
 //!
-//! PLAN Folders and expiry (Decisions log 2026-11-18, "drop the expiry hold"):
+//! Rules:
 //! - "An item expires at folder_entered_at + retention. Moving an item to another folder
 //!   resets folder_entered_at to now. A kept (pinned) item never expires."
 //! - Items expire ON TIME, whether or not the other device has the file. Before 0.2.0 an item
@@ -9,7 +9,7 @@
 //! - "Expiry is worked out on each device from these synced fields; no device sends
 //!   'expired' to the other."
 //!
-//! Truth table (first matching row wins; full table with examples in core-design.md):
+//! Truth table (first matching row wins):
 //! | # | effective deleted (E1) | pinned | retention (E2) | now >= due | state |
 //! |---|---|---|---|---|---|
 //! | 1 | yes | -   | -    | -   | Deleted{binned_at = deleted_at} |
@@ -19,7 +19,7 @@
 //! | 5 | no  | no  | secs | yes | Expired{binned_at = due} |
 //! due = location.entered_at + secs * 1000.
 //! E1 effective deleted = deleted.val.is_some() && !(pinned.val && pinned.v > deleted.v)
-//!    (M5's rule, so the view is right even before the M5 rewrite has run).
+//!    (merge rule M5, so the view is right even before the merge rewrite has run).
 //! E2 retention = the item's folder's retention if that folder record exists and is not
 //!    deleted; otherwise Keep (an unknown or deleted folder is treated as Unsorted/Keep, so
 //!    an item never falls into a short retention by accident).
@@ -104,7 +104,7 @@ mod tests {
         item_state(item, ExpiryCtx { folder: f, now_ms: now })
     }
 
-    // L11: truth table rows 1-5.
+    // Truth table rows 1-5.
     #[test]
     fn truth_table_rows() {
         let fo = folder(H24);
@@ -129,7 +129,7 @@ mod tests {
         assert_eq!(st(&del, Some(&fo), T0), ItemState::Deleted { binned_at: T0 + 77 });
     }
 
-    // L11: E1 (pin newer than delete = not deleted before M5 runs).
+    // E1 (pin newer than delete = not deleted before the merge rewrite runs).
     #[test]
     fn e1_pin_newer_than_delete_means_kept() {
         let mut it = item(1, p(), v(1, p()));
@@ -151,7 +151,7 @@ mod tests {
         assert!(!effectively_deleted(&it));
     }
 
-    // L11: E2 unknown folder and deleted folder -> Keep, never a surprise expiry.
+    // E2 unknown folder and deleted folder -> Keep, never a surprise expiry.
     #[test]
     fn e2_unknown_and_deleted_folder_are_keep() {
         let it = item(1, p(), v(1, p()));
@@ -190,9 +190,9 @@ mod tests {
         assert!(matches!(st(&it, Some(&fo), T0), ItemState::Live { .. }));
     }
 
-    // Design doc dated example: entered 10:00, Inbox 24 h, Bin 7 days.
+    // Worked example: entered 10:00, Inbox 24 h, Bin 7 days.
     #[test]
-    fn design_doc_example() {
+    fn worked_example() {
         let fo = folder(H24);
         let mut it = item(1, p(), v(1, p()));
         let entered = T0;

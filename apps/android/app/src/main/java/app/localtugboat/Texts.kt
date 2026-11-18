@@ -48,7 +48,7 @@ object Texts {
         return "STOPPED at ${java.time.Instant.ofEpochMilli(fromMs).atZone(zone).format(hm)} - Tugboat was not running"
     }
 
-    /** The ongoing notification line: "Connected to NIGEL-PC, synced 10s ago" or "PC not found, 3 waiting". */
+    /** The ongoing notification line: "Connected to OFFICE-PC, synced 10s ago" or "PC not found, 3 waiting". */
     fun notification(s: SyncStatus, nowMs: Long): String {
         val pc = s.peerName ?: "PC"
         return when (s.state) {

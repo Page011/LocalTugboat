@@ -1,13 +1,13 @@
-//! Activity history (local only). Owner: logic builder.
-//! PLAN question 6: captured, received, moved (from, to), kept, expired, binned, restored,
-//! purged, conflict lost, pairing, unpairing, paused for missing files - with time and device.
+//! Activity history (local only): captured, received, moved (from, to), kept, expired, binned,
+//! restored, purged, conflict lost, pairing, unpairing, paused for missing files - with time and
+//! device.
 
 use rusqlite::{params, Connection};
 use uuid::Uuid;
 
 use crate::{model::*, CoreError, Result};
 
-/// PLAN question 3: "activity kept 30 days".
+/// Activity rows are kept for 30 days.
 pub const KEEP_DAYS: i64 = 30;
 
 /// Longest stored detail text (chars); longer text is cut, never rejected.
@@ -165,7 +165,7 @@ mod tests {
         assert!(parse_action("nope").is_err());
     }
 
-    // L26: trim at the 30-day boundary; paging.
+    // Trim at the 30-day boundary; paging.
     #[test]
     fn trim_boundary_and_paging() {
         let db = Db::open_in_memory().unwrap();

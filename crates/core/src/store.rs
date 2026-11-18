@@ -1,4 +1,4 @@
-//! Typed table access. Owner: logic builder. The only module (with `activity`) that runs SQL.
+//! Typed table access. The only module (with `activity`) that runs SQL.
 //! Every function takes `&rusqlite::Connection` (a `Transaction` derefs to it), so callers
 //! group writes into one transaction. No function here applies a rule: rules live in
 //! merge/expiry/bin/ops and call these.
@@ -132,7 +132,7 @@ fn retention_from_sql(v: Option<i64>) -> Retention {
     }
 }
 
-// ---------- lamport (PLAN: "A local edit sets lamport to max(seen) + 1") ----------
+// ---------- lamport (a local edit sets lamport to max(seen) + 1) ----------
 
 /// Highest lamport seen or issued by this device.
 pub fn max_lamport(c: &Connection) -> Result<u64> {
@@ -822,7 +822,7 @@ pub fn unacked_local_change(c: &Connection, key: &EntityKey, field_group: &str, 
     Ok(v.map(to_u))
 }
 
-/// Delete change_log rows with seq <= upto (PLAN: "trimmed once the peer's cursor passes it").
+/// Delete change_log rows with seq <= upto (trimmed once the peer's cursor passes it).
 pub fn trim_log(c: &Connection, upto: u64) -> Result<usize> {
     Ok(c.execute("DELETE FROM change_log WHERE seq <= ?1", [to_i(upto)])?)
 }
@@ -1102,8 +1102,8 @@ pub fn set_value(c: &Connection, key: &str, value: &str) -> Result<()> {
 
 const PENDING_UNPAIR: &str = "pending_unpair";
 
-/// An unpair this device made while the other device could not be told. PLAN Security:
-/// "Unpair removes the key on both devices": the phone keeps this until it has delivered the
+/// An unpair this device made while the other device could not be told. An unpair removes
+/// the key on both devices, so the phone keeps this until it has delivered the
 /// news to the PC (or the PC refuses it as unknown, which is the same result).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PendingUnpair {
@@ -1294,7 +1294,7 @@ mod tests {
     use super::*;
     use crate::db::Db;
 
-    // L10: lamport = max + 1, persisted across reopen; observe raises, never lowers.
+    // Lamport = max + 1, persisted across reopen; observe raises, never lowers.
     #[test]
     fn lamport_next_observe_and_persist() {
         let dir = tempfile::tempdir().unwrap();
@@ -1421,7 +1421,7 @@ mod tests {
         assert_eq!(all_places(&db.conn).unwrap(), vec![pl]);
     }
 
-    // L8: receipts grow-only; duplicate -> false. A receipt counts for ONE named device.
+    // Receipts grow-only; duplicate -> false. A receipt counts for ONE named device.
     #[test]
     fn receipts_grow_only_and_are_matched_per_device() {
         let db = Db::open_in_memory().unwrap();
@@ -1472,7 +1472,7 @@ mod tests {
         assert_eq!(got, it);
     }
 
-    // L28: change_log rows, dedupe, paging, trim, head, unacked.
+    // Change_log rows, dedupe, paging, trim, head, unacked.
     #[test]
     fn change_log_dedupes_pages_and_trims() {
         let db = Db::open_in_memory().unwrap();
@@ -1611,7 +1611,7 @@ mod tests {
         assert_eq!(get_file_ref(&db.conn, b).unwrap(), Some(fb2));
     }
 
-    // L25: settings defaults, validation, unparsable stored value names the key.
+    // Settings defaults, validation, unparsable stored value names the key.
     #[test]
     fn settings_defaults_validation_and_bad_value() {
         let db = Db::open_in_memory().unwrap();

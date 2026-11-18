@@ -1,4 +1,4 @@
-"""Multi-size .ico files (PNG entries) from the rendered PNGs. Owner 2026-11-18: app icon AND tray are his artwork on
+"""Multi-size .ico files (PNG entries) from the rendered PNGs. The app icon and the tray are the artwork on
 the sea tile, drawn from the vector at every size (no simplified pixel boat anywhere)."""
 import os
 import struct

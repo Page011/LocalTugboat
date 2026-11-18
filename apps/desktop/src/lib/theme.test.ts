@@ -83,7 +83,7 @@ describe("the rail and the danger colour", () => {
     // Hover and current fills must also stand off the rail.
     for (const k of ["--rail-hover", "--rail-current"]) expect(ratio(dark[k]!, dark["--rail"]!)).toBeGreaterThanOrEqual(1.2);
   });
-  test("danger text is red in both themes, never pink or plum (owner rule: urgent is red)", () => {
+  test("danger text is red in both themes, never pink or plum (urgent is red)", () => {
     for (const t of [light, dark]) {
       const [r, g, b] = [1, 3, 5].map((i) => parseInt(t["--danger"]!.slice(i, i + 2), 16));
       expect(r!).toBeGreaterThanOrEqual(g! + 60);

@@ -1,6 +1,6 @@
-//! Name sanitising and media type checks. Owner: logic builder. Pure.
+//! Name sanitising and media type checks. Pure.
 //!
-//! PLAN Security: "The receiver generates every on-disk name itself":
+//! The receiver generates every on-disk name itself:
 //! N1 NFC-normalise (unicode-normalization).
 //! N2 Remove Unicode control chars (general category Cc) and bidi controls
 //!    (U+061C, U+200E, U+200F, U+202A-U+202E, U+2066-U+2069).
@@ -30,14 +30,14 @@
 //!    Agreement: the extension's family equals the sniffed family, except that the video
 //!    containers Mp4/Mov/ThreeGp accept each other (phones mislabel them; all are ISO-BMFF
 //!    video). Extension compare is case-insensitive; the stored ext is lowercase.
-//! N7b Always refused, both directions (R1, 0.2.0): .lnk .url .scf .library-ms
+//! N7b Always refused, both directions (0.2.0): .lnk .url .scf .library-ms
 //!    .searchConnector-ms, desktop.ini, autorun.inf. Matched on the cleaned name (NFC, control
 //!    and bidi characters out, trailing dots and spaces out, case-insensitive, an NTFS stream
 //!    suffix ":..." ignored), on the record's extension and on the final disk name.
 //! N8 Empty after cleaning -> Empty. The caller then uses `fallback_name`.
 //! N9 Collisions on disk: `disambiguate` adds " (2)", " (3)", ... before the extension (the
 //!    `ext_of` rule: up to 16 letters, digits, '-' or '_'), lowest free number; the record
-//!    keeps the original name (PLAN Storage).
+//!    keeps the original name.
 //! Folder names (`clean_folder_name`): N1-N6 without the extension rules, plus a leading '.'
 //! is rejected (protects the hidden `.tugboat` marker folder and avoids hidden folders).
 
@@ -403,8 +403,8 @@ pub fn strip_ext<'a>(name: &'a str, ext: &str) -> &'a str {
 /// The on-disk file name for a received item: the cleaned record name without its extension,
 /// plus "." and the checked extension (no dot when the extension is empty). A name that does not
 /// clean (empty, reserved, a colon, ...) falls back to `fallback_stem(captured_at)`: the file is
-/// still accepted, and only type and refusal failures refuse it (decision B: the made-up name keeps
-/// today's `IMG_` look whatever the kind). Returns (name, kind). A final name that is one of the
+/// still accepted, and only type and refusal failures refuse it (the made-up name keeps
+/// the `IMG_` look whatever the kind). Returns (name, kind). A final name that is one of the
 /// always-refused ones (`desktop` + extension `ini`) is `Refused` too.
 pub fn disk_file_name(record_name: &str, ext: &str, head: &[u8], captured_at_ms: i64) -> Result<(String, MediaKind), NameError> {
     // Type first: a type failure refuses the file whatever the name looks like.
@@ -440,7 +440,7 @@ fn build_disk_name(record_name: &str, ext: &str, captured_at_ms: i64) -> String 
 }
 
 /// A synced record that must never be downloaded: its extension, its name, or the disk name this
-/// device would build from them is one of the always-refused ones (amendment 1: name "a:b" with
+/// device would build from them is one of the always-refused ones (name "a:b" with
 /// ext "lnk" would otherwise become `IMG_<time>.lnk`). Pure; needs no file bytes.
 pub fn is_refused_record(record_name: &str, ext: &str) -> bool {
     let ext = ext.trim_start_matches('.').to_ascii_lowercase();
@@ -589,7 +589,7 @@ mod tests {
         v
     }
 
-    // L23: every family accepted with a matching extension.
+    // Every family accepted with a matching extension.
     #[test]
     fn every_family_good() {
         let cases: Vec<(&str, Vec<u8>, Family)> = vec![
@@ -620,7 +620,7 @@ mod tests {
         }
     }
 
-    // L23: .exe with JPEG magic, .jpg with PNG magic, .mp4 with qt brand, desktop.ini, .lnk.
+    // .exe with JPEG magic, .jpg with PNG magic, .mp4 with qt brand, desktop.ini, .lnk.
     #[test]
     fn extension_and_magic_must_agree() {
         assert!(matches!(check_media("exe", &jpeg()), Err(NameError::ExtensionNotAllowed(_))));
@@ -660,7 +660,7 @@ mod tests {
         assert!(matches!(disk_file_name(name, "jpg", &exe(), 0), Err(NameError::NotMedia)));
     }
 
-    // L23: NFC, ':', separators, '..', trailing dots and spaces.
+    // NFC, ':', separators, '..', trailing dots and spaces.
     #[test]
     fn stem_cleaning_rules() {
         // NFC: e + combining acute -> precomposed.
@@ -721,7 +721,7 @@ mod tests {
         assert!(name.starts_with("IMG_") && name.ends_with(".jpg"), "{name}");
     }
 
-    // L23: 150-unit cap keeps the extension.
+    // 150-unit cap keeps the extension.
     #[test]
     fn length_cap_keeps_extension() {
         let long = "x".repeat(300);
@@ -770,7 +770,7 @@ mod tests {
         assert_eq!(fallback_stem(-1000), "IMG_19691231_235959");
     }
 
-    // L23: disambiguate (2)(3) and no-ext, case-insensitive.
+    // Disambiguate (2)(3) and no-ext, case-insensitive.
     #[test]
     fn disambiguate_lowest_free_number() {
         let taken_set = |set: &'static [&'static str]| move |n: &str| set.iter().any(|t| t.eq_ignore_ascii_case(n));
@@ -786,7 +786,7 @@ mod tests {
         assert!(disambiguate("a.jpg", &always).ends_with(").jpg"));
     }
 
-    // L23: folder names, including ".tugboat".
+    // Folder names, including ".tugboat".
     #[test]
     fn folder_names() {
         assert_eq!(clean_folder_name("Work"), Ok("Work".to_string()));
@@ -844,7 +844,7 @@ mod tests {
         assert!(!is_safe_ext("searchconnector-msx"));
     }
 
-    // Amendment 1: a record is refused by its extension, its name or the disk name it would get.
+    // A record is refused by its extension, its name or the disk name it would get.
     #[test]
     fn refused_records() {
         for (name, ext) in [
@@ -929,7 +929,7 @@ mod tests {
         assert_eq!(disk_file_name("report.pdf", "pdf", b"%PDF", t).unwrap(), ("report.pdf".to_string(), MediaKind::File));
         assert_eq!(disk_file_name("Makefile", "", b"x", t).unwrap(), ("Makefile".to_string(), MediaKind::File));
         assert_eq!(disk_file_name("data", "csv", b"a,b", t).unwrap().0, "data.csv");
-        // Decision B: an unsafe name still gets the made-up IMG_ name, whatever the kind.
+        // An unsafe name still gets the made-up IMG_ name, whatever the kind.
         let (n, k) = disk_file_name("a:b.pdf", "pdf", b"%PDF", t).unwrap();
         assert!(n.starts_with("IMG_") && n.ends_with(".pdf"), "{n}");
         assert_eq!(k, MediaKind::File);

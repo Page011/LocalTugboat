@@ -1,4 +1,4 @@
-//! The app log (PLAN: "app log 3 x 5 MB"): every `tracing` event of the desktop app, Core and
+//! The app log (3 files of 5 MB): every `tracing` event of the desktop app, Core and
 //! the network crate goes to `<data dir>\logs\tugboat.log`. Without a subscriber every
 //! error and warning in the code is dropped, and a user who says "it stopped syncing" leaves
 //! nothing to read.

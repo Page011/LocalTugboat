@@ -18,7 +18,7 @@ import uniffi.tugboat_ffi.MediaKind
 /**
  * 0.2.0 "any file type" on the phone: share names, refusals, file tiles' labels, MIME, the real name other apps see.
  * The core's own name rules live in Rust; [FakeRules] stands in for the native library (a JVM test cannot load an
- * Android .so), so the emulator run (notes/plans/0.2.0-android-notes.md) is what proves the real rules end to end.
+ * Android .so), so only an emulator run proves the real rules end to end.
  */
 class AnyFileTest {
     private val main: File = listOf(File("src/main"), File("app/src/main")).first { it.isDirectory }

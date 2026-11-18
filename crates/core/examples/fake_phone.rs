@@ -1,5 +1,5 @@
 //! fake_phone: tugboat-core in the phone role, for QA and for trying the PC app before the
-//! Android app exists. Owner: sync builder.
+//! Android app exists.
 //!
 //! Usage (binds 127.0.0.1 only unless --bind is given):
 //!   cargo run -p tugboat-core --example fake_phone -- pair "<QR payload text>" [--data <dir>]

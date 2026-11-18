@@ -3,7 +3,7 @@ import type { SyncState } from "./SyncState";
 
 export type SyncStatus = { state: SyncState, peer_name: string | null, 
 /**
- * PLAN silent-failure row "Sync stopped": shown as "last synced" on both apps.
+ * Shown as "last synced" on both apps, so a stopped sync is visible.
  */
 last_synced_at: number | null, 
 /**

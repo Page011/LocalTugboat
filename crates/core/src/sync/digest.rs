@@ -1,8 +1,8 @@
-//! Reconcile digest. Owner: sync builder.
+//! Reconcile digest.
 //!
-//! PLAN: "both sides compare a hash of their sorted list of (id, field versions); a mismatch
+//! Both sides compare a hash of their sorted list of (id, field versions); a mismatch
 //! triggers a full list exchange. This catches a lost change, a restored backup, or a cursor
-//! that went wrong".
+//! that went wrong.
 //!
 //! Definition (both sides must produce identical bytes for identical state):
 //! - Iterate every synced record (folders, places, items, receipts; tombstones included) in

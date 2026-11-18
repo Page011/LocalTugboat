@@ -1,6 +1,6 @@
 //! The LAN-only iroh endpoint and connections.
 //!
-//! Endpoint configuration (exactly the spike's `make_endpoint`, plus the M1 additions):
+//! Endpoint configuration:
 //! - `Endpoint::builder(presets::Minimal)`, `.relay_mode(RelayMode::Disabled)`,
 //!   `.clear_address_lookup()` (no n0 DNS/pkarr), `.clear_ip_transports()` then
 //!   `.bind_addr(cfg.bind)` (one UDP socket; the desktop passes 127.0.0.1 when env
@@ -8,7 +8,7 @@
 //! - portmapper is not compiled (iroh default-features = false in the workspace).
 //! - `.addr_filter(local::local_addr_filter())`.
 //! - mDNS when `cfg.mdns`: `LocalOnly(MdnsAddressLookup::builder().advertise(cfg.role == Role::Pc)
-//!   .addr_filter(local_addr_filter()))`. Only the PC advertises (PLAN M0 lesson); the phone
+//!   .addr_filter(local_addr_filter()))`. Only the PC advertises; the phone
 //!   only resolves. Tests on loopback pass `mdns: false`.
 //! - `.hooks(GateHooks { .. })` (see `GateHooks`).
 //! - ALPN list: `[ALPN_SYNC]`, plus `ALPN_PAIR` only while `set_pairing_open(true)`
@@ -16,8 +16,8 @@
 //! - `.transport_config(..)`: keep-alive every 10 s and max idle timeout 30 s, so a dead
 //!   peer (Wi-Fi gone, phone killed) closes the connection and the UI shows Offline within
 //!   30 to 40 s (measured 35 s: the idle timer restarts on the first keep-alive after a
-//!   received packet, so the bound is keep-alive + idle) instead of a frozen "Synced"
-//!   (PLAN silent failure "Sync stopped"). API (checked in
+//!   received packet, so the bound is keep-alive + idle) instead of a frozen "Synced".
+//!   API (checked in
 //!   the 1.4.1 source): `QuicTransportConfig::builder().keep_alive_interval(Duration)
 //!   .max_idle_timeout(Some(IdleTimeout))`.
 
@@ -50,7 +50,7 @@ use crate::{
     NetError, ALPN_PAIR, ALPN_SYNC,
 };
 
-/// Dead peers must show Offline within KEEP_ALIVE + MAX_IDLE (PLAN silent failure "Sync stopped").
+/// Dead peers must show Offline within KEEP_ALIVE + MAX_IDLE, so a stopped sync is never shown as synced.
 const KEEP_ALIVE: Duration = Duration::from_secs(10);
 const MAX_IDLE: Duration = Duration::from_secs(30);
 /// An incoming connection must finish its handshake within this, or it is dropped.
@@ -91,7 +91,7 @@ pub trait AccessGate: Send + Sync + 'static {
     fn is_paired(&self, peer: &[u8; 32]) -> Result<bool, String>;
 }
 
-/// Endpoint hooks that enforce PLAN Network "An unknown key gets nothing else".
+/// Endpoint hooks that enforce "an unknown key gets nothing else".
 /// - before_connect: `Reject` if the EndpointAddr has any relay URL or any IP address that
 ///   `local::is_local_addr` rejects (second line behind `Node::dial`'s own check).
 /// - after_handshake, ALPN_SYNC: `Reject{close::NOT_PAIRED, "not paired"}` unless
@@ -182,7 +182,7 @@ impl StreamKind {
     }
 }
 
-/// Only the PC advertises over mDNS (PLAN M0 lesson); the phone resolves only.
+/// Only the PC advertises over mDNS; the phone resolves only.
 pub fn mdns_advertise(role: Role) -> bool {
     role == Role::Pc
 }
@@ -334,7 +334,7 @@ impl Node {
     }
 
     /// Installs what happens when the live path guard closes a connection because a path left
-    /// the local network (core turns it into a visible error and an activity row; PLAN: errors
+    /// the local network (core turns it into a visible error and an activity row; errors
     /// are surfaced, never swallowed). Takes effect for every connection, old and new. A
     /// violation found while a connection is being set up is returned as `NetError::NotLocal`
     /// by `dial` / `accept` instead.
@@ -377,7 +377,7 @@ impl Node {
 
     /// Dial `peer` on `alpn`. Rules:
     /// 1. Any address in `addrs` that is not local -> `Err(NotLocal)` at once, nothing sent
-    ///    (spike `dial_rejects_non_local_address_without_trying`).
+    ///    (see `n3_dial_rejects_non_local_address_without_trying`).
     /// 2. With addresses: one connect with all of them in the EndpointAddr (iroh races them),
     ///    bounded by `timeout`.
     /// 3. If that fails (or `addrs` is empty) and mDNS is enabled: connect by id alone (mDNS

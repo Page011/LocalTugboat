@@ -887,8 +887,8 @@ fn the_ten_percent_rule_applies_even_below_twenty_files() {
 
 #[test]
 fn a_tiny_library_pauses_on_one_missing_file_under_the_literal_ten_percent_rule() {
-    // PLAN: "more than 20 files or 10% of the library missing". In a 2-file library one delete
-    // is 50%. Pinned here so the behaviour is visible; see the report's open issues.
+    // The rule is "more than 20 files or 10% of the library missing". In a 2-file library one delete
+    // is 50%. Pinned here so the behaviour is visible.
     let mut r = Rig::strict();
     r.write("a.jpg", 1);
     r.write("b.jpg", 2);

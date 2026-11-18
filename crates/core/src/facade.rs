@@ -1,11 +1,11 @@
 //! The Core facade: the one API both apps call (desktop via Tauri commands, phone via the
-//! UniFFI crate in M3). Owner: sync builder. Thin: validates input, calls ops/bin/store,
+//! UniFFI crate). Thin: validates input, calls ops/bin/store,
 //! emits events, pokes the sync session. No rule lives here.
 //!
 //! Threading: `Core` is cheap to clone (Arc). The SQLite connection sits behind a Mutex;
 //! every method holds it only for its own call and never across an await. (ops::add_local_file
 //! copies the file while it holds the lock: a very large video stalls sync for the length of
-//! the copy; see the sync builder's open issues.)
+//! the copy.)
 //! Errors are returned AND (for background work: sweep, sync, fetch) sent as Event::Error.
 
 use std::{
@@ -45,7 +45,7 @@ pub struct CoreConfig {
     /// This device's public key (the app loads the secret from Credential Manager /
     /// Keystore and passes the derived public key here; the secret goes to `start_network`).
     pub self_id: DeviceId,
-    /// "NIGEL-PC" / phone model. Shown to the other device.
+    /// "OFFICE-PC" / phone model. Shown to the other device.
     pub device_name: String,
     pub app_version: String,
 }
@@ -535,14 +535,14 @@ impl Core {
         store::paired_peer(&db.conn)
     }
 
-    /// M4 confirmation count ("This moves 132 items to the Bin").
+    /// Confirmation count ("This moves 132 items to the Bin").
     pub fn retention_preview(&self, folder: FolderId, new: Retention) -> Result<u32> {
         let now = self.now();
         let db = lock(&self.inner.db);
         folders::retention_preview(&db.conn, folder, new, now)
     }
 
-    /// Phone capture routing (places::route over live places). M4 UI; tested in M1.
+    /// Phone capture routing (places::route over live places).
     pub fn route_capture(&self, fix: Option<Fix>) -> Result<Route> {
         let db = lock(&self.inner.db);
         let c = &db.conn;
@@ -698,7 +698,7 @@ impl Core {
         Ok(())
     }
 
-    // ----- PC library glue (M2; desktop watcher calls these) -----
+    // ----- PC library glue (the desktop watcher calls these) -----
 
     /// Watcher: an existing item's file content changed (ops::content_changed).
     pub fn local_content_changed(&self, id: ItemId, path: PathBuf) -> Result<()> {

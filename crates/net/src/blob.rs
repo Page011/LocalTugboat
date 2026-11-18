@@ -1,8 +1,8 @@
 //! Resumable, verified blob transfer. The receiver pulls.
 //!
 //! Why pull: the receiver knows which blobs it needs (from synced item records) and owns its
-//! partial file, so it alone knows the resume offset (PLAN Sync model: "chunked and resumable
-//! from the last received byte, written to a temp file, hash-checked, then renamed").
+//! partial file, so it alone knows the resume offset (transfers are chunked and resumable
+//! from the last received byte, written to a temp file, hash-checked, then renamed).
 //!
 //! Stream protocol (one `StreamKind::Blob` stream per blob, opened by the receiver):
 //!   receiver -> sender: frame `BlobRequest { hash, size, offset }`, then finish its send side
@@ -53,7 +53,7 @@ use crate::{
     NetError,
 };
 
-/// Streaming chunk size (spike value).
+/// Streaming chunk size.
 pub const CHUNK: usize = 256 * 1024;
 
 /// No byte for this long inside a body, or at the end-of-stream check, is a stuck peer.
@@ -108,7 +108,7 @@ pub fn check_space(needed: u64, available: u64) -> Result<(), NetError> {
 }
 
 /// Download one blob into `part_path` (rules 1-9 above). `max_size` is core's setting
-/// (default 16 GiB, spike MAX_FILE).
+/// (default 16 GiB).
 pub async fn fetch_blob(conn: &PeerConn, hash: &str, size: u64, part_path: &Path, max_size: u64) -> Result<Fetched, NetError> {
     let t0 = Instant::now();
     if !valid_hash(hash) {

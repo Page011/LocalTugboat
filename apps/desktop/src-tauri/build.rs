@@ -1,6 +1,6 @@
 fn main() {
     // The exe icon is compiled into resource.lib by tauri_build; cargo only re-runs this script for files it is told
-    // about, so without this line a changed icon.ico left the OLD icon in the exe (found 2026-11-18). Declared before
+    // about, so without this line a changed icon.ico left the OLD icon in the exe. Declared before
     // tauri_build::build(), which adds its own rerun lines.
     println!("cargo:rerun-if-changed=icons/icon.ico");
     println!("cargo:rerun-if-changed=icons/icon.png");

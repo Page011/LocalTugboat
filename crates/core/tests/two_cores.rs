@@ -1,7 +1,7 @@
-//! M1 scenarios from PLAN "Milestones / M1 Core", run as two real cores over loopback:
+//! Scenarios run as two real cores over loopback:
 //! both directions, field conflicts, Keep vs expiry while apart, restore vs purge while apart,
 //! expiry on time whatever the receipts say (incl. zero paired devices and a re-paired device), a PC edit
-//! plus a phone move while apart, live latency. Design test ids S1-S6, S13, S18.
+//! plus a phone move while apart, live latency. Scenarios S1-S6, S13, S18.
 
 mod common;
 
@@ -177,11 +177,11 @@ async fn s04_restore_beats_purge() {
     r.shutdown().await;
 }
 
-// C-T5 (replaces S5a): expiry is on time. The phone's item expires at its due time while the PC
+// Expiry is on time. The phone's item expires at its due time while the PC
 // is away, no "waiting" state ever shows, the Bin and the activity row say it never reached the
 // PC, and a PC that comes back after the due time never downloads the expired item.
 #[tokio::test(flavor = "multi_thread")]
-async fn c_t5_expiry_is_on_time_while_the_pc_is_away() {
+async fn expiry_is_on_time_while_the_pc_is_away() {
     let r = Rig::unconnected();
     pair(&r.pc, &r.phone).await;
     r.settle().await;

@@ -104,7 +104,7 @@ fn not_synced(path: &Path, name: &str, reason: &str) -> NotSyncedFile {
 }
 
 /// A download or editor lock file that is not the real file yet: Chrome `.crdownload`, `.part`,
-/// Office `~$x.docx`, LibreOffice `.~lock.x.odt#`, and this app's own cross-drive move copy. (Question 8 to the owner: built as "listed, not synced".)
+/// Office `~$x.docx`, LibreOffice `.~lock.x.odt#`, and this app's own cross-drive move copy. These are listed but not synced.
 fn is_in_progress(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     lower.starts_with("~$") || lower.starts_with(".~lock.") || ["crdownload", "part", "partial", "download", "opdownload", super::placement::MOVE_EXT].contains(&names::ext_of(name).as_str())
@@ -185,7 +185,7 @@ fn walk(root: &Path, with_files: bool) -> std::io::Result<Walk> {
 
 /// Ok when `path` may become a library: it does not exist, or holds nothing but `.tugboat`
 /// and Windows' hidden files. Pointing the library at a folder of 10,000 photos would sync
-/// them all and start expiring them (PLAN).
+/// them all and start expiring them.
 pub(super) fn check_new_library(path: &Path) -> Result<(), String> {
     if !path.exists() {
         return Ok(());
@@ -712,7 +712,7 @@ impl Inner {
                         claimed.insert(k.clone());
                         p.set(&k, DirEntry { name: d.name.clone(), volume, id });
                     } else {
-                        // New subfolder = new folder, Keep until its retention is set (PLAN).
+                        // New subfolder = new folder, Keep until its retention is set.
                         match self.core.create_folder(&d.name, Retention::Keep) {
                             Ok(fid) => {
                                 rep.folders_created += 1;
@@ -961,7 +961,7 @@ impl Inner {
         } else if names::ext_of(&f.name) == h.ext {
             names::join_ext(names::strip_ext(&f.name, &h.ext), &h.ext)
         } else {
-            // The user changed the extension: the record keeps its own type (open question for Nigel).
+            // The user changed the extension: the record keeps its own type.
             let stem = Path::new(&f.name).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
             names::join_ext(&stem, &h.ext)
         };

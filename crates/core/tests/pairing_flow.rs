@@ -1,4 +1,4 @@
-//! Pairing, unpairing, refusals and the fake-phone tool, over loopback. Design ids S11, S12,
+//! Pairing, unpairing, refusals and the fake-phone tool, over loopback. Scenarios S11, S12,
 //! S14, S15, S21.
 
 mod common;

@@ -116,8 +116,8 @@ describe("small helpers", () => {
   });
   test("shortPath keeps the drive and the last folders", () => {
     expect(shortPath("C:\\a\\b")).toBe("C:\\a\\b");
-    expect(shortPath("C:\\Users\\Nigel\\Documents\\Pictures\\Local Tugboat", 30)).toBe("C:\\...\\Pictures\\Local Tugboat");
-    expect(shortPath("C:\\Users\\Nigel\\Documents\\A-very-long-last-folder-name-here", 30)).toBe("C:\\...\\A-very-long-last-folder-name-here");
+    expect(shortPath("C:\\Users\\alex\\Documents\\Pictures\\Local Tugboat", 30)).toBe("C:\\...\\Pictures\\Local Tugboat");
+    expect(shortPath("C:\\Users\\alex\\Documents\\A-very-long-last-folder-name-here", 30)).toBe("C:\\...\\A-very-long-last-folder-name-here");
   });
 });
 

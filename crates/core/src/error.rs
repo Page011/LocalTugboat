@@ -1,6 +1,5 @@
-//! The one error type of tugboat-core. Owner: logic builder. The sync builder uses the
-//! Net/Protocol/Version/Pairing variants; add a variant only after updating
-//! notes/core-design.md (both builders compile against this enum).
+//! The one error type of tugboat-core. The sync layer uses the Net/Protocol/Version/Pairing
+//! variants.
 //! Errors are surfaced (returned, and turned into `Event::Error` by the facade), never swallowed.
 
 use crate::names::NameError;
@@ -13,7 +12,7 @@ pub enum CoreError {
     Db(#[from] rusqlite::Error),
     #[error("file error on {path}: {msg}")]
     Io { path: String, msg: String },
-    /// PLAN: "An older app opening a newer database refuses with a clear message".
+    /// An older app opening a newer database refuses with a clear message.
     #[error("this database was written by a newer Tugboat (schema {found}, this app knows up to {supported}); update Tugboat")]
     NewerDatabase { found: u32, supported: u32 },
     #[error("database upgrade {from} -> {to} failed: {msg}")]

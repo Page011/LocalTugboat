@@ -1,5 +1,5 @@
 // electron shoot.cjs <out.png> <page.html> <width> <height> [transparent]
-// Renders one local HTML page to a PNG (one page per run). Adapted from forteops plans/ui-examples/admin/shoot.cjs.
+// Renders one local HTML page to a PNG (one page per run).
 const { app, BrowserWindow } = require('electron')
 const fs = require('fs')
 const args = process.argv.slice(2).filter((x) => !x.startsWith('--'))

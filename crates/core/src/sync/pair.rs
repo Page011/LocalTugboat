@@ -1,10 +1,10 @@
-//! Pairing flows over tugboat-net's pairing primitives. Owner: sync builder.
+//! Pairing flows over tugboat-net's pairing primitives.
 //!
 //! PC: `begin` opens the window (QR payload), `handle_conn` serves each incoming pairing
 //! connection, `confirm` is the [Pair] / [Cancel] click, `tick` expires the window.
 //! Phone: `pair_with` runs the whole exchange from a scanned payload.
 //!
-//! Rules (PLAN "How it works / Pairing", notes/core-design.md section 3):
+//! Rules:
 //! - The PC completes a pairing only after the decision reached the phone (`pc_send_decision`
 //!   returned Ok): a PC that is paired with a phone that never heard "accepted" would be a
 //!   silent half-pairing.
@@ -58,7 +58,7 @@ pub fn pair_code(e: &PairError) -> String {
     serde_json::to_value(e).ok().and_then(|v| v.get("code").and_then(|c| c.as_str().map(String::from))).unwrap_or_else(|| "pairing".into())
 }
 
-/// One-line text, the same on both devices (notes/core-design.md section 3).
+/// One-line text, the same on both devices.
 pub fn pair_text(e: &PairError) -> String {
     match e {
         PairError::SecretReused => "PAIRING BLOCKED - someone else used this code".into(),

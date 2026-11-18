@@ -284,9 +284,14 @@ object UiLogic {
     /** What a folder does to its items: "Kept" or "Expires after 7d". */
     fun retention(secs: ULong?): String = if (secs == null) "Kept" else "Expires after ${Texts.duration(secs.toLong() * 1000)}"
 
-    /** Why a file is not viewable here, or null when it is held. */
-    fun fileNote(local: LocalFileState, bin: Boolean): String? = when (local) {
-        LocalFileState.PENDING -> "Downloading from PC"
+    const val WAITING_STORAGE_LOW = "Waiting - phone storage low"
+
+    /**
+     * Why a file is not viewable here, or null when it is held. While the storage guard holds downloads
+     * ([storageLow]) a pending file is not downloading, so it says so.
+     */
+    fun fileNote(local: LocalFileState, bin: Boolean, storageLow: Boolean = false): String? = when (local) {
+        LocalFileState.PENDING -> if (storageLow) WAITING_STORAGE_LOW else "Downloading from PC"
         LocalFileState.LOST -> "FILE MISSING on this phone"
         LocalFileState.REFUSED -> "PC refused this file"
         LocalFileState.PURGED -> if (bin) null else "On PC only"
@@ -302,8 +307,8 @@ object UiLogic {
     class CellUi(val label: String, val kept: Boolean, val video: Boolean, val file: Boolean)
 
     /** Label and badges under one thumbnail or file tile. A Bin item that never reached the PC says so. */
-    fun cell(item: ItemInfo, nowMs: Long, binDays: UInt, bin: Boolean): CellUi {
-        val base = fileNote(item.local, bin) ?: Texts.expiryLabel(item.state, nowMs, binDays)
+    fun cell(item: ItemInfo, nowMs: Long, binDays: UInt, bin: Boolean, storageLow: Boolean = false): CellUi {
+        val base = fileNote(item.local, bin, storageLow) ?: Texts.expiryLabel(item.state, nowMs, binDays)
         val label = if (bin && item.neverReachedPeer) "$base - ${Texts.NOT_ON_PC}" else base
         val kept = item.pinned || item.state is uniffi.tugboat_ffi.ItemStateInfo.Kept || item.state is uniffi.tugboat_ffi.ItemStateInfo.FolderKeep
         return CellUi(label, kept, item.kind == MediaKind.VIDEO, item.kind == MediaKind.FILE)

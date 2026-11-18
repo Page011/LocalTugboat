@@ -1,7 +1,7 @@
-//! Merge rules. Owner: logic builder. Pure functions first, then `apply_remote`, the single
+//! Merge rules. Pure functions first, then `apply_remote`, the single
 //! entry point the sync engine calls for every record it receives.
 //!
-//! Rules (PLAN Sync model; tables with worked examples in notes/core-design.md "Merge"):
+//! Rules:
 //! M1 Per group: the higher `Version` wins (lamport, then device bytes). Equal versions =
 //!    same write; keep local. Values are never compared to pick a winner.
 //! M2 Groups merge independently: a PC edit (content) and a phone move (placement) made
@@ -14,7 +14,7 @@
 //!    fresh local version: pinned.v > deleted.v -> deleted := None; otherwise pinned := false.
 //!    Activity `Conflict` is logged. Both devices compute the same winner from the same
 //!    versions; their rewrites carry the same value, so they converge.
-//! M6 Conflict logging (PLAN question 4: "the loser is logged in activity"): when a group's
+//! M6 Conflict logging (the loser is logged in activity): when a group's
 //!    values differ and this device has an unacked local change to that group (change_log seq
 //!    greater than our_seq_acked for the peer), the change was concurrent: log `Conflict` with the
 //!    winning and losing values, whichever side won. Non-concurrent overwrites are not conflicts.
@@ -23,7 +23,7 @@
 //!    turns it into Purged if the item is already in the Bin).
 //! M9 Remote-applied changes are not written to change_log; M5 rewrites are (they are local).
 //!
-//! Also at the trust boundary (a paired peer is still validated, PLAN Security): a remote
+//! Also at the trust boundary (a paired peer is still validated): a remote
 //! record with an out-of-range or unsafe field is a `Protocol` error and is not stored.
 
 use rusqlite::Connection;
@@ -321,7 +321,7 @@ fn place_group_text(c: &Connection, pl: &PlaceRecord, g: &str) -> String {
 
 /// M6 for one record: log a Conflict row for each differing group where this device has a
 /// local change the peer has not acked. No cursor = first snapshot with this peer: nothing
-/// is concurrent yet (open issue 6 in the design doc).
+/// is concurrent yet.
 #[allow(clippy::too_many_arguments)]
 fn log_conflicts(
     c: &Connection,
@@ -504,7 +504,7 @@ mod tests {
         Versioned { v: ver, val }
     }
 
-    // L1/L2: pick rows E1-E4.
+    // Pick rows E1-E4.
     #[test]
     fn pick_examples_e1_to_e4() {
         // E1: local (3,P), remote (5,F): remote.
@@ -520,7 +520,7 @@ mod tests {
         assert_eq!(pick(&vs(v(5, p()), 1), &vs(v(4, f()), 999)), Pick::Local);
     }
 
-    // L3: E5 content edit + move both survive.
+    // E5 content edit + move both survive.
     #[test]
     fn e5_content_edit_and_move_both_survive() {
         let mut local = item(1, f(), v(1, f()));
@@ -566,7 +566,7 @@ mod tests {
         it
     }
 
-    // L4: merge is commutative per group, associative, idempotent (random version pairs).
+    // Merge is commutative per group, associative, idempotent (random version pairs).
     #[test]
     fn merge_is_commutative_associative_idempotent() {
         let mut g = Lcg(42);
@@ -594,7 +594,7 @@ mod tests {
         assert_eq!(merge_folder(&x, &y).unwrap().merged, merge_folder(&y, &x).unwrap().merged);
     }
 
-    // L7: immutable mismatch -> Protocol error.
+    // Immutable mismatch -> Protocol error.
     #[test]
     fn immutable_mismatch_is_a_protocol_error() {
         let a = item(1, p(), v(1, p()));
@@ -657,7 +657,7 @@ mod tests {
             .collect()
     }
 
-    // L5: E7 (pin later than delete), both arrival orders, two dbs converge.
+    // E7 (pin later than delete), both arrival orders, two dbs converge.
     #[test]
     fn e7_keep_after_delete_wins_on_both_devices() {
         let (dp, df, base) = pair_with_item();
@@ -691,7 +691,7 @@ mod tests {
         assert_eq!(apply(&df, f(), p(), &fp).changed, None);
     }
 
-    // L5: E6 variant where delete is the later intent: pin loses, item deleted on both.
+    // E6 variant where delete is the later intent: pin loses, item deleted on both.
     #[test]
     fn delete_after_keep_wins_on_both_devices() {
         let (dp, df, base) = pair_with_item();
@@ -716,7 +716,7 @@ mod tests {
         assert!(store::max_lamport(&dp.conn).unwrap() >= 7);
     }
 
-    // L6: M6 concurrent change logs a Conflict; a non-concurrent overwrite logs nothing.
+    // M6 concurrent change logs a Conflict; a non-concurrent overwrite logs nothing.
     #[test]
     fn m6_conflict_only_when_local_change_unacked() {
         let (dp, _df, base) = pair_with_item();
@@ -770,7 +770,7 @@ mod tests {
         assert_eq!(store::get_item(&dp.conn, base.id).unwrap().unwrap().0.name.val, "F", "merge itself still applies");
     }
 
-    // L8 via apply_remote: receipts are grow-only; duplicate -> no change.
+    // Via apply_remote: Receipts are grow-only; duplicate -> no change.
     #[test]
     fn receipts_via_apply_remote() {
         let d = db_with_peer(p(), f());
@@ -827,7 +827,7 @@ mod tests {
         assert!(validate_remote(&rec(MediaKind::File, &"x".repeat(17), "x")).is_err());
     }
 
-    // L9: a new remote item is Pending; applying logs nothing (M9).
+    // A new remote item is Pending; applying logs nothing (M9).
     #[test]
     fn new_remote_item_is_pending_and_not_logged() {
         let d = db_with_peer(p(), f());

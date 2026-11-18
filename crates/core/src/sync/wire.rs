@@ -1,10 +1,10 @@
 //! Control-stream messages (ALPN localtugboat/1, StreamKind::Control, one stream per
 //! connection, opened by the dialer = phone). Framing: tugboat-net `frame` (u32 BE length
-//! + JSON). JSON tag field "t", snake_case names. Owner: sync builder.
+//! + JSON). JSON tag field "t", snake_case names.
 //!
-//! Session order (details and failure handling in core-design.md "Sync session"):
+//! Session order:
 //! 1. dialer -> Hello; acceptor -> Hello or Refuse (then close VERSION_MISMATCH / NOT_PAIRED).
-//! 2. Both: observe_lamport(peer.max_lamport) before any write (PLAN lamport catch-up).
+//! 2. Both: observe_lamport(peer.max_lamport) before any write (lamport catch-up).
 //! 3. Both send Pull{from: Seq(cursor)} or Pull{from: Snapshot{after: None}} for a new peer.
 //!    Answers: Changes pages until more = false. Each page applied in one transaction with
 //!    the cursor update.
@@ -26,8 +26,7 @@ use crate::model::*;
 /// those records as Protocol errors and its digest would never match, so the handshake refuses
 /// a mismatch on BOTH sides ("Update Tugboat on the <device with the lower number>") before any
 /// record moves. The ALPN stays `localtugboat/1` on purpose: an ALPN change would make an old
-/// peer fail the TLS handshake and show no message at all. (PLAN says "bump localtugboat/N";
-/// this deviation is recorded in notes/core-design.md section 12.)
+/// peer fail the TLS handshake and show no message at all.
 pub const PROTO: u32 = 2;
 
 /// Max records per Changes / Records page, keys per Fetch, entries per List.
@@ -103,8 +102,8 @@ pub enum PullFrom {
     /// Changes with seq > since, from the change log.
     Seq { since: u64 },
     /// Full snapshot in EntityKey order, after the given key (None = from the start).
-    /// Used when the puller has no cursor for this peer (new peer, PLAN "full snapshot both
-    /// ways, tombstones included").
+    /// Used when the puller has no cursor for this peer (new peer: full snapshot both
+    /// ways, tombstones included).
     Snapshot { after: Option<EntityKey> },
 }
 

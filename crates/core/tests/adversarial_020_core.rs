@@ -1,6 +1,5 @@
-//! Adversarial tests, verifier stage 020 (correctness and data-safety lens). Each test states a
-//! 0.2.0 rule and tries to break it with two real cores on loopback (127.0.0.1). A failing test
-//! here is a finding, not a broken test.
+//! Adversarial tests for 0.2.0 on the PC: each one states a rule and tries to break it with two
+//! real cores on loopback (127.0.0.1). A failing test means the rule does not hold.
 
 mod common;
 
@@ -27,7 +26,7 @@ fn present(d: &Dev, id: ItemId) -> bool {
 }
 
 /// Known bug "QR older than 2 minutes says 'That is not a Tugboat code'". The desktop app opens a
-/// NEW pairing window when the old one runs out (Android verifier notes), so a phone holding the old
+/// NEW pairing window when the old one runs out, so a phone holding the old
 /// QR reaches an OPEN pairing endpoint with a stale secret. The payload's own expiry has passed by
 /// the phone's clock, so the core must say "expired", not "wrong pairing code".
 #[tokio::test(flavor = "multi_thread")]
@@ -77,7 +76,7 @@ fn tugboat_core_dev_pc() -> Dev {
     Dev::new(tugboat_core::Role::Pc, "TEST-PC", &TestClock::new(T0))
 }
 
-/// R3 on-time expiry, then Restore: the phone's photo expires while the PC is away (the PC never
+/// On-time expiry, then Restore: the phone's photo expires while the PC is away (the PC never
 /// got it). Restoring it on the phone must make it live again on both devices and the late PC must
 /// then download it (no data lost by the dropped hold when the user acts in time).
 #[tokio::test(flavor = "multi_thread")]
@@ -124,7 +123,7 @@ async fn adv020_a_move_on_one_device_extends_expiry_on_both() {
     r.shutdown().await;
 }
 
-/// Any file type, zero bytes, phone -> PC (C-T1 only covers PC -> phone for an empty file).
+/// Any file type, zero bytes, phone -> PC (the any_file tests cover an empty file only PC -> phone).
 #[tokio::test(flavor = "multi_thread")]
 async fn adv020_a_zero_byte_file_goes_phone_to_pc() {
     let r = Rig::new().await;

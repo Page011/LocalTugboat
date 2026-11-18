@@ -1,6 +1,6 @@
-//! Opening the database and forward-only migrations. Owner: logic builder.
+//! Opening the database and forward-only migrations.
 //!
-//! Rules (PLAN "Schema changes and rollback"):
+//! Rules:
 //! 1. Schema version lives in `PRAGMA user_version`. `MIGRATIONS[i]` takes version i to i+1.
 //! 2. Opening a file whose user_version > SCHEMA_VERSION -> `CoreError::NewerDatabase`,
 //!    the file is not touched (no pragma writes, no WAL switch before the check).
@@ -178,7 +178,7 @@ mod tests {
     const V2: &str = "ALTER TABLE a ADD COLUMN y INTEGER DEFAULT 7;";
     const V2_BAD: &str = "ALTER TABLE a ADD COLUMN y INTEGER DEFAULT 7; ALTER TABLE nope ADD COLUMN z INTEGER;";
 
-    // L24: new db at SCHEMA_VERSION with defaults.
+    // New db at SCHEMA_VERSION with defaults.
     #[test]
     fn new_db_is_current_with_default_folders() {
         let dir = tempfile::tempdir().unwrap();
@@ -202,7 +202,7 @@ mod tests {
         assert_eq!(n, 3);
     }
 
-    // L24: a newer db is refused and the file is not touched.
+    // A newer db is refused and the file is not touched.
     #[test]
     fn newer_db_refused_and_untouched() {
         let dir = tempfile::tempdir().unwrap();
@@ -222,7 +222,7 @@ mod tests {
         assert!(!dir.path().join("tugboat.db-wal").exists());
     }
 
-    // L24: version 0 with tables is refused.
+    // Version 0 with tables is refused.
     #[test]
     fn version_zero_with_tables_refused() {
         let dir = tempfile::tempdir().unwrap();
@@ -234,7 +234,7 @@ mod tests {
         }
     }
 
-    // L24: upgrade writes .bak-<v> with the OLD content, then migrates step by step.
+    // Upgrade writes .bak-<v> with the OLD content, then migrates step by step.
     #[test]
     fn upgrade_writes_backup_then_migrates() {
         let dir = tempfile::tempdir().unwrap();
@@ -272,7 +272,7 @@ mod tests {
         assert_eq!(extra, 1);
     }
 
-    // L24: a failing step rolls back and the db stays at the last good version.
+    // A failing step rolls back and the db stays at the last good version.
     #[test]
     fn failing_step_rolls_back() {
         let dir = tempfile::tempdir().unwrap();

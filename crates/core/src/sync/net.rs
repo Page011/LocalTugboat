@@ -1,5 +1,5 @@
 //! Network driver: endpoint start/stop, the accept and connect loops, and the per-connection
-//! run loop that feeds `engine::Session` and runs the blob fetch queue. Owner: sync builder.
+//! run loop that feeds `engine::Session` and runs the blob fetch queue.
 //!
 //! One control stream per connection (opened by the phone). A reader task turns frames into
 //! channel messages (frame reads are not cancel safe), so the single control task can select
@@ -51,7 +51,7 @@ use crate::{
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 /// One dial attempt (cached addresses, then mDNS).
 const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
-/// Downloads running at once (design S9).
+/// Downloads running at once.
 const MAX_PARALLEL_FETCH: usize = 2;
 /// Longest wait between two tries of one download.
 const MAX_FETCH_BACKOFF: Duration = Duration::from_secs(60);
@@ -930,7 +930,7 @@ enum Space {
     Unknown(String),
 }
 
-/// The phone storage guard (R1, 0.2.0) for one `pick_downloads` pass: what it is allowed to look
+/// The phone storage guard (0.2.0) for one `pick_downloads` pass: what it is allowed to look
 /// at, and what it reports back.
 struct GuardPass {
     /// Only the phone has a guard; the PC picks without one.
@@ -1121,7 +1121,7 @@ fn pick_into(
 
 /// Start downloads for Pending items, oldest first, up to `MAX_PARALLEL_FETCH`.
 ///
-/// Phone storage guard (R1, 0.2.0): `Settings.storage_guard_bytes` is enforced here, on the phone
+/// Phone storage guard (0.2.0): `Settings.storage_guard_bytes` is enforced here, on the phone
 /// only. Nothing is downloaded while the free space is below the guard, and one item is skipped
 /// when `free - bytes still to come of the downloads running - this item's remaining bytes` would
 /// drop below the guard (a 3 GB video never eats the margin). A part file that already exists
@@ -1404,7 +1404,7 @@ mod tests {
         core.debug_conn(|c| pick_downloads(c, f, &core.inner.fetching, slots, T0, Instant::now(), &mut GuardPass::off(core)).unwrap())
     }
 
-    // Review finding 7: the oldest 500 Pending items all in back-off must not hide item 501.
+    // The oldest 500 Pending items all in back-off must not hide item 501.
     #[tokio::test]
     async fn pending_items_behind_a_block_of_backed_off_ones_are_picked() {
         let dir = tempfile::tempdir().unwrap();
@@ -1438,7 +1438,7 @@ mod tests {
         assert!(got.iter().all(|g| g.2), "Lost picks are marked so they are not asked in a loop");
     }
 
-    // Round 2, R13: a Lost item asked for earlier keeps its retry deadline. When it turns Pending
+    // A Lost item asked for earlier keeps its retry deadline. When it turns Pending
     // (restored from the Bin, new content) the deadline must not hold its download back.
     #[tokio::test]
     async fn a_pending_item_with_a_stale_lost_deadline_is_picked_at_once() {
@@ -1452,7 +1452,7 @@ mod tests {
         assert!(got.iter().all(|g| !g.2), "Pending picks are not marked Lost");
     }
 
-    // Round 2, R14: the task works on the hash the scheduler claimed. The pick hands out the claimed
+    // The task works on the hash the scheduler claimed. The pick hands out the claimed
     // hash; a record whose content changed (or that is no longer Pending/Lost) between the pick and
     // the load is dropped (the claim is freed, the item is picked again under its new hash), never
     // downloaded under the old claim.
@@ -1484,7 +1484,7 @@ mod tests {
         assert!(load_for_fetch(&core, id, fresh).unwrap().is_none(), "a present item is dropped");
     }
 
-    // Review finding 11: a hash still held by a download task (of an earlier session) is not
+    // A hash still held by a download task (of an earlier session) is not
     // picked again; when that task ends the hash is free and the scheduler is woken.
     #[tokio::test]
     async fn a_hash_held_by_a_running_download_is_skipped_until_it_ends() {
@@ -1504,7 +1504,7 @@ mod tests {
         assert!(got.iter().any(|g| g.0 == held_id), "now it is picked");
     }
 
-    // Review finding 11 (verifier): an error in the middle of a pick must not leave the hashes it
+    // An error in the middle of a pick must not leave the hashes it
     // already claimed held for good, with no task to free them.
     #[tokio::test]
     async fn an_error_mid_pick_frees_the_hashes_it_claimed() {
@@ -1566,9 +1566,8 @@ mod tests {
         core.debug_conn(|c| pick_downloads(c, f, &core.inner.fetching, slots, T0, Instant::now(), gp).unwrap())
     }
 
-    // Merge of PR 1 paging and the 0.2.0 guard: items the guard holds back are not walked past for
-    // ever. With the phone below its guard every row is held, so the scan of a state stops after one
-    // page (0.2.0's window) instead of reading the whole backlog on every scheduling pass. Nothing is
+    // Items the guard holds back are not walked past for ever. With the phone below its guard
+    // every row is held, so the scan of a state stops after one page instead of reading the whole backlog on every scheduling pass. Nothing is
     // picked, nothing is claimed, and the reason is reported (storage_low and the recheck use it).
     #[tokio::test]
     async fn guard_held_items_end_the_scan_after_one_page() {
@@ -1662,7 +1661,7 @@ mod tests {
         assert_eq!(got.iter().map(|g| g.0).collect::<Vec<_>>(), vec![items[1].0], "bytes already written no longer count");
     }
 
-    // Review finding 9: the unpair-notice task belongs to the network instance. Stopping the network
+    // The unpair-notice task belongs to the network instance. Stopping the network
     // ends it at once, so a restarted network can start its own (a task that outlived the stop kept
     // the shut-down node, and its running flag kept the new task from ever starting).
     #[tokio::test]
@@ -1695,7 +1694,7 @@ mod tests {
         assert!(!core.inner.notice_running.load(SeqCst), "stopping the network ended the task and freed the flag");
     }
 
-    // Review finding 6: only a fully acknowledged frame counts as delivered.
+    // Only a fully acknowledged frame counts as delivered.
     #[test]
     fn only_an_acknowledged_frame_is_delivered() {
         assert!(confirmed(StreamEnd::Acked).is_ok());

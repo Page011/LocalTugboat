@@ -23,7 +23,7 @@ bindgen = ["uniffi/cli", "uniffi/cargo-metadata"]
 [dependencies]
 tugboat-core = { path = "../core" }
 tugboat-net = { path = "../net" }
-# Proven by the M0 spike (spike/RESULTS.md). Pinned exactly: the generated Kotlin must match the .so.
+# Pinned exactly: the generated Kotlin must match the .so.
 uniffi = { version = "=0.32.2", default-features = false }
 tokio = { workspace = true }
 uuid = { workspace = true }

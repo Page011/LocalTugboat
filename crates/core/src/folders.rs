@@ -1,18 +1,18 @@
-//! Folder records and the default folders. Owner: logic builder.
+//! Folder records and the default folders.
 //!
 //! Rules:
 //! F1 Default folders have fixed ids (model::INBOX_ID, KEEP_ID, UNSORTED_ID) and GENESIS
 //!    versions, so both devices create identical records and never duplicate them:
 //!    Inbox (kind inbox, 24 h = 86_400 s), Keep (kind keep, Keep), Unsorted (kind unsorted, Keep).
 //! F2 Default folders cannot be deleted; their kind never changes. Inbox and Unsorted
-//!    retention can be changed (M4 UI); renaming is allowed (names are display only).
-//! F3 A folder created in Explorer starts as Keep (PLAN). A folder created in the app takes
+//!    retention can be changed; renaming is allowed (names are display only).
+//! F3 A folder created in Explorer starts as Keep. A folder created in the app takes
 //!    the retention the user chose (default Keep).
 //! F4 Folder names: `names::clean_folder_name`; two folders may share a name (disk names
-//!    get " (2)", PLAN Storage), so uniqueness is not enforced in the record.
+//!    get " (2)"), so uniqueness is not enforced in the record.
 //! F5 Deleting a folder: deleted = Some(now) on the folder, and each item in it that is not
-//!    already in the Bin is deleted in the same transaction (PLAN: "deleted subfolder = its
-//!    items to the Bin"). Items moved into it later by the other device are treated as
+//!    already in the Bin is deleted in the same transaction (a deleted subfolder sends its
+//!    items to the Bin). Items moved into it later by the other device are treated as
 //!    Unsorted (expiry E2) until moved.
 
 use std::collections::HashMap;
@@ -115,7 +115,7 @@ pub fn folder_views(c: &Connection, now: i64, hide_refused: bool) -> Result<Vec<
 }
 
 /// Number of items that `set_retention(folder, new)` would move to the Bin at `now`
-/// (M4 confirmation "This moves 132 items to the Bin").
+/// (the confirmation reads "This moves 132 items to the Bin").
 pub fn retention_preview(c: &Connection, folder: FolderId, new: Retention, now: i64) -> Result<u32> {
     let map: HashMap<FolderId, FolderRecord> = store::all_folders(c)?.into_iter().map(|f| (f.id, f)).collect();
     let Some(current) = map.get(&folder).cloned() else { return Ok(0) };
@@ -146,7 +146,7 @@ mod tests {
     use crate::placement::AppStorage;
     use crate::store::test_support::*;
 
-    // L21: default folders identical on two fresh dbs; idempotent.
+    // Default folders identical on two fresh dbs; idempotent.
     #[test]
     fn defaults_identical_on_two_fresh_dbs_and_idempotent() {
         let a = Db::open_in_memory().unwrap();
@@ -187,7 +187,7 @@ mod tests {
         assert_eq!(effective_folder(&db.conn, id).unwrap().id, UNSORTED_ID);
     }
 
-    // L21: views: order, counts exclude Bin items, items of a deleted folder show under Unsorted.
+    // Views: order, counts exclude Bin items, items of a deleted folder show under Unsorted.
     #[test]
     fn views_order_and_counts() {
         let mut db = db_with_peer(p(), f());
@@ -224,7 +224,7 @@ mod tests {
         assert_eq!(views.iter().find(|v| v.id == UNSORTED_ID).unwrap().count, 1);
     }
 
-    // L21: preview counts what a retention change would bin; the change itself re-derives all items.
+    // Preview counts what a retention change would bin; the change itself re-derives all items.
     #[test]
     fn retention_preview_and_change_rederive_all_items() {
         let mut db = db_with_peer(p(), f());

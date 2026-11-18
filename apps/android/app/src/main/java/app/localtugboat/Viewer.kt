@@ -89,6 +89,7 @@ fun ViewerScreen(vm: SnapViewModel, ui: UiState, route: Route.Viewer) {
     val folders by vm.folders.collectAsStateWithLifecycle()
     val nowMs by rememberNow(30_000)
     val binDays = ui.settings?.binDays ?: 7u
+    val storageLow = ui.status?.storageLow == true
     ReloadOnEvents(vm, model, ::itemsRelevant)
     var zoomed by remember { mutableStateOf(false) }
     var moving by rememberSaveable { mutableStateOf(false) }
@@ -142,10 +143,10 @@ fun ViewerScreen(vm: SnapViewModel, ui: UiState, route: Route.Viewer) {
         }
         HorizontalPager(pager, Modifier.weight(1f).fillMaxWidth(), userScrollEnabled = !zoomed, key = { model.rows.getOrNull(it)?.id ?: it }) { page ->
             val row = model.rows.getOrNull(page)
-            if (row != null) ViewerPage(row, active = page == pager.currentPage, bin = route.bin, onOpen = { openFile(row) }) { z -> if (page == pager.currentPage) zoomed = z }
+            if (row != null) ViewerPage(row, active = page == pager.currentPage, bin = route.bin, storageLow = storageLow, onOpen = { openFile(row) }) { z -> if (page == pager.currentPage) zoomed = z }
         }
         Column(Modifier.fillMaxWidth().navigationBarsPadding().padding(bottom = 4.dp)) {
-            val cell = UiLogic.cell(item, nowMs, binDays, route.bin)
+            val cell = UiLogic.cell(item, nowMs, binDays, route.bin, storageLow)
             val folder = folders.firstOrNull { it.id == item.folderId }?.name
             Text(
                 listOfNotNull(UiLogic.capturedAt(item.capturedAtMs, ZoneId.systemDefault()), folder, if (item.kind == MediaKind.FILE) null else FileRules.sizeText(item.size.toLong()), cell.label).joinToString("  -  "),
@@ -196,8 +197,8 @@ private fun RowScope.ViewerAction(icon: Int, label: String, enabled: Boolean, on
 }
 
 @Composable
-private fun ViewerPage(item: ItemInfo, active: Boolean, bin: Boolean, onOpen: () -> Unit, onZoomed: (Boolean) -> Unit) {
-    val note = UiLogic.fileNote(item.local, bin)
+private fun ViewerPage(item: ItemInfo, active: Boolean, bin: Boolean, storageLow: Boolean, onOpen: () -> Unit, onZoomed: (Boolean) -> Unit) {
+    val note = UiLogic.fileNote(item.local, bin, storageLow)
     val path = item.path
     when {
         item.kind == MediaKind.FILE -> FilePage(item, note ?: if (path == null) "FILE MISSING on this phone" else null, bin, onOpen)
@@ -313,7 +314,7 @@ private fun ZoomableImage(bitmap: ImageBitmap, desc: String, onZoomed: (Boolean)
 /**
  * Decoder fallback on: if a phone's first-choice decoder cannot be set up, the next one is tried (often the software decoder).
  * Debug builds also skip the Android emulator's own "goldfish" decoders: on the emulator image used for QA they fail for any
- * third-party app (SELinux denies the codec service the app's shared-memory queue, see notes/plans/0.2.0-android-notes.md),
+ * third-party app (SELinux denies the codec service the app's shared-memory queue),
  * so without this no recorded video could be played there. Release builds never touch the decoder list.
  */
 @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)

@@ -3,7 +3,7 @@
 //!
 //! Rules:
 //! - A declared length over `MAX_FRAME` is refused with `FrameTooLarge` before reading
-//!   the body (a paired peer is still untrusted input, PLAN Security).
+//!   the body (a paired peer is still untrusted input).
 //! - A length of 0 is a protocol error (every message is a JSON object).
 //! - Clean end of stream before a length prefix -> `Ok(None)`; end of stream inside a
 //!   frame -> `Stream` error.

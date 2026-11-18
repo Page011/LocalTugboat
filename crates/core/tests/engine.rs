@@ -1,5 +1,5 @@
 //! Protocol-level tests: two `Session`s pumped against each other over in-memory message queues
-//! and real SQLite files, no network. Fast and deterministic. Design ids S19, S20 plus the
+//! and real SQLite files, no network. Fast and deterministic. Scenarios S19, S20 plus the
 //! sync rules in engine.rs (cursor, snapshot restart, digest comparability, bad records).
 
 use std::collections::VecDeque;

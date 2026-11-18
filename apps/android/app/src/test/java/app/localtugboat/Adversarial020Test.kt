@@ -4,9 +4,9 @@ import org.junit.Assert.assertEquals
 import org.junit.Test
 
 /**
- * Adversarial tests, verifier stage 020 (correctness and data-safety lens). A failing test here is a finding.
+ * Tests that try to break the 0.2.0 file handling (correctness and data safety).
  *
- * R1: "every other file shows as a file tile" and keeps its own type. The share importer sniffs EVERY shared file
+ * Every other file shows as a file tile and keeps its own type. The share importer sniffs EVERY shared file
  * and, when the first bytes look like an ISO-BMFF video, renames it to the video extension. Audio in an MP4/3GP
  * container (Android voice recorder .m4a / .3ga, AAC .m4a written with the common "mp42" / "isom" brands) is then
  * saved and synced under a different name and type than the user shared.

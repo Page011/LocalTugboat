@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 // Mark.svelte carries the logo's path data inline. It must stay an exact copy of assets/brand/tugboat-logo.svg:
-// the leftmost porthole is cut open by the hull's bottom edge ON PURPOSE (owner's signature detail), so any
+// the leftmost porthole is cut open by the hull's bottom edge ON PURPOSE (a signature detail of the design), so any
 // "tidied" or re-traced geometry fails here.
 const brand = join(import.meta.dir, "../../../../assets/brand");
 const norm = (d: string) => d.replace(/\s+/g, " ").trim();

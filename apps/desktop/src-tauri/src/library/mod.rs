@@ -42,13 +42,13 @@ pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 #[derive(Debug, Clone)]
 pub struct LibraryOptions {
-    /// A new file counts after its size has been stable this long (PLAN: 2 seconds).
+    /// A new file counts after its size has been stable this long (2 seconds by default).
     pub stable_for: Duration,
     /// Quiet time after the last watcher event before a pass runs.
     pub debounce: Duration,
     /// Longest a stream of events may hold a pass back.
     pub max_debounce: Duration,
-    /// Full rescan interval (PLAN: 10 minutes).
+    /// Full rescan interval (10 minutes by default).
     pub rescan_every: Duration,
 }
 

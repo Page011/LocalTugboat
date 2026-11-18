@@ -5,9 +5,8 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * Verifier-stage findings written as tests. They read the sources and the manifest because the
- * paths involved (camera hand-off, deep-link guard, library manifests) need an Android runtime to
- * run; each would pass once the finding is fixed.
+ * Checks that read the sources and the manifest, because the paths involved (camera hand-off,
+ * deep-link guard, library manifests) need an Android runtime to run.
  */
 class AdversarialTest {
     private val main: File = listOf(File("src/main"), File("app/src/main")).first { it.isDirectory }
@@ -42,7 +41,7 @@ class AdversarialTest {
     }
 
     /**
-     * PLAN.md security: "no telemetry, no outbound internet traffic". ML Kit barcode-scanning 17.3.0 pulls in
+     * Security rule: no telemetry and no outbound internet traffic. ML Kit barcode-scanning 17.3.0 pulls in
      * com.google.android.datatransport (CCT backend), which ML Kit's own data-disclosure page says sends
      * diagnostics and usage analytics to Google over HTTPS. Nothing in our manifest removes it.
      */

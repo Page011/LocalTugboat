@@ -6,9 +6,8 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * Adversarial security tests for 0.2.0 on the phone (verifier stage, security lens): the any-type share target
- * against hostile content URIs, the FileProvider's reach, and the names other apps are shown.
- * A FAILING test here is a finding, not a broken test.
+ * Security tests for the 0.2.0 phone code: the any-type share target against hostile content URIs, the
+ * FileProvider's reach, and the names other apps are shown.
  */
 class Adversarial020SecurityTest {
     private val main: File = listOf(File("src/main"), File("app/src/main")).first { it.isDirectory }

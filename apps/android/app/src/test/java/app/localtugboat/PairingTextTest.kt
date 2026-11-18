@@ -7,7 +7,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class PairingTextTest {
-    private val good = "localtugboat://pair?v=1&k=" + "ab".repeat(32) + "&a=192.168.1.5:47300&s=" + "cd".repeat(16) + "&e=1795000000000&n=NIGEL-PC"
+    private val good = "localtugboat://pair?v=1&k=" + "ab".repeat(32) + "&a=192.168.1.5:47300&s=" + "cd".repeat(16) + "&e=1795000000000&n=OFFICE-PC"
 
     @Test fun accepts_a_payload_and_trims_it() {
         assertEquals(good, PairingText.candidate(good))

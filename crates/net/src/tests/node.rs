@@ -170,7 +170,7 @@ async fn n23_stream_kinds_are_routed_and_unknown_ones_close_the_connection() {
     assert!(!l.a_conn.is_open());
 }
 
-/// N24: an id nobody knows, no address, mDNS off: a clear error, quickly (spike port).
+/// N24: an id nobody knows, no address, mDNS off: a clear error, quickly.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn n24_dial_unknown_id_fails_clearly_and_bounded() {
     let n = start(Role::Phone).await;
@@ -241,8 +241,8 @@ async fn node_on_loopback_reports_its_own_address() {
 
 /// A peer that vanishes WITHOUT closing (laptop lid shut, Wi-Fi gone, phone frozen by the OS)
 /// sends no CONNECTION_CLOSE, so only the keep-alive / idle timeout can end the connection.
-/// PLAN silent failure "Sync stopped": the survivor must see the connection end instead of a
-/// frozen "Synced". Measured: 35 s, not the 30 s the design note claimed. quinn restarts the
+/// A stopped sync must be visible: the survivor must see the connection end instead of a
+/// frozen "Synced". Measured: 35 s, not the 30 s first assumed. quinn restarts the
 /// idle timer when the first keep-alive goes out after a received packet, so the bound is
 /// keep-alive (10 s) + idle (30 s) = 40 s worst case, 30 s best case.
 ///

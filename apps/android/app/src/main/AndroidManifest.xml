@@ -94,7 +94,7 @@
             </intent-filter>
         </receiver>
 
-        <!-- PLAN: no telemetry, no outbound internet traffic. ML Kit barcode scanning pulls in the
+        <!-- No telemetry and no outbound internet traffic. ML Kit barcode scanning pulls in the
              datatransport library, whose "cct" backend uploads usage analytics to Google. Without
              the backend the library has nowhere to send, and its scheduler pieces have nothing to run. -->
         <service

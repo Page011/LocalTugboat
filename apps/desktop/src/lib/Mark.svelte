@@ -1,7 +1,7 @@
 <script lang="ts">
   // The Tugboat logo: assets/brand/tugboat-logo.svg, path data copied exactly (904 x 362 source px), in one
   // CSS-variable colour so it follows the theme (--mark-fg, default --logo-ink: navy on light, white on dark).
-  // The leftmost porthole is cut open by the hull's bottom edge ON PURPOSE (the owner's signature detail): never change it.
+  // The leftmost porthole is cut open by the hull's bottom edge ON PURPOSE (a signature detail of the design): never change it.
   // Decorative: the words next to it carry the meaning. `width` is in px; the height follows the artwork.
   let { width = 120 }: { width?: number } = $props();
 </script>

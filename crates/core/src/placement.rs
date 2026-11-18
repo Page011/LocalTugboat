@@ -1,4 +1,4 @@
-//! Where held files live on this device. Owner: logic builder.
+//! Where held files live on this device.
 //!
 //! Two real implementations:
 //!
@@ -11,7 +11,7 @@
 //! <root>/parts/<hash hex>.part   in-progress downloads (same volume as items/)
 //! ```
 //!
-//! `PcLibrary` (apps/desktop/src-tauri, M2): the real library folder. Disk names come from
+//! `PcLibrary` (apps/desktop/src-tauri): the real library folder. Disk names come from
 //! names::disk_file_name / clean_folder_name + names::disambiguate.
 //!
 //! ```text
@@ -253,7 +253,7 @@ mod tests {
         assert!(std::fs::read_dir(s.root.join("parts")).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().ends_with(".adopt")));
     }
 
-    // L27: commit / adopt / to_bin / from_bin / purge, purge idempotent, adopt leaves source,
+    // Commit / adopt / to_bin / from_bin / purge, purge idempotent, adopt leaves source,
     // part in the same dir tree.
     #[test]
     fn full_lifecycle() {

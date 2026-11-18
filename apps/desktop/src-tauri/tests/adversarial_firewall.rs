@@ -1,4 +1,5 @@
-//! Adversarial tests for the firewall verdict (verifier stage). A failing test is a finding.
+//! Adversarial tests for the firewall verdict: odd rule and profile combinations that must not be
+//! reported as allowed when Windows would block the app.
 
 use std::path::Path;
 

@@ -1,7 +1,7 @@
-//! Adversarial security tests for 0.2.0 (verifier stage, security lens). Each test tries to break one
-//! rule of R1 (any file type, always-refused names) from the side of a hostile name: Windows spelling
+//! Adversarial security tests for 0.2.0. Each test tries to break the rule for any file type and
+//! always-refused names from the side of a hostile name: Windows spelling
 //! tricks, NTFS stream syntax, a hostile peer's record name, a folder name Explorer treats as a shell
-//! junction. A FAILING test here is a finding, not a broken test. Everything binds 127.0.0.1.
+//! junction. A FAILING test here means a hole is open. Everything binds 127.0.0.1.
 
 mod common;
 

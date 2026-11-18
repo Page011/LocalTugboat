@@ -1,6 +1,6 @@
 //! tugboat-net: the only crate that uses iroh.
 //!
-//! What lives here (contract in notes/core-design.md, sections "Net" and "Wire"):
+//! What lives here:
 //! - `node`: the LAN-only iroh endpoint (relays off, address lookup cleared, portmapper not
 //!   compiled, mDNS from `iroh-mdns-address-lookup`, fixed UDP port, configurable bind),
 //!   ALPN gating through endpoint hooks, dialing (cached addresses first, then mDNS).

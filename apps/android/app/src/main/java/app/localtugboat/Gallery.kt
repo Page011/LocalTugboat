@@ -126,7 +126,7 @@ fun GalleryScreen(vm: SnapViewModel, ui: UiState, banners: List<UiLogic.BannerUi
                     horizontalArrangement = Arrangement.spacedBy(4.dp), verticalArrangement = Arrangement.spacedBy(4.dp),
                 ) {
                     itemsIndexed(model.rows, key = { _, it -> it.id }) { _, item ->
-                        ItemCell(item, UiLogic.cell(item, nowMs, binDays, false)) { vm.nav.go(Route.Viewer(route.folderId, false, item.id)) }
+                        ItemCell(item, UiLogic.cell(item, nowMs, binDays, false, ui.status?.storageLow == true)) { vm.nav.go(Route.Viewer(route.folderId, false, item.id)) }
                     }
                 }
             }
@@ -200,7 +200,7 @@ fun BinScreen(vm: SnapViewModel, ui: UiState) {
                 val bottom = with(LocalDensity.current) { WindowInsets.navigationBars.getBottom(this).toDp() }
                 LazyColumn(state = listState, contentPadding = PaddingValues(bottom = bottom)) {
                     items(model.rows, key = { it.id }) { item ->
-                        val cell = UiLogic.cell(item, nowMs, binDays, true)
+                        val cell = UiLogic.cell(item, nowMs, binDays, true, ui.status?.storageLow == true)
                         Row(
                             Modifier.fillMaxWidth().defaultMinSize(minHeight = 72.dp).clickable(role = Role.Button) { vm.nav.go(Route.Viewer(null, true, item.id)) }.padding(horizontal = 16.dp, vertical = 6.dp),
                             verticalAlignment = Alignment.CenterVertically,

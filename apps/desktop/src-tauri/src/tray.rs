@@ -1,8 +1,8 @@
 //! The tray icon: the Tugboat tile in three states (synced, waiting, offline), told apart by SHAPE
 //! (plain tile, a dot top right, a slash across a grey tile) so colour is never the only signal.
 //!
-//! The icons are the owner's artwork on the sea tile, the same as the app icon (owner 2026-11-18: "use the artwork
-//! on tile"): assets/brand/ico/tray-<state>.ico, each holding six PNG entries drawn from the vector at 16, 20, 24, 32,
+//! The icons are the boat artwork on the sea tile, the same as the app icon:
+//! assets/brand/ico/tray-<state>.ico, each holding six PNG entries drawn from the vector at 16, 20, 24, 32,
 //! 40 and 48 px. Windows draws the tray at 16 px x the display scale, so the entry is picked to match (a resampled
 //! image is blurry). The tile reads on light and dark taskbars alike, so there is one set.
 

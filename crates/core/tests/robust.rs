@@ -1,6 +1,6 @@
-//! M1 robustness scenarios over loopback: tombstones against a restored backup, new-peer full
+//! Robustness scenarios over loopback: tombstones against a restored backup, new-peer full
 //! snapshot, reconcile catching a dropped change, resumable transfers, corrupt and non-media
-//! files. Design test ids S7-S10, S16, S17.
+//! files. Scenarios S7-S10, S16, S17.
 
 mod common;
 

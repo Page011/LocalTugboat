@@ -2,7 +2,7 @@
 //! control time exactly (expiry, Bin days, pairing window, activity trim) without sleeping.
 //! Time unit everywhere in core: unix epoch milliseconds, i64.
 //!
-//! Implemented now (tiny, and every builder's tests need it from day one).
+//! Small on purpose: every module's tests need it.
 
 use std::sync::{
     atomic::{AtomicI64, Ordering},

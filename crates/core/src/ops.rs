@@ -1,4 +1,4 @@
-//! Local user/system actions as database writes. Owner: logic builder.
+//! Local user/system actions as database writes.
 //!
 //! Every op: one IMMEDIATE transaction; each written field group gets
 //! `store::next_version(self)` and one change_log row (`store::log_change`); one activity
@@ -6,7 +6,7 @@
 //! failure is returned (the record change stands; the next `bin::sweep` / relocate retry
 //! fixes the file). Ops never emit events; the facade does.
 //!
-//! Rules per op (PLAN Folders and expiry):
+//! Rules per op:
 //! O1 add_local_file: an always-refused name -> Refused before anything is read; the head is
 //!    classified (names::classify): a photo/video extension must match its bytes (else NotMedia,
 //!    a renamed program never poses as a photo), any other safe extension or none is a plain File
@@ -20,8 +20,8 @@
 //!    never a record without a file, never an orphan file.
 //! O2 set_pinned(true/false): pinned group. Activity Kept / Unkept. Not allowed on an item in
 //!    the Bin (restore first) -> Invalid.
-//! O3 move_item: placement group = (folder, entered_at = now) (PLAN: "Moving an item to
-//!    another folder resets folder_entered_at to now"). Target folder must exist and not be
+//! O3 move_item: placement group = (folder, entered_at = now) (moving an item to
+//!    another folder resets folder_entered_at to now). Target folder must exist and not be
 //!    deleted -> else Invalid. Same folder -> no-op. Activity Moved "from -> to". An item in
 //!    the Bin must be restored first -> Invalid.
 //! O4 rename_item: name group; name cleaned with names::clean_stem rules for the stem
@@ -30,8 +30,8 @@
 //!    result that is an always-refused name (stem "desktop" + ext "ini") -> Refused; Activity Renamed.
 //! O5 delete_item: deleted = Some(now); if pinned, also pinned = false in the same op
 //!    (a user delete is the later intent). Activity Deleted. An item already in the Bin is a no-op.
-//! O6 restore_item (PLAN: "Restoring from the Bin puts the item back with a fresh full
-//!    retention"): Deleted -> deleted = None AND placement entered_at = now (same folder;
+//! O6 restore_item (restoring from the Bin puts the item back with a fresh full
+//!    retention): Deleted -> deleted = None AND placement entered_at = now (same folder;
 //!    unknown/deleted folder -> Unsorted). Expired -> placement entered_at = now.
 //!    Local Purged -> Pending ("If only the other device still has the file, it is fetched
 //!    from there"). Not in the Bin -> Invalid. Activity Restored.
@@ -84,7 +84,7 @@ pub struct NewLocalFile {
     pub folder: Option<FolderId>,
     pub captured_at: i64,
     pub geo: Option<Geo>,
-    /// Thumbnail file made by the creating device (PLAN: thumbnails are made by the device
+    /// Thumbnail file made by the creating device (thumbnails are made by the device
     /// that created the item; JPEG, longest side 512 px). The facade hashes it, copies it to
     /// <data_dir>/thumbs/<hash hex>.jpg and passes the resulting `Thumb` to `add_local_file`.
     pub thumb: Option<PathBuf>,
@@ -829,7 +829,7 @@ mod tests {
         (e.to_string(), g.to_string())
     }
 
-    // L19: add_local_file happy path.
+    // Add_local_file happy path.
     #[test]
     fn add_local_file_records_everything() {
         let mut r = Rig::new();
@@ -861,7 +861,7 @@ mod tests {
         assert_eq!(groups(&r.db.conn, "receipt").len(), 1, "no second receipt for the same hash");
     }
 
-    // L19: an exe renamed .jpg -> NotMedia, nothing stored anywhere. An exe under its own name is
+    // An exe renamed .jpg -> NotMedia, nothing stored anywhere. An exe under its own name is
     // simply a file now (any file type syncs) and never gets a photo kind.
     #[test]
     fn add_refuses_a_program_posing_as_a_photo_and_leaves_no_trace() {
@@ -927,7 +927,7 @@ mod tests {
         assert_eq!(files, 1, "the second file was removed again");
     }
 
-    // L28: one change_log row per written group.
+    // One change_log row per written group.
     #[test]
     fn each_op_logs_one_row_per_written_group() {
         let mut r = Rig::new();
@@ -953,7 +953,7 @@ mod tests {
         assert_eq!(*lamports.last().unwrap() as u64, store::max_lamport(&r.db.conn).unwrap());
     }
 
-    // L17: move resets entered_at; deleted/unknown target -> Invalid; same folder no-op.
+    // Move resets entered_at; deleted/unknown target -> Invalid; same folder no-op.
     #[test]
     fn move_item_rules() {
         let mut r = Rig::new();
@@ -1053,7 +1053,7 @@ mod tests {
         assert_eq!(flaky.calls.load(SeqCst), calls + 1, "rename retry relocated");
     }
 
-    // L18: delete of a pinned item writes pinned = false + deleted in one op.
+    // Delete of a pinned item writes pinned = false + deleted in one op.
     #[test]
     fn delete_pinned_item_clears_the_pin_in_the_same_op() {
         let mut r = Rig::new();
@@ -1104,7 +1104,7 @@ mod tests {
         assert_eq!(r.rec(id).name.val, "Other.jpg");
     }
 
-    // L20: a PC edit gets a new hash. Expiry does not wait for any receipt (0.2.0): the edit keeps
+    // A PC edit gets a new hash. Expiry does not wait for any receipt (0.2.0): the edit keeps
     // the item's due time, and the new hash simply has no receipt from the peer yet.
     #[test]
     fn content_change_does_not_hold_the_expiry() {
@@ -1283,7 +1283,7 @@ mod tests {
         assert_eq!(too_large_text(500 * 1024 * 1024), "TOO LARGE - over 500 MB");
     }
 
-    // L21: deleting a folder bins its items (files follow), refuses default folders.
+    // Deleting a folder bins its items (files follow), refuses default folders.
     #[test]
     fn folder_ops_and_deletion_bins_items() {
         let mut r = Rig::new();

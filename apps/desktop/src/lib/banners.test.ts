@@ -34,7 +34,7 @@ describe("computeBanners", () => {
     expect(b[0]).toMatchObject({ text: "LIBRARY FOLDER NOT FOUND", detail: "D:\\Local Tugboat" });
     expect(b[0]?.actions.map((a) => a.id)).toEqual(["lib-locate", "lib-rescan"]);
   });
-  test("bulk missing offers exactly the two plan buttons", () => {
+  test("bulk missing offers exactly the two choice buttons", () => {
     const b = computeBanners({ ...base, library: lib({ health: { t: "bulk_missing", missing: 142, total: 900 } }) });
     expect(b[0]?.text).toBe("142 of 900 files MISSING - sync paused");
     // The core message repeats the buttons; the banner never shows it.

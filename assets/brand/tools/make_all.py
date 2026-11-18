@@ -45,7 +45,7 @@ mark_body = paths_svg(g, xf_mark)
 write(B + r"\tugboat-mark-square.svg", svg_doc(1024, 1024, mark_body, width=1024, height=1024, title="Tugboat"))
 # solid-background tile (Play Store 512, full bleed) and a rounded Windows tile
 write(B + r"\tugboat-play-512.svg", svg_doc(1024, 1024, f'<rect width="1024" height="1024" fill="{SEA}"/>\n<g fill="{WHITE}">\n{mark_body}</g>\n', fill=WHITE, width=512, height=512))
-# Windows app-icon tile (owner 2026-11-18: "use the good quality one i designed", and the tray too): his artwork on
+# Windows app-icon tile (also used for the tray): the full artwork on
 # the sea tile, boat 900 wide (88 %) so it still reads at the 16-32 px taskbar and tray sizes. It stays clear of the
 # rounded corners (boat 360 high, centred: y 332-692; the corners only bend above y 224 and below y 800).
 TILE_W = 900.0

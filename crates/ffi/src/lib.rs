@@ -835,9 +835,9 @@ mod tests {
         // A well-formed code naming a public address is refused: the phone never dials it.
         let public = format!("localtugboat://pair?v=1&k={}&a=8.8.8.8:47300&s={}&e=1&n=PC", "ab".repeat(32), "cd".repeat(16));
         assert!(matches!(inspect_pairing_payload(public), Err(SnapError::PairBadPayload(_))));
-        let ok = format!("localtugboat://pair?v=1&k={}&a=192.168.1.5:47300,10.0.0.2:47300&s={}&e=1790000000000&n=NIGEL%2DPC", "ab".repeat(32), "cd".repeat(16));
+        let ok = format!("localtugboat://pair?v=1&k={}&a=192.168.1.5:47300,10.0.0.2:47300&s={}&e=1790000000000&n=OFFICE%2DPC", "ab".repeat(32), "cd".repeat(16));
         let p = inspect_pairing_payload(ok).unwrap();
-        assert_eq!(p.pc_name, "NIGEL-PC");
+        assert_eq!(p.pc_name, "OFFICE-PC");
         assert_eq!(p.addresses, vec!["192.168.1.5:47300", "10.0.0.2:47300"]);
         assert_eq!(p.expires_at_ms, 1_790_000_000_000);
     }

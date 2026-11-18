@@ -1,8 +1,8 @@
-//! Adversarial security tests for 0.2.0 on the PC (verifier stage, security lens). They try to break:
+//! Adversarial security tests for 0.2.0 on the PC. They try to break:
 //! the always-refused names against what NTFS and Win32 really do with a name (case, trailing dots and
 //! spaces, stream syntax, Unicode lookalikes); the Mark-of-the-Web on received files when the other
 //! device later renames or moves them; and the drag-drop copy against device paths and NTFS stream
-//! paths that a hostile drag source could put in a drop. A FAILING test here is a finding.
+//! paths that a hostile drag source could put in a drop. A failing test means one of those rules does not hold.
 
 use std::{
     path::{Path, PathBuf},
@@ -189,7 +189,7 @@ impl Rig {
         self.core.items(&ItemQuery { limit: 500, ..Default::default() }).unwrap().rows
     }
 
-    /// Run a drop on its own thread; a drop that never returns (a device that blocks a read) is a finding.
+    /// Run a drop on its own thread; a drop that never returns (a device that blocks a read) is a failure.
     fn drop_paths(&self, paths: Vec<PathBuf>) -> DropReport {
         let lib = self.lib.clone();
         let t = self.inbox();

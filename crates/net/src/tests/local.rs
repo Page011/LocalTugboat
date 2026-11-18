@@ -8,7 +8,7 @@ use n0_future::StreamExt;
 
 use crate::local::*;
 
-/// N1: the spike's 24 addresses plus the shapes the design adds.
+/// N1: common local and public address shapes, including IPv4-mapped IPv6.
 #[test]
 fn n1_local_address_filter() {
     for ok in [

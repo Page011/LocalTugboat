@@ -1,6 +1,6 @@
-//! Adversarial tests, verifier stage 020 (correctness and data-safety lens) for the 0.2.0 PC
-//! library: any file type, Explorer renames, Mark-of-the-Web placement and drag-and-drop copies.
-//! A failing test here is a finding, not a broken test.
+//! Adversarial tests for the 0.2.0 PC library: any file type, Explorer renames, Mark-of-the-Web
+//! placement and drag-and-drop copies. Each one tries to break a rule of the library; a failing
+//! test means the rule does not hold.
 
 use std::{
     path::PathBuf,
@@ -81,7 +81,7 @@ impl Rig {
     }
 }
 
-/// PLAN "rename = rename". A plain file with no extension by the `ext_of` rule ("Dr. Smith letter":
+/// A rename in Explorer is a rename. A plain file with no extension by the `ext_of` rule ("Dr. Smith letter":
 /// the text after the last dot has a space) is renamed in Explorer to "Dr. Smith letter 2". The
 /// record must take the new name and the file must stay where the user put it. `moved()` builds
 /// the new name with Rust's `file_stem` ("Dr") instead of the `ext_of` rule, so the record becomes

@@ -24,10 +24,10 @@ class UiLogicTest {
     private fun perms(camera: Boolean = true, mic: Boolean = false, loc: LocationAccess = LocationAccess.NONE, notif: Boolean = true, net: Boolean = true) =
         PermState(camera, mic, loc, notif, net, batteryExempt = false)
 
-    private fun pc() = PairedPc("a".repeat(64), "NIGEL-PC", 1L, 2L, listOf("192.168.1.5:47300"))
+    private fun pc() = PairedPc("a".repeat(64), "OFFICE-PC", 1L, 2L, listOf("192.168.1.5:47300"))
 
     private fun status(state: SyncState, waiting: UInt = 0u, message: String? = null, downloading: UInt = 0u, storageLow: Boolean = false) =
-        SyncStatus(state, "NIGEL-PC", null, waiting, downloading, storageLow, message)
+        SyncStatus(state, "OFFICE-PC", null, waiting, downloading, storageLow, message)
 
     private fun item(
         state: ItemStateInfo = ItemStateInfo.Live(1_000_000L + 5 * hour), local: LocalFileState = LocalFileState.PRESENT,
@@ -272,6 +272,18 @@ class UiLogicTest {
         assertNull(UiLogic.fileNote(LocalFileState.BINNED, true))
     }
 
+    @Test fun a_pending_file_waits_for_space_while_the_storage_guard_holds_downloads() {
+        val now = 1_000_000L
+        val pending = item(local = LocalFileState.PENDING)
+        assertEquals("Downloading from PC", UiLogic.cell(pending, now, 7u, false).label)
+        assertEquals("Downloading from PC", UiLogic.cell(pending, now, 7u, false, storageLow = false).label)
+        assertEquals("Waiting - phone storage low", UiLogic.cell(pending, now, 7u, false, storageLow = true).label)
+        assertEquals("Waiting - phone storage low", UiLogic.fileNote(LocalFileState.PENDING, false, storageLow = true))
+        // Only the pending note changes: other file problems and held files read the same either way.
+        assertEquals("FILE MISSING on this phone", UiLogic.fileNote(LocalFileState.LOST, false, storageLow = true))
+        assertNull(UiLogic.fileNote(LocalFileState.PRESENT, false, storageLow = true))
+    }
+
     @Test fun cell_label_badges_and_waiting() {
         val now = 1_000_000L
         val live = UiLogic.cell(item(), now, 7u, false)
@@ -412,14 +424,14 @@ class UiLogicTest {
         assertEquals(listOf(1u, 3u, 7u, 10u, 14u, 30u), UiLogic.binChoices(10u))
     }
 
-    // ---- R3: a deleted folder is never handed to the core by a cached target ----
+    // ---- a deleted folder is never handed to the core by a cached target ----
 
     @Test fun a_cached_target_whose_folder_was_deleted_is_not_used() {
         assertNull(UiLogic.shotFolder(null, ids, "gone", null)) // automatic, target cached for automatic, folder deleted since
         assertNull(UiLogic.shotFolder("gone", ids, "gone", "gone")) // deleted pick, target cached for that pick, also deleted
     }
 
-    // ---- R4: the full-size photo is decoded again when the held file's content changes ----
+    // ---- the full-size photo is decoded again when the held file's content changes ----
 
     @Test fun the_photo_decode_key_follows_path_size_and_thumbnail() {
         val base = UiLogic.photoDecodeKey("items/a.jpg", 100uL, "thumbs/h1.jpg")

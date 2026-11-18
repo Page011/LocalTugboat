@@ -13,7 +13,7 @@ class TextsTest {
     private val hour = 60 * min
     private val day = 24 * hour
 
-    private fun status(state: SyncState, peer: String? = "NIGEL-PC", last: Long? = null, waiting: UInt = 0u, message: String? = null) =
+    private fun status(state: SyncState, peer: String? = "OFFICE-PC", last: Long? = null, waiting: UInt = 0u, message: String? = null) =
         SyncStatus(state, peer, last, waiting, 0u, false, message)
 
     @Test fun duration_rounds_down_and_switches_unit() {
@@ -52,8 +52,8 @@ class TextsTest {
 
     @Test fun notification_text() {
         val now = 10 * hour
-        assertEquals("Connected to NIGEL-PC, synced 10s ago", Texts.notification(status(SyncState.SYNCED, last = now - 10_000), now))
-        assertEquals("Connected to NIGEL-PC", Texts.notification(status(SyncState.SYNCED), now))
+        assertEquals("Connected to OFFICE-PC, synced 10s ago", Texts.notification(status(SyncState.SYNCED, last = now - 10_000), now))
+        assertEquals("Connected to OFFICE-PC", Texts.notification(status(SyncState.SYNCED), now))
         assertEquals("PC not found, 3 waiting", Texts.notification(status(SyncState.OFFLINE, waiting = 3u), now))
         assertEquals("PC not found", Texts.notification(status(SyncState.CONNECTING), now))
         assertEquals("Not paired", Texts.notification(status(SyncState.UNPAIRED, peer = null), now))

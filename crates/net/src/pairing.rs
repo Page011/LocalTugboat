@@ -1,9 +1,9 @@
 //! Pairing: QR payload, 6-digit code, the PC's pairing window, and the exchange.
 //!
-//! PLAN Security: "the QR holds the PC's public key, LAN addresses, port, a one-time 128-bit
+//! The QR holds the PC's public key, LAN addresses, port, a one-time 128-bit
 //! secret and a 2-minute expiry, and is shown only on request. Both screens then show a
 //! 6-digit code derived from both public keys and the secret, and the PC owner confirms it
-//! matches. A second use of the secret cancels pairing with a warning."
+//! matches. A second use of the secret cancels pairing with a warning.
 //!
 //! Exchange (ALPN_PAIR connection dialed by the phone to the QR addresses and key; iroh's
 //! TLS proves the PC holds the QR key, so the secret travels only to the real PC):
@@ -31,7 +31,7 @@ use crate::{
     NetError, ALPN_PAIR,
 };
 
-/// QR window length (PLAN: "shows a QR code for 2 minutes").
+/// QR window length (the PC shows a QR code for 2 minutes).
 pub const WINDOW_MS: i64 = 120_000;
 /// How long a shown code waits for the PC user's click before the window cancels itself.
 pub const CONFIRM_TIMEOUT_MS: i64 = 120_000;
@@ -65,7 +65,7 @@ const CLOSE_WAIT: Duration = Duration::from_secs(DELIVERY_TIMEOUT.as_secs() + PC
 const PAYLOAD_PREFIX: &str = "localtugboat://pair?";
 
 /// Why pairing did not complete. Serialized into PairDecision::Refused so the phone shows
-/// the same reason the PC shows. Each has its own user text (notes/core-design.md).
+/// the same reason the PC shows. Each has its own user text.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 #[serde(tag = "code", rename_all = "snake_case")]
 pub enum PairError {

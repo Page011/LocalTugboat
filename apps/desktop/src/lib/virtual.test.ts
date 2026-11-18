@@ -81,7 +81,7 @@ describe("tileWidth", () => {
   });
 });
 
-// The dark-gallery bug (2026-11-18): the columns were sized for a width that included the vertical scrollbar, so the
+// Dark-gallery regression: the columns were sized for a width that included the vertical scrollbar, so the
 // last column was clipped and a horizontal scrollbar appeared. The grid must fit the VISIBLE width for every width.
 describe("the laid-out row always fits the visible width", () => {
   test("for every scroller width a window can have, no tile reaches past the visible edge", async () => {
