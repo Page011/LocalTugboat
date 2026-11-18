@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Narrowest possible: the exported log file, and held photos/videos for the share sheet. Nothing else
+     (not the database, not the identity key, not the Bin, not thumbnails). -->
+<paths>
+    <cache-path name="export" path="export/" />
+    <files-path name="items" path="storage/items/" />
+</paths>

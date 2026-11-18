@@ -1,0 +1,8 @@
+build/
+.gradle/
+local.properties
+.kotlin/
+*.log
+# Build output of build-rust.cmd
+app/src/main/jniLibs/
+app/src/main/java/uniffi/

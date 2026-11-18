@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Status bar icon: two opposing arrows (sync both ways). Monochrome, white; the system tints it. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M4,8 H16 V5 L21,9 L16,13 V10 H4 Z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M20,14 H8 V11 L3,15 L8,19 V16 H20 Z" />
+</vector>
