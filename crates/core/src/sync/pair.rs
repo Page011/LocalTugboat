@@ -19,7 +19,7 @@ use tugboat_net::{
     close,
     pairing::{
         format_code, pc_read_hello, pc_send_decision, phone_start, HelloOutcome, PairDecision, PairError, PairPayload, PairingWindow,
-        CONFIRM_TIMEOUT_MS,
+        CONFIRM_TIMEOUT_MS, PC_SAVE_WAIT,
     },
     NetError,
 };
@@ -37,10 +37,6 @@ use crate::{
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 /// Dialing the PC from the QR addresses.
 const DIAL_TIMEOUT: Duration = Duration::from_secs(8);
-
-/// How long the PC keeps the pairing connection open after an Accepted decision while it saves
-/// the pairing (normally milliseconds).
-const STORE_WAIT: Duration = Duration::from_secs(10);
 
 /// The decision for the phone, the channel that reports its delivery and, for Accepted, the
 /// signal that the PC has finished saving the pairing (sent or dropped once saving ended).
@@ -207,7 +203,7 @@ pub(crate) async fn handle_conn(core: Core, peer: tugboat_net::node::PeerConn) {
                         // the pairing is saved here (or saving failed): a sync dial that arrives first
                         // is refused as "not paired", and the phone then unpairs itself.
                         if let Some(stored) = stored {
-                            let _ = tokio::time::timeout(STORE_WAIT, stored).await;
+                            let _ = tokio::time::timeout(PC_SAVE_WAIT, stored).await;
                         }
                         peer.close(if accepted { close::NORMAL } else { close::PAIRING_CLOSED }, "pairing finished");
                     }

@@ -51,9 +51,13 @@ pub const CODE_CONTEXT: &str = "localtugboat 2026-11-17 pairing code v1";
 const MAX_PAIR_FRAME: u32 = 4096;
 /// Waiting for the decision to reach the phone before the PC closes the connection.
 const DELIVERY_TIMEOUT: Duration = Duration::from_secs(5);
-/// Phone, after Accepted: waiting for the PC to close the pairing connection, which it does once
-/// it has saved the pairing (the PC waits up to 10 s for that save).
-const CLOSE_WAIT: Duration = Duration::from_secs(12);
+/// PC, after Accepted was delivered: how long it keeps the pairing connection open while it saves
+/// the pairing (normally milliseconds). It closes the connection once saved.
+pub const PC_SAVE_WAIT: Duration = Duration::from_secs(10);
+/// Phone, after Accepted: waiting for the PC to close the pairing connection. Covers the PC's
+/// whole path (its delivery wait, then its save wait) plus a margin, so the phone never dials
+/// to sync before the PC has saved the pairing.
+const CLOSE_WAIT: Duration = Duration::from_secs(DELIVERY_TIMEOUT.as_secs() + PC_SAVE_WAIT.as_secs() + 2);
 
 const PAYLOAD_PREFIX: &str = "localtugboat://pair?";
 

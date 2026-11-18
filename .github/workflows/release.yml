@@ -164,6 +164,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
+          BUILT_SHA: ${{ github.sha }}
         run: |
           set -eu
           shopt -s nullglob
@@ -178,6 +179,12 @@ jobs:
             identical|behind) ;;
             *) echo "::error::TAG $TAG IS NOT ON main (compare status: $st)"; exit 1 ;;
           esac
+          # The tag must still point at the commit this run built (an annotated tag resolves to its commit).
+          tag_sha=$(gh api "repos/$GH_REPO/commits/$TAG" --jq .sha)
+          if [ "$tag_sha" != "$BUILT_SHA" ]; then
+            echo "::error::TAG $TAG MOVED - it points at $tag_sha, this run built $BUILT_SHA"
+            exit 1
+          fi
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "::error::RELEASE $TAG ALREADY EXISTS - delete that draft on GitHub, then re-run"
             exit 1
