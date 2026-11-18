@@ -60,6 +60,7 @@ pub struct PassReport {
 
 /// Listed in Not synced when the file's content fails the photo/video check.
 const MISMATCH_REASON: &str = "REFUSED - content does not match its type";
+const RENAME_REASON: &str = "REFUSED - a file without an extension cannot take a photo or video name";
 const IN_PROGRESS_REASON: &str = "IN PROGRESS - not synced yet";
 const LINK_REASON: &str = "LINK - shortcuts to other places never sync";
 const LEGACY_REASON: &str = "FROM BEFORE 0.2.0 - not synced";
@@ -72,8 +73,9 @@ struct DiskFile {
     size: u64,
     mtime: i64,
     /// Why this file is never imported (an always-refused name, a download still in progress,
-    /// a link). It is listed, never skipped silently, and a held item that was renamed to such a
-    /// name in Explorer is neither renamed back nor called missing.
+    /// a link). It is listed, never skipped silently. A held item renamed to a refused name or a
+    /// link in Explorer is neither renamed back nor called missing; a held file whose name only
+    /// looks like a download is handled like any other held file.
     skip: Option<&'static str>,
 }
 
@@ -99,6 +101,14 @@ fn mtime_ms(meta: &std::fs::Metadata) -> i64 {
     meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
+/// What the Not synced list says for a refusal from Core.
+fn refusal_text(e: &CoreError) -> String {
+    match e {
+        CoreError::Refused(m) => m.clone(),
+        _ => MISMATCH_REASON.to_string(),
+    }
+}
+
 fn not_synced(path: &Path, name: &str, reason: &str) -> NotSyncedFile {
     NotSyncedFile { path: path.display().to_string(), name: name.to_string(), reason: reason.to_string() }
 }
@@ -107,7 +117,7 @@ fn not_synced(path: &Path, name: &str, reason: &str) -> NotSyncedFile {
 /// Office `~$x.docx`, LibreOffice `.~lock.x.odt#`, and this app's own cross-drive move copy. These are listed but not synced.
 fn is_in_progress(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    lower.starts_with("~$") || lower.starts_with(".~lock.") || ["crdownload", "part", "partial", "download", "opdownload", super::placement::MOVE_EXT].contains(&names::ext_of(name).as_str())
+    lower.starts_with("~$") || lower.starts_with(".~lock.") || super::placement::is_move_temp(name) || ["crdownload", "part", "partial", "download", "opdownload"].contains(&names::ext_of(name).as_str())
 }
 
 fn disk_file(path: PathBuf, dir: Option<String>, name: String, meta: &std::fs::Metadata) -> DiskFile {
@@ -484,8 +494,11 @@ impl Inner {
             }
             let ident = self.identity(st, f, &key, full);
             let idx = ident.and_then(|i| by_ident.get(&(i.volume_serial, i.file_id)).copied()).or_else(|| by_path.get(&key).copied());
-            if let Some(why) = f.skip {
-                // Never imported, listed. A held item renamed to this name in Explorer is not missing and
+            // A held file whose name merely looks like a download ("movie.part" from the phone) is an ordinary
+            // synced file: it takes the normal path below, so its edits and remote renames still follow.
+            let held_download = idx.is_some() && f.skip == Some(IN_PROGRESS_REASON);
+            if let Some(why) = f.skip.filter(|_| !held_download) {
+                // Never imported, listed. A held item renamed to a refused name in Explorer is not missing and
                 // is left exactly as the user made it (never renamed back, never binned).
                 if let Some(i) = idx {
                     matched[i] = true;
@@ -534,7 +547,7 @@ impl Inner {
                 if let Ok((hash, _)) = tugboat_core::ops::hash_file(&f.path) {
                     if let Some(&i) = cands.iter().find(|&&i| held[i].hash == hash) {
                         missing.retain(|&m| m != i);
-                        self.moved(&held[i], f, ident, &index, rep, errors);
+                        self.moved(&held[i], f, ident, &index, rep, errors, &mut ns);
                         continue;
                     }
                 }
@@ -842,7 +855,7 @@ impl Inner {
         // path to same_path: compare the file name exactly as well.
         let renamed = Path::new(&h.path).file_name().is_some_and(|n| n.to_string_lossy() != f.name.as_str());
         if !same_path(Path::new(&h.path), &f.path) || renamed {
-            self.moved(h, f, ident, index, rep, errors);
+            self.moved(h, f, ident, index, rep, errors, ns);
         } else {
             if let Some(i) = ident {
                 if h.volume_serial != Some(i.volume_serial) || h.file_id != Some(i.file_id) {
@@ -862,6 +875,12 @@ impl Inner {
         let key = norm(&f.path);
         let last = st.mtimes.get(&key).copied().or(h.mtime_ms);
         let changed = f.size != h.size || last.is_some_and(|m| m != f.mtime);
+        // An edit Core refused (too large, wrong type) is judged once per (size, mtime), like a
+        // new file: listed, not retried, so a refused file is never read again until it changes.
+        let judged = st.rejected.get(&key).is_some_and(|(size, mtime, _)| *size == f.size && *mtime == f.mtime);
+        if changed && judged {
+            return;
+        }
         if changed {
             if self.stable(st, f, now) {
                 match self.core.local_content_changed(h.item, f.path.clone()) {
@@ -869,6 +888,9 @@ impl Inner {
                         rep.edited += 1;
                         st.mtimes.insert(key, f.mtime);
                         self.stamp_mtime(h.item, f.mtime);
+                    }
+                    Err(e @ (CoreError::NotMedia(_) | CoreError::Refused(_))) => {
+                        st.rejected.insert(key, (f.size, f.mtime, refusal_text(&e)));
                     }
                     Err(e) => errors.push(format!("EDIT NOT SYNCED - {}: {e}", f.name)),
                 }
@@ -938,7 +960,8 @@ impl Inner {
     }
 
     /// A held file now lives at `f.path`: folder and name follow where the user put it.
-    fn moved(&self, h: &HeldFile, f: &DiskFile, ident: Option<FileIdentity>, index: &HashMap<String, FolderId>, rep: &mut PassReport, errors: &mut Vec<String>) {
+    #[allow(clippy::too_many_arguments)]
+    fn moved(&self, h: &HeldFile, f: &DiskFile, ident: Option<FileIdentity>, index: &HashMap<String, FolderId>, rep: &mut PassReport, errors: &mut Vec<String>, ns: &mut Vec<NotSyncedFile>) {
         let folder = match &f.dir {
             None => INBOX_ID,
             Some(d) => match index.get(&d.to_lowercase()) {
@@ -967,6 +990,16 @@ impl Inner {
         };
         match self.core.local_file_moved(h.item, f.path.clone(), folder, &name) {
             Ok(()) => rep.moved += 1,
+            // The record refuses the new name: the file stays as the user left it, listed once per
+            // pass (never an error, so no retry storm). Nothing was recorded, so it is not undone.
+            Err(CoreError::Refused(why)) => {
+                ns.push(not_synced(&f.path, &f.name, &why));
+                return;
+            }
+            Err(CoreError::NotMedia(_)) => {
+                ns.push(not_synced(&f.path, &f.name, RENAME_REASON));
+                return;
+            }
             Err(e) => {
                 errors.push(format!("MOVE NOT SYNCED - {}: {e}", f.name));
                 return;
@@ -1036,7 +1069,7 @@ impl Inner {
             }
             Err(e @ (CoreError::NotMedia(_) | CoreError::Refused(_))) => {
                 // Judged once per (size, mtime): listed, never retried until the file changes.
-                let why = if let CoreError::Refused(m) = &e { m.clone() } else { MISMATCH_REASON.to_string() };
+                let why = refusal_text(&e);
                 st.rejected.insert(norm(&f.path), (f.size, f.mtime, why.clone()));
                 ns.push(not_synced(&f.path, &f.name, &why));
             }
@@ -1354,7 +1387,8 @@ impl Inner {
                         let why = if e.kind() == std::io::ErrorKind::AlreadyExists { "already exists in the new folder".to_string() } else { e.to_string() };
                         return Err(CmdError::new("io", format!("MOVE FAILED - {}: {why}", h.name)));
                     }
-                    let r = std::fs::copy(&h.path, &dest).and_then(|n| if n == h.size { Ok(()) } else { Err(std::io::Error::other("copy is shorter than the original")) });
+                    // A received file's Mark-of-the-Web must come along (a FAT/exFAT folder drops it without an error).
+                    let r = self.place.copy_marked(Path::new(&h.path), &dest).and_then(|n| if n == h.size { Ok(()) } else { Err(std::io::Error::other("copy is shorter than the original")) });
                     match r {
                         Ok(()) => items.push((h, dest, true)),
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound && !Path::new(&h.path).exists() => {

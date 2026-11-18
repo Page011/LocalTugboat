@@ -53,7 +53,7 @@ let progressTimer: ReturnType<typeof setTimeout> | undefined;
 function dropFinished(r: DropReport): void {
   clearTimeout(progressTimer);
   progressTimer = undefined;
-  app.drop.over = null;
+  // `over` is not touched: the drop's own Leave hid the overlay, and a drag started since may be showing it.
   app.drop.progress = null;
   app.drop.showProgress = false;
   const text = dropSummary(r);

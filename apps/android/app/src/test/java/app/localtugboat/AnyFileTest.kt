@@ -208,6 +208,27 @@ class AnyFileTest {
         assertTrue("read far past the room: ${endless.served}", endless.served <= room + 64 * 1024)
     }
 
+    // The cache copy and the core's copy are both on the disk at the peak: a share needs twice its size.
+    @Test fun a_share_must_fit_on_the_phone_twice() {
+        val mb = 1024L * 1024
+        val free = 2048 * mb
+        val max = 16L * 1024 * mb
+        // 1.5 GB into 2 GB free: one copy fits, two do not.
+        assertEquals("phone storage low", ShareImporter.refusal(1536 * mb, free, max))
+        // Half of what is free beyond the 64 MB margin still goes in.
+        assertNull(ShareImporter.refusal((free - 64 * mb) / 2, free, max))
+        assertEquals("phone storage low", ShareImporter.refusal((free - 64 * mb) / 2 + 1, free, max))
+        // No declared size: nothing to refuse yet, the copy itself is capped.
+        assertNull(ShareImporter.refusal(null, free, max))
+        assertEquals((free - 64 * mb) / 2 - 100, ShareImporter.copyRoom(free, 100))
+    }
+
+    @Test fun a_file_over_the_core_limit_is_refused_before_the_copy() {
+        val gb = 1024L * 1024 * 1024
+        assertEquals("too large", ShareImporter.refusal(20 * gb, 60 * gb, 16 * gb))
+        assertNull(ShareImporter.refusal(10 * gb, 60 * gb, 16 * gb))
+    }
+
     // ---- file labels, icons, names other apps see ----
 
     @Test fun file_meta_reads_type_then_size() {
@@ -301,6 +322,14 @@ class AnyFileTest {
         assertFalse("a refused start must not raise a banner at once", svc.contains("c.core.reportError(m)"))
     }
 
+    // The Open button must use the tested predicate: a binned file outside the Bin route is not openable.
+    @Test fun the_open_button_uses_the_open_rule() {
+        val viewer = File(kotlin, "Viewer.kt").readText()
+        val page = viewer.substringAfter("private fun FilePage(").substringBefore("/** The file is not here")
+        assertTrue(page.contains("UiLogic.canOpen(item, bin) -> ActionButton"))
+        assertFalse("Open must not be the unconditional last branch", page.contains("else -> ActionButton"))
+    }
+
     // ---- recording ----
 
     @Test fun orientation_is_locked_only_while_recording() {
@@ -309,5 +338,10 @@ class AnyFileTest {
         val cam = File(kotlin, "CameraScreen.kt").readText()
         assertTrue(cam.contains("UiLogic.recordingOrientation(true)"))
         assertTrue("the lock must be released on dispose", cam.contains("onDispose { if (isRecording) activity?.requestedOrientation = UiLogic.recordingOrientation(false) }"))
+        // Source check: the release must not wait for a recomposition (none runs while the app is stopped).
+        val finalize = cam.substringAfter("is VideoRecordEvent.Finalize ->").substringBefore("else -> {}")
+        assertTrue("the lock must be released when the recording ends", finalize.contains("requestedOrientation = UiLogic.recordingOrientation(false)"))
+        val main = File(kotlin, "MainActivity.kt").readText()
+        assertTrue("a restored activity must not keep a stale lock", main.contains("if (savedInstanceState != null) requestedOrientation = UiLogic.recordingOrientation(false)"))
     }
 }

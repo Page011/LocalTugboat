@@ -107,6 +107,7 @@ impl Dev {
         };
         let storage = AppStorage::new(dir.path().join("storage")).expect("storage");
         let (core, mut rx) = Core::open(cfg, Arc::new(clock.clone()), wrap(storage)).expect("open core");
+        core.debug_record_blob_requests();
         let events = Arc::new(Mutex::new(Vec::new()));
         let log = events.clone();
         tokio::spawn(async move {

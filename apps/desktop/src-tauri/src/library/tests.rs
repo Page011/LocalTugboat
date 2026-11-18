@@ -263,26 +263,66 @@ fn downloads_and_editor_lock_files_are_listed_not_synced_yet_and_sync_once_they_
     assert_eq!(r.item("a.zip").ext, "zip");
 }
 
-/// The copy a cross-drive move makes sits in the visible library folder under `<name>.tugboat-move`: a scan must
+/// The copy a cross-drive move makes sits in the visible library folder under `.tugboat-<id>.tugboat-move`: a scan must
 /// never import it (a crash mid-copy leaves it), and the start-up clean-up removes it from the root and the folders.
 #[test]
 fn a_move_copy_left_in_the_library_is_in_progress_never_an_item_and_is_removed_at_start() {
     let mut r = Rig::new();
     std::fs::create_dir(r.root.join("Work")).unwrap();
-    std::fs::write(r.root.join("a.tugboat-move"), jpeg(1, 64)).unwrap();
-    std::fs::write(r.root.join("Work").join("B.TUGBOAT-MOVE"), jpeg(2, 64)).unwrap();
+    let (a, b) = (".tugboat-0190f2a45b7c7e3a9d4e5f60718293a4.tugboat-move", ".tugboat-0190F2A45B7C7E3A9D4E5F60718293A5.TUGBOAT-MOVE");
+    std::fs::write(r.root.join(a), jpeg(1, 64)).unwrap();
+    std::fs::write(r.root.join("Work").join(b), jpeg(2, 64)).unwrap();
     r.write("keep.jpg", 3);
     r.settle();
     r.settle();
     let s = r.lib.status();
-    for n in ["a.tugboat-move", "B.TUGBOAT-MOVE"] {
+    for n in [a, b] {
         assert!(s.not_synced.iter().any(|f| f.name == n && f.reason.starts_with("IN PROGRESS")), "{n} is listed: {:?}", s.not_synced);
     }
     assert_eq!(r.items().iter().map(|i| i.name.as_str()).collect::<Vec<_>>(), ["keep.jpg"], "no move copy is imported");
     assert_eq!(crate::drop::clean_stale(&r.root), 2);
-    assert!(!r.root.join("a.tugboat-move").exists() && !r.root.join("Work").join("B.TUGBOAT-MOVE").exists());
+    assert!(!r.root.join(a).exists() && !r.root.join("Work").join(b).exists());
     assert!(r.root.join("keep.jpg").exists(), "nothing else is removed");
     assert_eq!(crate::drop::clean_stale(&r.root), 0);
+}
+
+/// Any file type syncs, so a file whose extension is the move copy's own ("Notes.tugboat-move") is a real file: the
+/// start-up clean-up must not delete it (that delete would then sync to the phone).
+#[test]
+fn a_real_file_ending_in_tugboat_move_is_synced_and_survives_the_start_up_clean_up() {
+    let mut r = Rig::new();
+    std::fs::write(r.root.join("Notes.tugboat-move"), b"keep me").unwrap();
+    r.settle();
+    r.settle();
+    assert_eq!(r.item("Notes.tugboat-move").ext, "tugboat-move");
+    assert_eq!(crate::drop::clean_stale(&r.root), 0);
+    assert!(r.root.join("Notes.tugboat-move").exists());
+    r.settle();
+    assert_eq!(r.deleted_count(), 0);
+    assert_eq!(r.item("Notes.tugboat-move").local, LocalFileState::Present);
+}
+
+/// A synced file whose name looks like a download in progress ("movie.part" received from the phone) is still a
+/// held file: it is not listed as not synced, and an edit made on the PC reaches the record.
+#[test]
+fn a_synced_file_named_like_a_download_is_not_listed_and_its_edits_still_sync() {
+    let mut r = Rig::new();
+    std::fs::write(r.root.join("movie.txt"), b"one").unwrap();
+    r.settle();
+    let id = r.item("movie.txt").id;
+    // The held file now carries a download-looking name (the same state as one the phone sent under that name).
+    std::fs::rename(r.root.join("movie.txt"), r.root.join("movie.part")).unwrap();
+    r.settle();
+    std::fs::write(r.root.join("movie.part"), b"two two").unwrap();
+    let mut edited = 0;
+    for _ in 0..3 {
+        edited += r.settle().edited;
+    }
+    assert_eq!(edited, 1, "the edit was seen");
+    assert_eq!(r.core.item(id).unwrap().unwrap().size, 7);
+    let s = r.lib.status();
+    assert!(!s.not_synced.iter().any(|f| f.name == "movie.part"), "a held file is not 'not synced': {:?}", s.not_synced);
+    assert_eq!(r.deleted_count(), 0);
 }
 
 /// A 0.1.x library: the config has a path but no `legacy_done`. Its non-photo files were listed
@@ -407,6 +447,30 @@ fn a_received_files_mark_of_the_web_survives_choose_and_locate() {
     for p in [located.join("a.jpg"), located.join("Work").join("b.jpg")] {
         assert_eq!(read_zone_mark(&p).as_deref(), Some(ZONE_TEXT), "Locate kept the mark on {}", p.display());
     }
+}
+
+/// Copying onto FAT/exFAT drops the Mark-of-the-Web without an error. Choose must then fail and leave the old library
+/// exactly as it was, never move received files over unmarked. (The drop is simulated: the temp drive is NTFS.)
+#[test]
+fn choosing_a_folder_that_would_strip_a_received_files_mark_is_refused_and_changes_nothing() {
+    use crate::winfs::{read_zone_mark, write_zone_mark};
+    let mut r = Rig::new();
+    let marked = r.write("setup.jpg", 1);
+    write_zone_mark(&marked).unwrap();
+    r.write("mine.jpg", 2); // the user's own file: no mark to lose
+    r.settle();
+    let new_root = r._tmp.path().join("newlib");
+    r.place.strip_copy_marks.store(true, std::sync::atomic::Ordering::SeqCst);
+    let err = r.lib.choose(&new_root, false).unwrap_err();
+    assert!(err.message.contains("setup.jpg") && err.message.contains("NOT MARKED AS DOWNLOADED"), "{}", err.message);
+    assert!(read_zone_mark(&marked).is_some(), "the original keeps its mark and stays in place");
+    assert_eq!(r.lib.root().as_deref(), Some(r.root.as_path()), "still the old library");
+    assert!(!new_root.join("setup.jpg").exists(), "no unmarked copy is left");
+    assert_eq!(r.item("setup.jpg").path.as_deref().map(Path::new), Some(marked.as_path()));
+    // The drive can hold the mark (the seam off): the same choice goes through.
+    r.place.strip_copy_marks.store(false, std::sync::atomic::Ordering::SeqCst);
+    r.lib.choose(&new_root, false).unwrap();
+    assert!(read_zone_mark(&new_root.join("setup.jpg")).is_some());
 }
 
 /// Explorer rename to a refused name: the record does not change, the file is listed, Tugboat never
@@ -1824,6 +1888,27 @@ mod any_file_placement {
     }
 
     #[test]
+    fn a_bin_restore_that_would_come_out_unmarked_fails_and_the_bin_copy_stays() {
+        let (_t, p, root) = rig();
+        let mut t = target(1, "setup.exe", "exe");
+        let first = p.commit(&part(&p, &t, b"v1"), &t).unwrap();
+        t.current = Some(first);
+        let binned = p.to_bin(&t).unwrap();
+        let mut tb = t.clone();
+        tb.current = Some(binned.clone());
+        // A library on FAT/exFAT: the copy loses the stream without an error.
+        p.strip_copy_marks.store(true, std::sync::atomic::Ordering::SeqCst);
+        let err = p.from_bin(&tb).unwrap_err();
+        assert!(err.to_string().contains("NOT MARKED AS DOWNLOADED"), "{err}");
+        assert!(binned.exists() && read_zone_mark(&binned).is_some(), "the marked Bin copy is untouched");
+        assert!(!root.join("setup.exe").exists(), "nothing appears unmarked");
+        assert!(std::fs::read_dir(root.join(".tugboat")).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().ends_with(".restore")), "no staging copy is left");
+        p.strip_copy_marks.store(false, std::sync::atomic::Ordering::SeqCst);
+        let back = p.from_bin(&tb).unwrap();
+        assert!(read_zone_mark(&back).is_some());
+    }
+
+    #[test]
     fn a_users_own_file_adopted_in_place_or_copied_in_gets_no_mark() {
         let (tmp, p, root) = rig();
         let own = root.join("mine.txt");
@@ -2184,6 +2269,33 @@ mod dropping {
         // An Outlook attachment or a zip entry has no path: nothing to copy, and it says so.
         let rep = copy(&r, &[], &inbox(&r));
         assert_eq!(rep.refused[0].reason, NOTHING_TEXT);
+    }
+
+    /// Unzipping in Explorer gives every file the zip's mark, so a zip of a folder holding a marked file is marked
+    /// (as the single file would be), and an all-unmarked folder gives an unmarked zip.
+    #[test]
+    fn a_zipped_folder_is_marked_when_a_file_in_it_is_and_fails_when_the_drive_cannot_hold_the_mark() {
+        let r = Rig::new();
+        let plain = src_dir(&r).join("Plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        std::fs::write(plain.join("a.txt"), b"a").unwrap();
+        let tools = src_dir(&r).join("Tools");
+        std::fs::create_dir_all(tools.join("sub")).unwrap();
+        std::fs::write(tools.join("a.txt"), b"a").unwrap();
+        std::fs::write(tools.join("sub").join("setup.exe"), b"MZ").unwrap();
+        write_zone_mark(&tools.join("sub").join("setup.exe")).unwrap();
+        let rep = copy(&r, &[plain, tools.clone()], &inbox(&r));
+        assert_eq!(rep.copied, ["Plain.zip", "Tools.zip"], "{rep:?}");
+        assert!(read_zone_mark(&r.root.join("Plain.zip")).is_none(), "nothing marked inside: no mark");
+        assert!(read_zone_mark(&r.root.join("Tools.zip")).is_some(), "a marked file inside marks the zip");
+        assert!(staged(&r).is_empty());
+        // A drive that cannot hold the mark: no zip at all, a line saying why.
+        r.place.fail_marks.store(true, std::sync::atomic::Ordering::SeqCst);
+        let rep = copy(&r, &[tools], &inbox(&r));
+        assert!(rep.copied.is_empty(), "{rep:?}");
+        assert!(rep.failed.len() == 1 && rep.failed[0].reason.starts_with("ZIP FAILED - Tools"), "{rep:?}");
+        assert!(staged(&r).is_empty(), "no temp copy left");
+        assert!(!r.root.join("Tools (2).zip").exists());
     }
 
     #[test]

@@ -82,7 +82,7 @@ class TextsTest {
     }
 
     @Test fun an_old_qr_never_reads_as_not_a_tugboat_code() {
-        // Known bug 0.1.x: a QR older than 2 minutes said "That is not a Tugboat code". Only a payload the core cannot parse says that.
+        // An expired QR never says "That is not a Tugboat code": only a payload the core cannot parse does.
         assertEquals("PAIRING CODE EXPIRED - show a new QR", Texts.pairFailure(SnapException.PairExpired("PAIRING CODE EXPIRED - show a new QR"), false))
         assertEquals("Pairing is not open on the PC", Texts.pairFailure(SnapException.PairNotOpen("Pairing is not open on the PC"), true))
         assertEquals("Update Tugboat on the PC", Texts.pairFailure(SnapException.PairVersionMismatch("Update Tugboat on the PC"), true))
@@ -90,7 +90,7 @@ class TextsTest {
     }
 
     @Test fun an_old_qr_refused_by_the_pcs_newer_window_reads_expired() {
-        // Measured on the emulator: after 2 minutes the PC opens a new window, so the old QR comes back as a wrong secret.
+        // After 2 minutes the PC opens a new window, so the old QR comes back as a wrong secret.
         assertEquals("WRONG PAIRING CODE - scan the QR again", Texts.pairFailure(SnapException.PairBadSecret("WRONG PAIRING CODE - scan the QR again"), true))
         assertEquals("PAIRING CODE EXPIRED - show a new QR", Texts.pairFailure(SnapException.PairBadSecret("WRONG PAIRING CODE - scan the QR again"), true, codeExpired = true))
         assertEquals("PAIRING CODE EXPIRED - show a new QR", Texts.pairFailure(SnapException.PairNotOpen("Pairing is not open on the PC"), true, codeExpired = true))

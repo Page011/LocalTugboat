@@ -156,6 +156,14 @@ impl Shared {
     }
 }
 
+/// The drag in progress. `seq` changes with every Enter, Leave and Drop, so the answer of an Enter that was
+/// looked up on a worker thread is dropped when its drag has already ended.
+#[derive(Default)]
+struct Drag {
+    seq: u64,
+    target: Option<DropTarget>,
+}
+
 pub struct Backend {
     pub core: Core,
     pub library: Library,
@@ -173,8 +181,8 @@ pub struct Backend {
     tasks: Mutex<Vec<JoinHandle<()>>>,
     /// The folder the gallery is showing (None = Inbox), set by the UI. Only a folder id: never a path.
     drop_view: Mutex<Option<FolderId>>,
-    /// The target named by the overlay at the moment files entered the window.
-    drop_locked: Mutex<Option<DropTarget>>,
+    /// The drag over the window: which one it is, and the target its overlay named.
+    drag: Mutex<Drag>,
     /// One drop copies at a time; a second waits its turn.
     drop_run: Mutex<()>,
 }
@@ -230,7 +238,7 @@ impl Backend {
             network_error: Mutex::new(None),
             tasks: Mutex::new(Vec::new()),
             drop_view: Mutex::new(None),
-            drop_locked: Mutex::new(None),
+            drag: Mutex::new(Drag::default()),
             drop_run: Mutex::new(()),
         });
 
@@ -468,29 +476,60 @@ impl Backend {
         Ok(DropTarget { id, kind, name })
     }
 
-    /// Files entered the window: fix the target now (the overlay names it) and tell the overlay.
-    pub fn drop_enter(&self, paths: &[PathBuf]) {
-        let (files, folders) = drop::count_kinds(paths);
-        match self.drop_target() {
-            Ok(t) => {
-                let state = DropState::Enter { files, folders, target_name: t.name.clone() };
-                *lock(&self.drop_locked) = Some(t);
-                self.shared.emit(ev::DROP_STATE, &state);
+    /// Files entered the window. Called on the window's event thread, which must never wait for the database
+    /// (Core holds it while it hashes a big file): the target is looked up on a worker thread, then fixed
+    /// (the overlay names it) and sent to the overlay, unless the drag has ended meanwhile.
+    pub fn drop_enter(self: &Arc<Self>, paths: Vec<PathBuf>) {
+        let seq = {
+            let mut d = lock(&self.drag);
+            d.seq += 1;
+            d.target = None;
+            d.seq
+        };
+        let me = self.clone();
+        let spawned = std::thread::Builder::new().name("tugboat-drag".into()).spawn(move || {
+            let (files, folders) = drop::count_kinds(&paths);
+            let found = me.drop_target();
+            let mut d = lock(&me.drag);
+            if d.seq != seq {
+                return;
             }
-            Err(e) => self.shared.emit(ev::CORE, &Event::Error { kind: "drop".into(), message: e.message }),
+            match found {
+                Ok(t) => {
+                    let state = DropState::Enter { files, folders, target_name: t.name.clone() };
+                    d.target = Some(t);
+                    me.shared.emit(ev::DROP_STATE, &state);
+                }
+                Err(e) => me.shared.emit(ev::CORE, &Event::Error { kind: "drop".into(), message: e.message }),
+            }
+        });
+        if let Err(e) = spawned {
+            tracing::error!("drag thread did not start: {e}");
         }
     }
 
     pub fn drop_leave(&self) {
-        *lock(&self.drop_locked) = None;
+        let mut d = lock(&self.drag);
+        d.seq += 1;
+        d.target = None;
         self.shared.emit(ev::DROP_STATE, &DropState::Leave);
     }
 
-    /// Files were dropped: copy them (blocking: call off the UI thread). Always ends with one `drop-result`.
-    pub fn drop_files(&self, files: NativeDrop) -> DropReport {
-        let _turn = lock(&self.drop_run);
-        let locked = lock(&self.drop_locked).take();
+    /// The files were dropped: the drag is over (the overlay goes) and the folder it named is the one they go to.
+    /// Called on the event thread at the moment of the drop, so a drop that waits behind another keeps its own
+    /// folder whatever is dragged over the window later. None = the lookup had not finished: the folder on screen.
+    pub fn drop_end(&self) -> Option<DropTarget> {
+        let mut d = lock(&self.drag);
+        d.seq += 1;
+        let target = d.target.take();
         self.shared.emit(ev::DROP_STATE, &DropState::Leave);
+        target
+    }
+
+    /// Files were dropped on `locked` (from `drop_end`): copy them (blocking: call off the UI thread). Always
+    /// ends with one `drop-result`.
+    pub fn drop_files(&self, files: NativeDrop, locked: Option<DropTarget>) -> DropReport {
+        let _turn = lock(&self.drop_run);
         let report = match locked.map(Ok).unwrap_or_else(|| self.drop_target()) {
             Ok(target) => {
                 let shared = self.shared.clone();

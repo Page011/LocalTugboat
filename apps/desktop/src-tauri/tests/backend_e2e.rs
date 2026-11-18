@@ -334,7 +334,8 @@ async fn any_file_travels_both_ways_the_pc_marks_what_it_receives_and_a_dropped_
     std::fs::create_dir_all(&usb).unwrap();
     let dropped = usb.join("dropped.pdf");
     std::fs::write(&dropped, b"%PDF-1.4 dropped").unwrap();
-    let rep = be.drop_files(NativeDrop::from_native(std::slice::from_ref(&dropped)));
+    let target = be.drop_end(); // what the window's Drop event does first
+    let rep = be.drop_files(NativeDrop::from_native(std::slice::from_ref(&dropped)), target);
     assert_eq!(rep.copied, ["dropped.pdf"], "{rep:?}");
     assert!(dropped.exists(), "the source is never touched");
     assert!(pc.root.join("dropped.pdf").is_file());
@@ -347,5 +348,49 @@ async fn any_file_travels_both_ways_the_pc_marks_what_it_receives_and_a_dropped_
     }
 
     ph.stop_network().await;
+    be.shutdown().await;
+}
+
+/// A drop that waits behind another keeps the folder it was dropped on, whatever is dragged over the window
+/// afterwards, and the window's event thread never waits for the folder lookup (it runs on a worker thread).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_drop_keeps_the_folder_it_was_dropped_on_and_a_finished_drag_is_never_announced_late() {
+    use tugboat_core::Retention;
+    use tugboat_desktop_lib::drop::NativeDrop;
+
+    let pc = start_pc().await;
+    let be = &pc.be;
+    let (y, z) = (be.core.create_folder("Y", Retention::Keep).unwrap(), be.core.create_folder("Z", Retention::Keep).unwrap());
+    let usb = pc._tmp.path().join("usb");
+    std::fs::create_dir_all(&usb).unwrap();
+    let (a, b) = (usb.join("a.txt"), usb.join("b.txt"));
+    std::fs::write(&a, b"a").unwrap();
+    std::fs::write(&b, b"b").unwrap();
+    let enters = |name: &str| pc.out.events.lock().unwrap().iter().filter(|(n, v)| n == ev::DROP_STATE && v["t"] == "enter" && v["target_name"] == name).count();
+
+    // B is dropped while the overlay says "Y".
+    be.drop_target_set(Some(y));
+    be.drop_enter(vec![b.clone()]);
+    until("the overlay names Y", 10, || enters("Y") == 1).await;
+    let for_b = be.drop_end();
+    assert_eq!(for_b.as_ref().map(|t| t.name.as_str()), Some("Y"));
+    // Later drags change what is on screen and what the slot holds.
+    be.drop_target_set(Some(z));
+    be.drop_enter(vec![a.clone()]);
+    until("the overlay names Z", 10, || enters("Z") == 1).await;
+    be.drop_leave();
+    // B's turn comes only now: it still goes to Y.
+    let rep = be.drop_files(NativeDrop::from_native(std::slice::from_ref(&b)), for_b);
+    assert_eq!((rep.folder_name.as_str(), rep.copied.as_slice()), ("Y", ["b.txt".to_string()].as_slice()), "{rep:?}");
+    assert!(pc.root.join("Y").join("b.txt").is_file() && !pc.root.join("Z").join("b.txt").exists());
+
+    // A drag that ends at once is never announced after its Leave, whenever the lookup finishes.
+    for _ in 0..20 {
+        be.drop_enter(vec![a.clone()]);
+        be.drop_leave();
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let last = pc.out.events.lock().unwrap().iter().filter(|(n, _)| n == ev::DROP_STATE).map(|(_, v)| v["t"].clone()).next_back();
+    assert_eq!(last, Some(Value::from("leave")), "the overlay is not left showing");
     be.shutdown().await;
 }

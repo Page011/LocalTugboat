@@ -356,23 +356,34 @@ pub fn move_item(c: &mut Connection, ctx: &Ctx<'_>, id: ItemId, folder: FolderId
     relocate_if_held(c, ctx, id)
 }
 
+/// The display name `name` would give an item of type `ext`, or why it is refused.
+fn renamed_display(name: &str, ext: &str) -> Result<String> {
+    let stem = names::clean_stem(names::strip_ext(name, ext))?;
+    let display = names::join_ext(&stem, ext);
+    // A name that would be one of the always-refused ones (stem "desktop" + ext "ini") never starts.
+    if names::is_refused_name(&display) {
+        return Err(CoreError::Refused(names::REFUSED_TEXT.to_string()));
+    }
+    // A plain file without an extension cannot take a photo/video name: it would be placed
+    // under it and open as a photo.
+    if !names::plain_name_ok(&display, ext) {
+        return Err(media_err(names::NameError::NotMedia));
+    }
+    Ok(display)
+}
+
+/// Whether `rename_item` would accept `name`, without changing anything.
+pub fn check_rename(c: &Connection, id: ItemId, name: &str) -> Result<()> {
+    let (rec, _) = load_item(c, id)?;
+    renamed_display(name, &rec.content.val.ext).map(|_| ())
+}
+
 /// O4.
 pub fn rename_item(c: &mut Connection, ctx: &Ctx<'_>, id: ItemId, name: &str) -> Result<()> {
     {
         let tx = begin(c)?;
         let (rec, _) = load_item(&tx, id)?;
-        let ext = rec.content.val.ext.clone();
-        let stem = names::clean_stem(names::strip_ext(name, &ext))?;
-        let display = names::join_ext(&stem, &ext);
-        // A name that would be one of the always-refused ones (stem "desktop" + ext "ini") never starts.
-        if names::is_refused_name(&display) {
-            return Err(CoreError::Refused(names::REFUSED_TEXT.to_string()));
-        }
-        // A plain file without an extension cannot take a photo/video name: it would be placed
-        // under it and open as a photo.
-        if !names::plain_name_ok(&display, &ext) {
-            return Err(media_err(names::NameError::NotMedia));
-        }
+        let display = renamed_display(name, &rec.content.val.ext)?;
         if display == rec.name.val {
             // Same as move_item: a retry after a failed relocate must still relocate.
             drop(tx);
@@ -460,6 +471,17 @@ pub fn restore_item(c: &mut Connection, ctx: &Ctx<'_>, id: ItemId) -> Result<()>
 
 /// O7.
 pub fn content_changed(c: &mut Connection, ctx: &Ctx<'_>, id: ItemId, path: &Path) -> Result<()> {
+    // A file over the cap is refused from its size alone: hashing it would hold the database for
+    // the whole read, on every pass while it keeps growing. A same-size touch still hashes, so an
+    // unchanged file is not reported as too large.
+    {
+        let (rec, _) = load_item(c, id)?;
+        let max = store::load_settings(c)?.max_blob_bytes;
+        let on_disk = std::fs::metadata(path).map_err(|e| CoreError::io(path, e))?.len();
+        if on_disk > max && on_disk != rec.content.val.size {
+            return Err(CoreError::Refused(too_large_text(max)));
+        }
+    }
     let (hash, size) = hash_file(path)?;
     let tx = begin(c)?;
     let (rec, _) = load_item(&tx, id)?;

@@ -430,3 +430,58 @@ async fn a_files_thumbnail_is_never_fetched_or_shown() {
     assert_eq!(r.pc.record(id).unwrap().content.val.thumb, Some(Thumb { hash: BlobHash([5; 32]), size: 10 }), "stored unchanged: digests stay equal");
     r.shutdown().await;
 }
+
+// An edit that leaves a file over max_blob_bytes is refused from its size, before the file is
+// read: the file here is locked against reading, so a read would fail with an I/O error instead.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn an_oversized_edit_is_refused_without_reading_the_file() {
+    use std::{fs::OpenOptions, os::windows::fs::OpenOptionsExt};
+    let r = Rig::new().await;
+    let id = add(&r.pc, "log.txt", b"short");
+    r.pc.core.save_settings(&Settings { max_blob_bytes: 2_000, ..Settings::default() }).unwrap();
+    let big = r.pc.dir.path().join("grown.txt");
+    std::fs::write(&big, vec![b'x'; 3_000]).unwrap();
+    let _lock = OpenOptions::new().read(true).share_mode(0).open(&big).unwrap();
+    let e = r.pc.core.local_content_changed(id, big).unwrap_err();
+    assert!(matches!(&e, CoreError::Refused(_)), "{e:?}");
+    r.shutdown().await;
+}
+
+// A refused rename leaves the record and its file path as they were: nothing is half done that the
+// next pass would read as a change from the other device and undo.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_rename_does_not_move_the_file_path() {
+    let r = Rig::new().await;
+    let id = add(&r.pc, "Makefile", b"all:\n");
+    let folder = r.pc.record(id).unwrap().location.val.folder;
+    let path_of = |d: &Dev| d.core.debug_conn(|c| store::get_file_ref(c, id).unwrap().map(|f| f.path));
+    let before = path_of(&r.pc);
+    let moved = r.pc.dir.path().join("holiday.jpg");
+    let e = r.pc.core.local_file_moved(id, moved, folder, "holiday.jpg").unwrap_err();
+    assert!(matches!(e, CoreError::NotMedia(_)), "{e:?}");
+    assert_eq!(path_of(&r.pc), before, "the path was not rewritten");
+    assert_eq!(r.pc.record(id).unwrap().name.val, "Makefile");
+    r.shutdown().await;
+}
+
+// The storage-low banner ends with the session: with the PC away nothing downloads, so a banner
+// left on would outlive the user freeing the space.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_storage_low_flag_clears_when_the_session_ends() {
+    let pc = Dev::new(Role::Pc, "TEST-PC", &TestClock::new(T0));
+    let (phone, free, _fail) = Dev::phone_with_space("Test phone", &TestClock::new(T0), 1_000);
+    phone.core.save_settings(&Settings { storage_guard_bytes: 1_000, ..Settings::default() }).unwrap();
+    pair(&pc, &phone).await;
+    let rig = Rig { pc, phone };
+    rig.settle().await;
+    rig.apart().await;
+    let a = add(&rig.pc, "a.bin", &[1u8; 400]);
+    free.store(900, Ordering::SeqCst);
+    rig.together().await;
+    until("the guard is on", 20, || rig.phone.core.status().storage_low).await;
+    rig.pc.stop().await;
+    until("the flag clears with the session", 20, || !rig.phone.core.status().storage_low).await;
+    assert_ne!(rig.phone.local(a), Some(LocalFileState::Present));
+    rig.shutdown().await;
+}

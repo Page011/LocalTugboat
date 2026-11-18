@@ -2,6 +2,7 @@
 
 export type DropLine = { 
 /**
- * Empty when the line is about the whole drop.
+ * Empty when the line is about the whole drop (a refusal), or is a folder that could not be zipped (a failure:
+ * the reason names the folder).
  */
 name: string, reason: string, };

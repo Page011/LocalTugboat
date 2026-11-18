@@ -124,7 +124,7 @@ class SnapService : Service() {
          * A refusal is always in the log. It becomes a banner only when no start has succeeded within
          * [StartRefusal.GRACE_MS]: Android can refuse one start (a broadcast delivered after a force-stop, a worker with
          * no foreground standing) while the next one, from the opened app, works. A banner for the first would stay on
-         * screen although the service is running (known bug, 0.1.0).
+         * screen although the service is running.
          */
         fun start(c: Context, why: String = "?"): String? = try {
             c.applicationContext.startForegroundService(Intent(c.applicationContext, SnapService::class.java))

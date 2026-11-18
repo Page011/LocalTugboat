@@ -28,6 +28,9 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // A restored activity keeps the orientation the last one asked for: a recording lock left behind by a
+        // killed process must not outlive it.
+        if (savedInstanceState != null) requestedOrientation = UiLogic.recordingOrientation(false)
         enableEdgeToEdge()
         val actions = ShellActions(
             request = { kind ->

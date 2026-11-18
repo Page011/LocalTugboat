@@ -75,13 +75,15 @@ fn on_drag_drop(app: &AppHandle, e: &DragDropEvent) {
     let Some(state) = app.try_state::<Arc<Backend>>() else { return };
     let backend: Arc<Backend> = state.inner().clone();
     match e {
-        DragDropEvent::Enter { paths, .. } => backend.drop_enter(paths),
+        DragDropEvent::Enter { paths, .. } => backend.drop_enter(paths.clone()),
         DragDropEvent::Leave => backend.drop_leave(),
         DragDropEvent::Drop { paths, .. } => {
             let files = NativeDrop::from_native(paths);
+            // The folder is fixed here, at the drop; a drop that waits its turn keeps it.
+            let target = backend.drop_end();
             // A big copy must not freeze the window: its own thread. The result always arrives as an event.
             if let Err(e) = std::thread::Builder::new().name("tugboat-drop".into()).spawn(move || {
-                backend.drop_files(files);
+                backend.drop_files(files, target);
             }) {
                 tracing::error!("drop thread did not start: {e}");
             }

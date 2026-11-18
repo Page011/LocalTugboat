@@ -220,7 +220,9 @@ private fun FilePage(item: ItemInfo, note: String?, bin: Boolean, onOpen: () -> 
         when {
             note != null -> Text(note, color = Color.White, style = MaterialTheme.typography.titleMedium, textAlign = TextAlign.Center)
             bin -> Text("Restore it to open it", color = Color.White, style = MaterialTheme.typography.titleMedium, textAlign = TextAlign.Center)
-            else -> ActionButton(onClick = onOpen, modifier = Modifier.defaultMinSize(minHeight = 56.dp)) { Text("Open") }
+            UiLogic.canOpen(item, bin) -> ActionButton(onClick = onOpen, modifier = Modifier.defaultMinSize(minHeight = 56.dp)) { Text("Open") }
+            // Binned since this list was built: the provider serves items/ only, so there is nothing to open.
+            else -> Text("In the Bin", color = Color.White, style = MaterialTheme.typography.titleMedium, textAlign = TextAlign.Center)
         }
     }
 }

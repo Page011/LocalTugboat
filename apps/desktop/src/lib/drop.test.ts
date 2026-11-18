@@ -71,6 +71,15 @@ describe("the result", () => {
     const b = dropBanner(report({ refused: [{ name: "a.lnk", reason: "REFUSED" }], failed: [{ name: "big.mp4", reason: "COPY FAILED - The device is not ready." }] }));
     expect(b).toEqual({ tone: "danger", text: "2 FILES NOT COPIED", lines: ["a.lnk: REFUSED", "big.mp4: COPY FAILED - The device is not ready."] });
   });
+  test("a whole-drop line is the headline and the files refused before it are the lines, never counted as files", () => {
+    // 10 files dropped, x.lnk refused, then the drive is full: the count must not say "2 FILES".
+    const b = dropBanner(report({ refused: [{ name: "x.lnk", reason: "REFUSED" }, { name: "", reason: "NOT ENOUGH SPACE on D: - nothing copied" }] }));
+    expect(b).toEqual({ tone: "warn", text: "NOT ENOUGH SPACE on D: - nothing copied", lines: ["x.lnk: REFUSED"] });
+  });
+  test("a folder that failed to zip counts as an item, a whole-drop line does not", () => {
+    const b = dropBanner(report({ refused: [{ name: "a.lnk", reason: "REFUSED" }], failed: [{ name: "", reason: "ZIP FAILED - Trip: IMG_1.jpg locked" }] }));
+    expect(b).toEqual({ tone: "danger", text: "2 ITEMS NOT COPIED", lines: ["a.lnk: REFUSED", "ZIP FAILED - Trip: IMG_1.jpg locked"] });
+  });
   test("a whole-drop line has no name and no detail", () => {
     const b = dropBanner(report({ refused: [{ name: "", reason: "PAUSED - nothing copied" }] }));
     expect(b).toEqual({ tone: "warn", text: "PAUSED - nothing copied", detail: undefined });

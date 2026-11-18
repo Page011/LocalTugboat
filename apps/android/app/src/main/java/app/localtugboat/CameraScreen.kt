@@ -336,6 +336,9 @@ fun CameraScreen(vm: SnapViewModel, ui: UiState, banners: List<UiLogic.BannerUi>
                 is VideoRecordEvent.Status -> recordMs.longValue = ev.recordingStats.recordedDurationNanos / 1_000_000
                 is VideoRecordEvent.Finalize -> {
                     recording = null
+                    // Released here, not only when the effect above disposes: that waits for a recomposition, which
+                    // does not come while the app is stopped (and never, if the process is killed meanwhile).
+                    activity?.requestedOrientation = UiLogic.recordingOrientation(false)
                     if (ev.hasError()) {
                         // The file is still handed over when it has content: the core checks it, a recording is never thrown away here.
                         ctx.core.reportError("video: error ${ev.error} ${ev.cause?.message.orEmpty()}")

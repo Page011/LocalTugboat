@@ -321,7 +321,7 @@ class OutOfRoom : IOException("phone storage low")
 object Streams {
     /**
      * Copy [input] to [output], at most [maxBytes]. A source that streams on past the room left (a provider that gave
-     * no size, or lied) stops at once with [OutOfRoom]: one shared file must never fill the phone.
+     * no size, or lied) stops at once with [OutOfRoom].
      * Returns the bytes copied.
      */
     fun copyWithin(input: java.io.InputStream, output: java.io.OutputStream, maxBytes: Long): Long {
@@ -341,6 +341,21 @@ object Streams {
 object ShareImporter {
     /** Keep this much free after the copy: a full phone breaks more than Tugboat. */
     private const val FREE_MARGIN = 64L * 1024 * 1024
+
+    /**
+     * Why a share of [declared] bytes is refused up front, or null. A share is on the disk twice at its peak (the
+     * cache copy, then the core's copy into the library), so both must fit with [FREE_MARGIN] to spare.
+     * [maxBlob] = the core's per-file limit: refuse before copying what the core would refuse after.
+     */
+    fun refusal(declared: Long?, free: Long, maxBlob: Long): String? {
+        if (declared == null) return null
+        if (declared > maxBlob) return "too large"
+        if (declared > copyRoom(free, 0)) return "phone storage low"
+        return null
+    }
+
+    /** Most bytes the cache copy may take once [head] bytes are already read: half the free space beyond the margin. */
+    fun copyRoom(free: Long, head: Int): Long = (free - FREE_MARGIN) / 2 - head
 
     /** Blocking. One bad file never stops the others; each refusal is named in the result. [intentType] = the share intent's MIME type. */
     fun run(c: Context, uris: List<Uri>, intentType: String? = null): ShareResult {
@@ -374,7 +389,7 @@ object ShareImporter {
         val resolver = c.contentResolver
         val declared = size(c, uri)
         val free = c.core.phone().freeSpaceBytes().toLong()
-        if (declared != null && declared + FREE_MARGIN > free) throw Refusal("phone storage low")
+        refusal(declared, free, c.core.phone().settings().maxBlobBytes.toLong())?.let { throw Refusal(it) }
         val tmp = File(dir, "${UUID.randomUUID()}.tmp")
         var media: Media? = null
         try {
@@ -392,7 +407,7 @@ object ShareImporter {
                 media = ShareNames.mediaFor(label, MagicBytes.sniff(head, n))
                 tmp.outputStream().use { out ->
                     out.write(head, 0, n)
-                    Streams.copyWithin(ins, out, free - FREE_MARGIN - n)
+                    Streams.copyWithin(ins, out, copyRoom(free, n))
                 }
             }
         } catch (e: Exception) {

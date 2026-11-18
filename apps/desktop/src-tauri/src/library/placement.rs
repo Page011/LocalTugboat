@@ -113,6 +113,23 @@ fn remove_if_exists(p: &Path) -> Result<()> {
 /// Extension of the copy `move_across` makes next to its destination. It sits in the VISIBLE library folder, so the
 /// scan treats it as in progress (never imported) and the start-up clean-up removes one a crash left.
 pub const MOVE_EXT: &str = "tugboat-move";
+const MOVE_PREFIX: &str = ".tugboat-";
+
+/// A fresh name for that copy: `.tugboat-<32 hex>.tugboat-move`. A file the user or the phone brought in
+/// ("Notes.tugboat-move") never has this shape, so it is never taken for a leftover.
+fn move_temp_name() -> String {
+    format!("{MOVE_PREFIX}{}.{MOVE_EXT}", uuid::Uuid::now_v7().simple())
+}
+
+/// Is this file name one of this app's own move copies (see `move_temp_name`)?
+pub fn is_move_temp(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower
+        .strip_prefix(MOVE_PREFIX)
+        .and_then(|rest| rest.strip_suffix(MOVE_EXT))
+        .and_then(|rest| rest.strip_suffix('.'))
+        .is_some_and(|id| id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()))
+}
 
 /// Move a file; across drives (the Bin is under %LOCALAPPDATA%, the library may be anywhere)
 /// copy next to the destination, then rename, then delete the source. A failure at any step
@@ -124,7 +141,7 @@ pub fn move_across(from: &Path, to: &Path, replace: bool) -> io::Result<()> {
     match rename(from, to) {
         Ok(()) => Ok(()),
         Err(e) if e.raw_os_error() == Some(ERROR_NOT_SAME_DEVICE) => {
-            let tmp = to.with_extension(MOVE_EXT);
+            let tmp = to.with_file_name(move_temp_name());
             if let Err(e) = std::fs::copy(from, &tmp) {
                 let _ = std::fs::remove_file(&tmp);
                 return Err(e);
@@ -195,6 +212,9 @@ pub struct PcLibrary {
     /// Test seam: make the Mark-of-the-Web write fail (a drive that cannot hold it).
     #[cfg(test)]
     pub(crate) fail_marks: AtomicBool,
+    /// Test seam: `copy_marked` loses the mark, as a copy onto FAT/exFAT does.
+    #[cfg(test)]
+    pub(crate) strip_copy_marks: AtomicBool,
 }
 
 impl PcLibrary {
@@ -210,6 +230,8 @@ impl PcLibrary {
             adopted: Mutex::new(HashMap::new()),
             #[cfg(test)]
             fail_marks: AtomicBool::new(false),
+            #[cfg(test)]
+            strip_copy_marks: AtomicBool::new(false),
         }
     }
 
@@ -375,8 +397,24 @@ impl PcLibrary {
         })
     }
 
+    /// `std::fs::copy` that fails when the source has a Mark-of-the-Web and the copy did not get it: copying onto
+    /// FAT/exFAT drops the stream and reports success. The caller keeps its original (C4).
+    pub(crate) fn copy_marked(&self, from: &Path, to: &Path) -> io::Result<u64> {
+        let n = std::fs::copy(from, to)?;
+        #[cfg(test)]
+        if self.strip_copy_marks.load(Ordering::SeqCst) {
+            let _ = std::fs::remove_file(format!("{}:Zone.Identifier", to.display()));
+        }
+        match winfs::read_zone_mark(from) {
+            Some(mark) if winfs::read_zone_mark(to).as_deref() != Some(mark.as_str()) => {
+                Err(io::Error::other("NOT MARKED AS DOWNLOADED - the new drive cannot hold the mark"))
+            }
+            _ => Ok(n),
+        }
+    }
+
     /// Mark `part` as downloaded (C7). Fails closed: Err = nothing may appear in the library.
-    fn mark_downloaded(&self, part: &Path) -> Result<()> {
+    pub(crate) fn mark_downloaded(&self, part: &Path) -> Result<()> {
         #[cfg(test)]
         if self.fail_marks.load(Ordering::SeqCst) {
             return Err(CoreError::io(part, io::Error::other("test: marks are failing")));
@@ -517,7 +555,12 @@ impl Placement for PcLibrary {
         let name = self.disk_name(t, &bin_path)?;
         // Stage through `.tugboat` so a cross-drive restore is copy + rename on the library drive.
         let stage = self.part_dir()?.join(format!("{}.restore", t.item.0.hyphenated()));
-        std::fs::copy(&bin_path, &stage).map_err(|e| CoreError::io(&bin_path, e))?;
+        // A marked file that would come out unmarked (a library on FAT/exFAT) stays in the Bin, like a download
+        // that cannot be marked stays out of the library.
+        if let Err(e) = self.copy_marked(&bin_path, &stage) {
+            let _ = std::fs::remove_file(&stage);
+            return Err(CoreError::io(&bin_path, e));
+        }
         match place_new(&stage, &dir, &name, None) {
             Ok(dest) => {
                 if let Err(e) = remove_if_exists(&bin_path) {

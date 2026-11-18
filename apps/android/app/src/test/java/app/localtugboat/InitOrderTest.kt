@@ -8,14 +8,14 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * A1 (remote unpair), A2 (CameraX temp sweep) and A3 (SnapViewModel field order).
+ * Remote unpair, the CameraX temp sweep and the SnapViewModel field order.
  *
  * Nothing in the unit tests constructs SnapViewModel (it needs an Application and the native core), so a field used by
  * init but declared below it crashed the app at launch with every test green. [declaration_order] reads the source and
  * fails for that mistake.
  */
 class InitOrderTest {
-    // ---- A1: a remote unpair must not leave the success screen up ----
+    // ---- a remote unpair must not leave the success screen up ----
 
     @Test fun the_paired_with_screen_is_dropped_when_the_pairing_goes() {
         assertEquals(PairUi.Idle, UiLogic.pairingAfterUnpair(PairUi.Done("Office PC")))
@@ -44,7 +44,7 @@ class InitOrderTest {
         assertTrue(vm.substringAfter("fun unpair()").substringBefore("fun resetAfterUnpair").contains("resetAfterUnpair()"))
     }
 
-    // ---- A2: CameraX temp files left by a killed process ----
+    // ---- CameraX temp files left by a killed process ----
 
     @Test fun abandoned_camerax_temp_files_are_deleted_and_nothing_else() {
         val dir = Files.createTempDirectory("shots").toFile()
@@ -72,7 +72,7 @@ class InitOrderTest {
         assertTrue(source("Import.kt").substringAfter("fun recover(").contains("sweepCameraTemps(shotsDir(c), nowMs, minAgeMs)"))
     }
 
-    // ---- A3: no field is read before it is assigned ----
+    // ---- no field is read before it is assigned ----
 
     @Test fun declaration_order_guard_finds_the_launch_crash() {
         // the shape of the real bug: init -> refresh() -> a dispatcher declared further down

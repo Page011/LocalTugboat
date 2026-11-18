@@ -44,5 +44,11 @@ export function dropBanner(r: DropReport): { tone: "danger" | "warn"; text: stri
     const names = problems.map((l) => l.name).filter((n) => n !== "");
     return { tone, text: problems[0]!.reason, detail: names.length > 0 ? names.join(", ") : undefined };
   }
-  return { tone, text: `${problems.length} FILES NOT COPIED`, lines: problems.map((l) => (l.name === "" ? l.reason : `${l.name}: ${l.reason}`)) };
+  // A refused line with no name covers the whole drop ("NOT ENOUGH SPACE ... nothing copied"): it is the headline, not
+  // one more file. A failed line with no name is a folder that could not be zipped (its reason names the folder).
+  const whole = r.refused.find((l) => l.name === "");
+  const rest = problems.filter((l) => l !== whole);
+  const lines = rest.map((l) => (l.name === "" ? l.reason : `${l.name}: ${l.reason}`));
+  if (whole) return { tone, text: whole.reason, lines };
+  return { tone, text: `${rest.length} ${rest.some((l) => l.name === "") ? "ITEMS" : "FILES"} NOT COPIED`, lines };
 }

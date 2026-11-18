@@ -406,6 +406,7 @@ fn unpair_local(core: &Core, peer: DeviceId) -> Result<bool> {
     });
     match &r {
         Ok(true) => {
+            core.inner.storage_low.store(false, std::sync::atomic::Ordering::SeqCst);
             core.emit(Event::Pairing(PairingEvent::Unpaired { peer }));
             core.emit(Event::ActivityAdded);
             core.emit_status();
@@ -497,6 +498,9 @@ pub(crate) async fn run_session(core: Core, conn: Arc<PeerConn>, dialer: bool) {
         End::Net(e) => core.emit_error(e.kind(), &e.to_string()),
     }
     if current {
+        // Nothing downloads without a session: the storage-low banner would outlive the user
+        // freeing the space. The next session's first pass sets it again if it still holds.
+        set_storage_low(&core, None);
         match refused {
             Some(text) => core.set_state(SyncState::Refused, Some(text)),
             None => core.set_state(SyncState::Offline, None),
@@ -938,11 +942,14 @@ struct GuardPass {
     placement: Arc<dyn crate::placement::Placement>,
     /// Set when the guard held an item back in this pass: why.
     held_back: Option<String>,
+    /// Set when the pass stopped because every slot was taken: the scan did not reach the end, so
+    /// "nothing held back" says nothing about the items behind the last pick.
+    slots_full: bool,
 }
 
 impl GuardPass {
     fn new(core: &Core) -> GuardPass {
-        GuardPass { phone: core.inner.cfg.role == Role::Phone, placement: core.inner.placement.clone(), held_back: None }
+        GuardPass { phone: core.inner.cfg.role == Role::Phone, placement: core.inner.placement.clone(), held_back: None, slots_full: false }
     }
 
     /// No guard (tests that are not about the guard).
@@ -1039,6 +1046,7 @@ fn pick_into(
             for (captured_at, id) in &page {
                 after = Some((*captured_at, *id));
                 if out.len() >= slots {
+                    gp.slots_full = true;
                     break 'states;
                 }
                 let id = *id;
@@ -1149,7 +1157,9 @@ fn schedule(core: &Core, conn: &Arc<PeerConn>, peer: DeviceId, f: &mut Fetcher, 
             return;
         }
     };
-    if gp.phone {
+    // A pass that filled its slots may not have reached a held item: it can turn the flag on but
+    // never off, so the flag does not flap while small items are picked ahead of a big one.
+    if gp.phone && (gp.held_back.is_some() || !gp.slots_full) {
         set_storage_low(core, gp.held_back.take());
     }
     for (id, hash, was_lost) in picked {
@@ -1357,7 +1367,9 @@ struct CoreBlobSource {
 
 impl BlobSource for CoreBlobSource {
     fn open(&self, hash: &str) -> Option<PathBuf> {
-        lock(&self.core.inner.blob_requests).push(hash.to_string());
+        if self.core.inner.record_blob_requests.load(std::sync::atomic::Ordering::SeqCst) {
+            lock(&self.core.inner.blob_requests).push(hash.to_string());
+        }
         let raw: [u8; 32] = hex::decode(hash).ok()?.try_into().ok()?;
         let hash = BlobHash(raw);
         let from_items = {
@@ -1559,7 +1571,7 @@ mod tests {
     /// A phone-side guard pass that sees `free` bytes (the default guard is 2 GB).
     fn low_space_pass(dir: &std::path::Path, free: u64) -> GuardPass {
         let inner = AppStorage::new(dir.join("storage")).unwrap();
-        GuardPass { phone: true, placement: Arc::new(LowSpace { inner, free }), held_back: None }
+        GuardPass { phone: true, placement: Arc::new(LowSpace { inner, free }), held_back: None, slots_full: false }
     }
 
     fn pick_with(core: &Core, f: &Fetcher, slots: usize, gp: &mut GuardPass) -> Vec<(ItemId, BlobHash, bool)> {
@@ -1634,6 +1646,26 @@ mod tests {
         let got = pick_with(&core, &Fetcher::default(), 2, &mut gp);
         assert_eq!(got.iter().map(|g| g.0).collect::<Vec<_>>(), vec![items[1].0]);
         assert!(gp.held_back.is_none(), "a duplicate held by a task never turns storage_low on");
+    }
+
+    // A pass that fills its slots stops before the items behind the last pick, so it cannot say
+    // whether one of them is held: it reports that, and `schedule` then leaves the flag alone.
+    #[tokio::test]
+    async fn a_pass_that_fills_its_slots_says_it_did_not_see_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = open_core(dir.path());
+        let guard = crate::model::Settings::default().storage_guard_bytes;
+        let items = add_items(&core, 2, LocalFileState::Pending);
+        // Room for the first item only: with one slot the pass picks it and never reaches the second.
+        let mut gp = low_space_pass(dir.path(), guard + 150);
+        let got = pick_with(&core, &Fetcher::default(), 1, &mut gp);
+        assert_eq!(got.iter().map(|g| g.0).collect::<Vec<_>>(), vec![items[0].0]);
+        assert!(gp.slots_full && gp.held_back.is_none());
+        lock(&core.inner.fetching).clear();
+        // With a slot to spare the scan reaches the second item and reports the hold.
+        let mut gp = low_space_pass(dir.path(), guard + 150);
+        pick_with(&core, &Fetcher::default(), 2, &mut gp);
+        assert!(!gp.slots_full && gp.held_back.is_some());
     }
 
     // A download task outlives its session. Right after a reconnect the new session's `Fetcher` is

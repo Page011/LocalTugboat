@@ -107,8 +107,11 @@ pub(crate) struct Inner {
     pub storage_low: std::sync::atomic::AtomicBool,
     /// How long a blocked download queue waits before it looks at the free space again (ms).
     pub guard_recheck_ms: AtomicU64,
-    /// Hash (hex) of every blob or thumbnail request this device answered or refused (tests
-    /// assert "zero", or that one hash was never asked for).
+    /// Tests only: record the hash of each blob request (`debug_record_blob_requests`). Off in the
+    /// apps, so the list below never grows there.
+    pub record_blob_requests: std::sync::atomic::AtomicBool,
+    /// Hash (hex) of every blob or thumbnail request this device answered or refused while
+    /// recording (tests assert "zero", or that one hash was never asked for).
     pub blob_requests: Mutex<Vec<String>>,
     /// Content hashes with a download task alive (any session). Two tasks must never write the
     /// same part file, and a task outlives the session that started it. The value is the declared
@@ -162,6 +165,7 @@ impl Core {
                 notice_running: std::sync::atomic::AtomicBool::new(false),
                 storage_low: std::sync::atomic::AtomicBool::new(false),
                 guard_recheck_ms: AtomicU64::new(30_000),
+                record_blob_requests: std::sync::atomic::AtomicBool::new(false),
                 blob_requests: Mutex::new(Vec::new()),
                 fetching: Mutex::new(std::collections::HashMap::new()),
             }),
@@ -283,8 +287,15 @@ impl Core {
         self.inner.guard_recheck_ms.store(ms.max(1), Ordering::SeqCst);
     }
 
-    /// Test hook: how many blob or thumbnail requests the peer has made of this device (a refused
-    /// record must cost zero).
+    /// Test hook: start recording the blob requests the peer makes (off by default: the list is
+    /// unbounded).
+    #[doc(hidden)]
+    pub fn debug_record_blob_requests(&self) {
+        self.inner.record_blob_requests.store(true, Ordering::SeqCst);
+    }
+
+    /// Test hook: how many blob or thumbnail requests the peer has made of this device since
+    /// recording started (a refused record must cost zero).
     #[doc(hidden)]
     pub fn debug_blob_requests(&self) -> usize {
         lock(&self.inner.blob_requests).len()
@@ -715,6 +726,12 @@ impl Core {
             // The file is already at its new place: point the record at it first, so the
             // placement's relocate during move/rename finds it there (C6).
             let old = store::get_file_ref(c, id)?;
+            // A name the record refuses is found out before the path is written: otherwise the
+            // path stays changed, the refused rename reads as done and the next pass puts the
+            // user's file back under its old name.
+            if rec.name.val != name {
+                ops::check_rename(c, id, name)?;
+            }
             store::put_file_ref(
                 c,
                 &store::FileRef {

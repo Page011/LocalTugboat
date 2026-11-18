@@ -6,7 +6,8 @@
 //!   `shell.rs`). No Tauri command takes a path to copy, so a script running in the page cannot make
 //!   the app copy an arbitrary file; a test reads the sources to keep it that way.
 //! - The source is only ever read (CopyFileExW): a USB stick can be pulled right after "copied".
-//!   Its own Mark-of-the-Web, if it has one, comes along; none is added (the user's own file).
+//!   Its own Mark-of-the-Web, if it has one, comes along; none is added (the user's own file). A zip is
+//!   marked when any file inside it is, because Explorer passes a zip's mark on to what it unpacks.
 //! - The copy (or the zip) is made in the hidden `.tugboat` folder under a temp name and only then placed in
 //!   the library with a free name (hard link or checked rename), so the library never lists a half file.
 //! - A failure is always a line in the report (refused or failed), never silent.
@@ -88,7 +89,8 @@ pub struct DropProgress {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 pub struct DropLine {
-    /// Empty when the line is about the whole drop.
+    /// Empty when the line is about the whole drop (a refusal), or is a folder that could not be zipped (a failure:
+    /// the reason names the folder).
     pub name: String,
     pub reason: String,
 }
@@ -287,6 +289,13 @@ pub fn copy_dropped(lib: &Library, drop: NativeDrop, target: &DropTarget, progre
                     rep.failed.push(DropLine { name: String::new(), reason: e.text(&name) });
                     continue;
                 }
+                // Unzipping hands the zip's mark to every file, so a marked file inside must mark the zip: a
+                // folder keeps what a single dropped file keeps. A drive that cannot hold it gets no zip.
+                if plan.entries.iter().filter_map(|e| e.source.as_deref()).any(|p| winfs::read_zone_mark(p).is_some()) && lib.inner.place.mark_downloaded(&tmp).is_err() {
+                    let _ = std::fs::remove_file(&tmp);
+                    rep.failed.push(DropLine { name: String::new(), reason: format!("ZIP FAILED - {name}: this drive cannot keep the downloaded mark") });
+                    continue;
+                }
                 let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64);
                 (format!("{name}.zip"), now)
             }
@@ -307,7 +316,8 @@ pub fn copy_dropped(lib: &Library, drop: NativeDrop, target: &DropTarget, progre
 }
 
 /// Remove copies left behind by a quit or crash: a drop's (`.tugboat\drop-*.tmp`) and a cross-drive move's
-/// (`*.tugboat-move` in the library root or one of its folders, see `placement::MOVE_EXT`). Returns how many.
+/// (`.tugboat-<id>.tugboat-move` in the library root or one of its folders, see `placement::is_move_temp`: a
+/// file of the user's own that merely ends in `.tugboat-move` is left alone). Returns how many.
 pub fn clean_stale(root: &Path) -> usize {
     let mut n = 0;
     if let Ok(rd) = std::fs::read_dir(root.join(crate::library::config::HIDDEN_DIR)) {
@@ -318,7 +328,7 @@ pub fn clean_stale(root: &Path) -> usize {
             }
         }
     }
-    let is_move_copy = |p: &Path| p.extension().is_some_and(|x| x.eq_ignore_ascii_case(crate::library::placement::MOVE_EXT));
+    let is_move_copy = |p: &Path| p.file_name().is_some_and(|n| crate::library::placement::is_move_temp(&n.to_string_lossy()));
     let mut remove_in = |dir: &Path| {
         if let Ok(rd) = std::fs::read_dir(dir) {
             for e in rd.flatten() {
