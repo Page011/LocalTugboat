@@ -24,7 +24,7 @@ render_svg(B + r"\tugboat-logo.svg", tmp, VBW, VBH, bg="#ffffff")
 r = np.asarray(Image.open(tmp).convert("RGB")).astype(float).mean(axis=2)
 canvas = np.full((1254, 1254), 254.0)
 canvas[OY : OY + VBH, OX : OX + VBW] = r
-src = np.asarray(Image.open(r"C:\Users\Nigel\Downloads\Tugboat.png").convert("RGB")).astype(float).mean(axis=2)
+src = np.asarray(Image.open(source_png()).convert("RGB")).astype(float).mean(axis=2)
 LEVEL = 146
 A = src < LEVEL
 Bm = canvas < LEVEL

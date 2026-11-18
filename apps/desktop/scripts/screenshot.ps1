@@ -22,11 +22,29 @@ public static class Win {
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int cmd);
     [DllImport("user32.dll")] public static extern void SwitchToThisWindow(IntPtr hWnd, bool altTab);
     [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
-    [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(POINT p);
-    [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr hWnd, int flags);
-    [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
+    [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr hWnd, uint cmd);
     [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr hwnd, int attr, out RECT rect, int size);
+    [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr hwnd, int attr, out int value, int size);
     [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
+    // The first visible window ABOVE h in the z-order (topmost ones included) whose frame
+    // overlaps r, as its title (or "(untitled)"); null when nothing covers r. Minimized and
+    // DWM-cloaked windows (other virtual desktops, hidden UWP shells) are not on screen.
+    public static string Covering(IntPtr h, RECT r) {
+        for (IntPtr w = GetWindow(h, 3); w != IntPtr.Zero; w = GetWindow(w, 3)) {   // GW_HWNDPREV
+            if (!IsWindowVisible(w) || IsIconic(w)) continue;
+            int cloaked = 0;
+            if (DwmGetWindowAttribute(w, 14, out cloaked, 4) == 0 && cloaked != 0) continue;   // DWMWA_CLOAKED
+            RECT f;
+            if (DwmGetWindowAttribute(w, 9, out f, Marshal.SizeOf(typeof(RECT))) != 0) continue;
+            if (f.Right <= f.Left || f.Bottom <= f.Top) continue;
+            if (f.Left < r.Right && f.Right > r.Left && f.Top < r.Bottom && f.Bottom > r.Top) {
+                var sb = new StringBuilder(256);
+                GetWindowText(w, sb, 256);
+                return sb.Length > 0 ? sb.ToString() : "(untitled)";
+            }
+        }
+        return null;
+    }
     public static IntPtr Find(string title) {
         IntPtr found = IntPtr.Zero;
         EnumWindows((h, l) => {
@@ -64,21 +82,22 @@ function Get-Rect {
     return $r
 }
 
-# CopyFromScreen captures whatever is on top, so the window must really be on top at its centre.
-# If another window covers it, ask again a few times; if it still is not on top, stop rather
-# than photograph someone else's windows.
+# CopyFromScreen captures whatever is on top, so nothing may be above the window anywhere in
+# its rectangle: every visible window above it in the z-order is checked (not a sample of
+# points, which would miss a small toast between them). If one overlaps, ask again a few times;
+# if it still does, stop rather than photograph someone else's windows.
 $onTop = $false
+$cover = $null
 for ($try = 0; $try -lt 5 -and -not $onTop; $try++) {
     [Win]::SetForegroundWindow($h) | Out-Null
     # SwitchToThisWindow is not held back by the foreground lock while the user is typing elsewhere.
     if ($try -gt 0) { [Win]::SwitchToThisWindow($h, $true) }
     Start-Sleep -Milliseconds 400
     $r = Get-Rect
-    $pt = New-Object Win+POINT
-    $pt.X = [int](($r.Left + $r.Right) / 2); $pt.Y = [int](($r.Top + $r.Bottom) / 2)
-    $onTop = ([Win]::GetAncestor([Win]::WindowFromPoint($pt), 2) -eq $h)
+    $cover = [Win]::Covering($h, $r)
+    $onTop = ($null -eq $cover)
 }
-if (-not $onTop) { Write-Error "'$Title' is covered by another window; nothing captured"; exit 2 }
+if (-not $onTop) { Write-Error "'$Title' is covered by another window ('$cover'); nothing captured"; exit 2 }
 $w = $r.Right - $r.Left
 $ht = $r.Bottom - $r.Top
 if ($w -le 0 -or $ht -le 0) { Write-Error "Window has no size"; exit 1 }

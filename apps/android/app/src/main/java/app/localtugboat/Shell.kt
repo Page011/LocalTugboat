@@ -87,6 +87,15 @@ private fun MainNav(vm: SnapViewModel, ui: UiState, actions: ShellActions) {
     val holder = rememberSaveableStateHolder()
     BackHandler(enabled = nav.routes.size > 1) { nav.back() }
 
+    // A viewer that left the stack must not keep its saved pager page: opening the same photo again starts on that photo.
+    val seen = remember { mutableSetOf<Route>() }
+    val routesNow = nav.routes.toList()
+    LaunchedEffect(routesNow) {
+        seen += routesNow
+        for (key in UiLogic.droppedViewerKeys(seen, routesNow)) holder.removeState(key)
+        seen.retainAll(routesNow.toSet())
+    }
+
     val banners = remember(ui) { UiLogic.banners(ui, ZoneId.systemDefault()) }
     val onBanner: (UiLogic.BannerUi) -> Unit = { b ->
         fun ask(k: PermKind) = if (k in hardDenied) actions.openAppSettings() else actions.request(k)

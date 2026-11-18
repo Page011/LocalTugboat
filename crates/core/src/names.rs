@@ -233,6 +233,8 @@ pub fn clean_stem(raw_name: &str) -> Result<String, NameError> {
     if s.is_empty() {
         return Err(NameError::Empty);
     }
+    // Capping and trimming can leave a device name ("CON" + spaces + "x" -> "CON"): check the result.
+    check_reserved(&s)?;
     Ok(s)
 }
 
@@ -260,7 +262,8 @@ pub fn disk_file_name(record_name: &str, ext: &str, head: &[u8], captured_at_ms:
     let stem = match clean_stem(strip_ext(record_name, &ext)) {
         Ok(s) => {
             let capped = cap_utf16(&s, room);
-            if capped.is_empty() {
+            // The smaller room can cut a name down to a device name too.
+            if capped.is_empty() || check_reserved(&capped).is_err() {
                 fallback_stem(captured_at_ms)
             } else {
                 capped
@@ -282,6 +285,8 @@ pub fn clean_folder_name(raw: &str) -> Result<String, NameError> {
     if s.is_empty() {
         return Err(NameError::Empty);
     }
+    // Capping and trimming can leave a device name ("CON" + spaces + "x" -> "CON"): check the result.
+    check_reserved(&s)?;
     Ok(s)
 }
 
@@ -490,6 +495,19 @@ mod tests {
         assert!(name.starts_with("IMG_"), "{name}");
         let (name, _) = disk_file_name("a:b.jpg", "jpg", &jpeg(), 1_794_000_000_000).unwrap();
         assert!(name.starts_with("IMG_"), "colon falls back: {name}");
+    }
+
+    // Truncation must not turn an allowed name into a device name.
+    #[test]
+    fn reserved_name_left_by_truncation_is_refused() {
+        let long = format!("CON{}x", " ".repeat(147));
+        assert!(matches!(clean_stem(&long), Err(NameError::Reserved(_))));
+        assert!(matches!(clean_folder_name(&long), Err(NameError::Reserved(_))));
+        // 149 units: passes the 150 cap, but disk_file_name's room for ".jpg" cuts it down to "CON".
+        let mid = format!("CON{}x", " ".repeat(145));
+        assert!(clean_stem(&mid).is_ok());
+        let (name, _) = disk_file_name(&mid, "jpg", &jpeg(), 1_794_000_000_000).unwrap();
+        assert!(name.starts_with("IMG_") && name.ends_with(".jpg"), "{name}");
     }
 
     // L23: 150-unit cap keeps the extension.

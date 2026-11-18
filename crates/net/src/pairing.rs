@@ -169,16 +169,31 @@ fn pct_decode(s: &str) -> Result<String, PairError> {
 
 impl PairPayload {
     /// Encode to the text format above.
+    ///
+    /// The text always fits `MAX_PAYLOAD_LEN`, the limit `parse` enforces: when the percent-encoded
+    /// name is too long (every non-ASCII char costs 9 to 12 bytes), trailing chars of the name are
+    /// dropped. The phone gets the full PC name from the Accepted decision anyway.
     pub fn encode(&self) -> String {
         let addrs: Vec<String> = self.addrs.iter().map(|a| a.to_string()).collect();
-        format!(
-            "{PAYLOAD_PREFIX}v=1&k={}&a={}&s={}&e={}&n={}",
-            hex::encode(self.pc_key),
-            addrs.join(","),
-            self.secret.to_hex(),
-            self.expires_at_ms,
-            pct_encode(&self.pc_name)
-        )
+        let build = |name: &str| {
+            format!(
+                "{PAYLOAD_PREFIX}v=1&k={}&a={}&s={}&e={}&n={}",
+                hex::encode(self.pc_key),
+                addrs.join(","),
+                self.secret.to_hex(),
+                self.expires_at_ms,
+                pct_encode(name)
+            )
+        };
+        let mut name: &str = &self.pc_name;
+        loop {
+            let text = build(name);
+            if text.len() <= MAX_PAYLOAD_LEN || name.is_empty() {
+                return text;
+            }
+            let cut = name.char_indices().next_back().map(|(i, _)| i).unwrap_or(0);
+            name = &name[..cut];
+        }
     }
 
     /// Parse and validate. Every failure is `PairError::BadPayload{reason}` naming the field:
@@ -498,7 +513,10 @@ pub async fn pc_read_hello(conn: &PeerConn, timeout: Duration) -> Result<(SendSt
 /// the bytes (closing the connection earlier can drop them). The caller closes the connection
 /// afterwards (`close::NORMAL` on accept, `close::PAIRING_CLOSED` on refusal).
 ///
-/// `Ok` means the phone received the whole decision. Core completes the pairing on the PC only
+/// `Ok` means the transport acknowledged every byte of the decision. A STOP_SENDING from the
+/// phone (`stopped()` = `Some(code)`) is not that: the phone may have stopped before the whole
+/// frame arrived, so it is an error. The normal phone path reads to the end and never sends it.
+/// Core completes the pairing on the PC only
 /// after `Ok` for an `Accepted` decision: on `Err` the phone may never have heard it, and a
 /// PC that is paired with a phone that is not would be a silent half-pairing.
 pub async fn pc_send_decision(tx: &mut SendStream, decision: &PairDecision) -> Result<(), NetError> {
@@ -506,10 +524,17 @@ pub async fn pc_send_decision(tx: &mut SendStream, decision: &PairDecision) -> R
     tx.finish().map_err(|e| stream_err("finish decision", &e))?;
     match tokio::time::timeout(DELIVERY_TIMEOUT, tx.stopped()).await {
         Err(_) => Err(NetError::Timeout("the phone did not confirm it received the decision".into())),
-        // Ok(None): all data acknowledged. Ok(Some(_)): the phone stopped reading after it had
-        // the whole frame. Both mean delivered.
-        Ok(Ok(_)) => Ok(()),
+        Ok(Ok(stop)) => decision_delivery(stop.map(|c| c.into_inner())),
         Ok(Err(e)) => Err(stream_err("deliver decision", &e)),
+    }
+}
+
+/// `SendStream::stopped` result to delivery: `None` = all data acknowledged, `Some(code)` = the
+/// receiver stopped the stream, which does not prove it got the whole frame.
+pub(crate) fn decision_delivery(stop_code: Option<u64>) -> Result<(), NetError> {
+    match stop_code {
+        None => Ok(()),
+        Some(code) => Err(NetError::Stream(format!("the phone stopped reading the decision (code {code})"))),
     }
 }
 
@@ -550,32 +575,44 @@ pub struct PhonePairing {
 }
 
 impl PhonePairing {
-    /// Waits for the PC's decision, bounded by `timeout` (CONFIRM_TIMEOUT_MS + 10 s in core).
-    /// Accepted -> Ok(pc_name, cleaned). Refused -> Err(NetError::Pairing(reason)).
+    /// Step 2a: wait for the PC's decision frame, bounded by `timeout` (CONFIRM_TIMEOUT_MS + 10 s
+    /// in core). Cancel safe: dropping the future before it returns abandons the exchange.
     /// Connection closed without a decision -> Err(NetError::ClosedByPeer / Stream).
-    pub async fn wait_decision(mut self, timeout: Duration) -> Result<String, NetError> {
+    pub async fn read_decision(&mut self, timeout: Duration) -> Result<PairDecision, NetError> {
         let got = tokio::time::timeout(timeout, read_frame_limited::<PairDecision>(&mut self.rx, MAX_PAIR_FRAME))
             .await
             .map_err(|_| NetError::Timeout(format!("no decision from the PC within {}s", timeout.as_secs())))??;
-        let decision = match got {
-            Some(d) => d,
-            None => {
-                return Err(match self.conn.conn.close_reason() {
-                    Some(e) => map_conn_err(&e),
-                    None => NetError::Stream("the PC ended the pairing stream without a decision".into()),
-                })
-            }
-        };
+        match got {
+            Some(d) => Ok(d),
+            None => Err(match self.conn.conn.close_reason() {
+                Some(e) => map_conn_err(&e),
+                None => NetError::Stream("the PC ended the pairing stream without a decision".into()),
+            }),
+        }
+    }
+
+    /// Step 2b, after `read_decision`: let the PC see the decision arrived, then leave. Accepted
+    /// -> Ok(pc_name, cleaned). Refused -> Err(NetError::Pairing(reason)). Once the decision is
+    /// read the PC may already have completed its side, so a caller must not abandon this step
+    /// (it takes up to DELIVERY_TIMEOUT + 2 s) before it stores the pairing.
+    pub async fn finish(self, decision: PairDecision) -> Result<String, NetError> {
+        let mut this = self;
         // Read the stream to its end before leaving: that is what tells the PC the decision
         // arrived. Closing first would make a delivered decision look undelivered on the PC.
         let mut one = [0u8; 1];
-        let _ = tokio::time::timeout(DELIVERY_TIMEOUT, self.rx.read(&mut one)).await;
+        let _ = tokio::time::timeout(DELIVERY_TIMEOUT, this.rx.read(&mut one)).await;
         // The PC closes after it sees the delivery; give it a moment, then leave ourselves.
-        let _ = tokio::time::timeout(Duration::from_secs(2), self.conn.conn.closed()).await;
-        self.conn.close(close::NORMAL, "pairing finished");
+        let _ = tokio::time::timeout(Duration::from_secs(2), this.conn.conn.closed()).await;
+        this.conn.close(close::NORMAL, "pairing finished");
         match decision {
             PairDecision::Accepted { pc_name } => Ok(clean_name(&pc_name, "PC")),
             PairDecision::Refused { reason } => Err(NetError::Pairing(reason)),
         }
+    }
+
+    /// Both steps in one call (tests and callers that never cancel).
+    pub async fn wait_decision(mut self, timeout: Duration) -> Result<String, NetError> {
+        let decision = self.read_decision(timeout).await?;
+        self.finish(decision).await
     }
 }

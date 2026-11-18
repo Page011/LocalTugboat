@@ -3,10 +3,12 @@ import json
 import numpy as np
 from PIL import Image, ImageDraw
 from scipy import ndimage
-from lib import S
+from lib import S, source_png
 
 B = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-src = np.asarray(Image.open(r"C:\Users\Nigel\Downloads\Tugboat.png").convert("RGB"))
+R = os.environ.get("TUG_RENDERS", B + r"\renders")
+os.makedirs(R, exist_ok=True)
+src = np.asarray(Image.open(source_png()).convert("RGB"))
 cv = np.asarray(Image.open(S + r"\logo_on_canvas.png").convert("L"))
 srcg = src.astype(float).mean(axis=2)
 A = srcg < 146
@@ -26,7 +28,7 @@ d = ImageDraw.Draw(side)
 d.text((10, 15), "Tugboat.png (original)", fill=(0, 0, 0))
 d.text((w + 40, 15), "tugboat-logo.svg (rendered 1:1)", fill=(0, 0, 0))
 d.line([(w + 15, 0), (w + 15, h + 50)], fill=(180, 180, 180))
-side.save(B + r"\renders\compare-side-by-side.png")
+side.save(R + r"\compare-side-by-side.png")
 
 # difference overlay: grey = both dark, red = only in original, blue = only in SVG
 ov = np.full(A.shape + (3,), 255, np.uint8)
@@ -39,5 +41,5 @@ dd = ImageDraw.Draw(im)
 dd.rectangle([455 - X0, 700 - Y0, 540 - X0, 795 - Y0], outline=(0, 160, 0))
 dd.text((10, 8), "grey = both, red = original only, blue = SVG only, green box = approved porthole change", fill=(0, 0, 0))
 im = im.resize((w * 2, h * 2), Image.NEAREST)
-im.save(B + r"\renders\compare-diff-overlay.png")
+im.save(R + r"\compare-diff-overlay.png")
 print("saved")

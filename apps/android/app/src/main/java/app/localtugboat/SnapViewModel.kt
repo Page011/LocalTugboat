@@ -6,6 +6,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -189,9 +190,13 @@ class SnapViewModel(app: Application) : AndroidViewModel(app) {
 
     // ---- state ----
 
+    /** One refresh at a time, in call order: an older read must never publish after a newer one (stale paired/unpaired). */
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private val refreshDispatcher = Dispatchers.IO.limitedParallelism(1)
+
     /** Re-read the small facts behind the banners. Safe to call often. */
     fun refresh() {
-        viewModelScope.launch(Dispatchers.IO) {
+        viewModelScope.launch(refreshDispatcher) {
             val perms = Perms.snapshot(ctx)
             try {
                 val p = core.phone()
@@ -263,13 +268,16 @@ class SnapViewModel(app: Application) : AndroidViewModel(app) {
         if (_pairing.value is PairUi.Dialing || _pairing.value is PairUi.Code) return
         _pairing.value = PairUi.Dialing
         viewModelScope.launch(Dispatchers.IO) {
-            core.hold("pairing").join() // pairing needs the endpoint up
+            // The hold is inside the try: if this job is cancelled while waiting for it, the release in finally still runs.
             try {
+                core.hold("pairing").join() // pairing needs the endpoint up
                 val pc = core.phone().pairWith(payload)
                 _pairing.value = PairUi.Done(pc.name)
                 // The service takes over the network hold before "pairing" lets go: no gap in between.
                 ServiceGate.startIfWanted(ctx, "paired")
                 refresh()
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 val line = Texts.pairFailure(e, Perms.localNetworkAllowed(ctx))
                 // The onboarding screen shows this failure; a banner after a later success would be stale, so log only.
@@ -380,16 +388,23 @@ class SnapViewModel(app: Application) : AndroidViewModel(app) {
 
     // ---- settings and maintenance ----
 
+    /** Settings are saved as one whole record: read, change one field, save must not interleave with another setter. */
+    private val settingsLock = Any()
+
     fun setStayConnected(on: Boolean) = act("Settings") {
-        val p = core.phone()
-        p.saveSettings(p.settings().copy(stayConnected = on))
-        if (on) ServiceGate.startIfWanted(ctx, "setting on") else SnapService.stop(ctx)
+        synchronized(settingsLock) {
+            val p = core.phone()
+            p.saveSettings(p.settings().copy(stayConnected = on))
+            if (on) ServiceGate.startIfWanted(ctx, "setting on") else SnapService.stop(ctx)
+        }
         refresh()
     }
 
     fun setBinDays(days: UInt) = act("Settings") {
-        val p = core.phone()
-        p.saveSettings(p.settings().copy(binDays = days))
+        synchronized(settingsLock) {
+            val p = core.phone()
+            p.saveSettings(p.settings().copy(binDays = days))
+        }
         refresh()
     }
 

@@ -155,10 +155,12 @@ pub fn build_tray(app: &AppHandle) -> tauri::Result<()> {
 /// thumbnails folder is a 404.
 pub fn thumb_response(ctx: tauri::UriSchemeContext<'_, tauri::Wry>, request: tauri::http::Request<Vec<u8>>) -> tauri::http::Response<Vec<u8>> {
     let respond = |status: u16, body: Vec<u8>| {
+        // A 404 is never cached: the thumbnail may be made a moment later and the tile asks again.
+        let cache = if status == 200 { "private, max-age=3600" } else { "no-store" };
         tauri::http::Response::builder()
             .status(status)
             .header("Content-Type", "image/jpeg")
-            .header("Cache-Control", "private, max-age=3600")
+            .header("Cache-Control", cache)
             .body(body)
             .unwrap_or_default()
     };

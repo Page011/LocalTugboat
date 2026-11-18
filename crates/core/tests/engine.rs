@@ -343,3 +343,19 @@ fn a_peer_with_the_same_role_is_a_protocol_error() {
     let err = pc.sess.handle(&mut pc.db.conn, hello, T0).unwrap_err();
     assert_eq!(err.kind(), "protocol");
 }
+
+// A paired peer's Hello cannot pin the lamport clock at its maximum: the session ends as a
+// protocol error and the local clock is untouched, so local writes keep working.
+#[test]
+fn a_hello_with_an_absurd_lamport_is_a_protocol_error_and_leaves_the_clock_alone() {
+    let (_phone, mut pc) = pair_up();
+    let before = store::max_lamport(&pc.db.conn).unwrap();
+    for max_lamport in [u64::MAX, i64::MAX as u64] {
+        let hello = Msg::Hello { proto: tugboat_core::sync::wire::PROTO, app_version: "x".into(), device_name: "x".into(), role: Role::Phone, max_lamport };
+        let err = pc.sess.handle(&mut pc.db.conn, hello, T0).unwrap_err();
+        assert_eq!(err.kind(), "protocol", "{max_lamport}");
+        pc.sess = Session::new(key(0xAA), key(0xBB), Role::Pc, "t");
+    }
+    assert_eq!(store::max_lamport(&pc.db.conn).unwrap(), before);
+    assert_eq!(store::next_version(&pc.db.conn, pc.id).unwrap().lamport, before + 1, "local writes still work");
+}

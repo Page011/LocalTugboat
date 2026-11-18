@@ -1,5 +1,19 @@
 import { describe, expect, test } from "bun:test";
-import { arrowTarget, GRID, gridLayout, innerWidth, tileWidth, visibleRows } from "./virtual";
+import { arrowTarget, focusIndexFor, GRID, gridLayout, innerWidth, tileWidth, visibleRows } from "./virtual";
+
+describe("focusIndexFor", () => {
+  const ids = (...s: string[]) => s.map((id) => ({ id }));
+  test("follows the selected item when new items arrive at the top", () => {
+    const before = ids("A", "B", "C");
+    expect(focusIndexFor(before, "B", 0)).toBe(1);
+    const after = [...ids("X"), ...before];
+    expect(focusIndexFor(after, "B", 1)).toBe(2);
+  });
+  test("a selection that is not in the list falls back to the number", () => {
+    expect(focusIndexFor(ids("A", "B"), "gone", 1)).toBe(1);
+    expect(focusIndexFor(ids("A", "B"), null, 0)).toBe(0);
+  });
+});
 
 describe("gridLayout", () => {
   test("fits as many columns as the width allows", () => {

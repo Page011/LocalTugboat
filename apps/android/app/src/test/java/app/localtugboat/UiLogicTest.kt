@@ -321,8 +321,62 @@ class UiLogicTest {
         assertEquals("100 KB", UiLogic.bytes(100L shl 10))
     }
 
+    // ---- shutter folder (the chip's target may be stale for a moment after a pick) ----
+
+    private val ids = listOf("inbox", "keep", "site")
+
+    @Test fun an_explicit_pick_that_exists_wins_even_over_a_target_computed_for_another_pick() {
+        assertEquals("keep", UiLogic.shotFolder("keep", ids, "inbox", null))
+        assertEquals("keep", UiLogic.shotFolder("keep", ids, "site", "site")) // stale target for an older pick
+    }
+
+    @Test fun a_deleted_pick_uses_the_target_computed_for_that_same_pick() {
+        assertEquals("inbox", UiLogic.shotFolder("gone", ids, "inbox", "gone"))
+    }
+
+    @Test fun a_fresh_target_for_automatic_is_used() {
+        assertEquals("site", UiLogic.shotFolder(null, ids, "site", null))
+    }
+
+    @Test fun a_stale_target_with_automatic_is_not_used_so_the_place_rule_decides_at_hand_off() {
+        assertNull(UiLogic.shotFolder(null, ids, "keep", "keep")) // the pick was just cleared, target is still the old pick's
+        assertNull(UiLogic.shotFolder(null, ids, null, null)) // no target yet
+        assertNull(UiLogic.shotFolder("gone", ids, "inbox", "other")) // pick deleted and target for something else
+    }
+
+    // ---- saved viewer state ----
+
+    @Test fun a_viewer_that_left_the_stack_loses_its_saved_state_and_others_keep_it() {
+        val a = Route.Viewer(null, false, "a")
+        val c = Route.Viewer(null, false, "c")
+        val seen = setOf<Route>(Route.Camera, Route.Gallery(null), a, c)
+        // a was popped, c is still on the stack (under Settings): only a is dropped.
+        assertEquals(setOf(a.toString()), UiLogic.droppedViewerKeys(seen, listOf(Route.Camera, c, Route.Settings)))
+        // the same viewer opened again is on the stack: kept.
+        assertTrue(UiLogic.droppedViewerKeys(seen, listOf(Route.Camera, Route.Gallery(null), a, c)).isEmpty())
+        // non-viewer routes are never dropped, even when gone.
+        assertTrue(UiLogic.droppedViewerKeys(setOf(Route.Gallery(null), Route.Settings, Route.Bin), listOf(Route.Camera)).isEmpty())
+    }
+
     @Test fun bin_choices_always_include_the_current_value() {
         assertEquals(listOf(1u, 3u, 7u, 14u, 30u), UiLogic.binChoices(7u))
         assertEquals(listOf(1u, 3u, 7u, 10u, 14u, 30u), UiLogic.binChoices(10u))
+    }
+
+    // ---- R3: a deleted folder is never handed to the core by a cached target ----
+
+    @Test fun a_cached_target_whose_folder_was_deleted_is_not_used() {
+        assertNull(UiLogic.shotFolder(null, ids, "gone", null)) // automatic, target cached for automatic, folder deleted since
+        assertNull(UiLogic.shotFolder("gone", ids, "gone", "gone")) // deleted pick, target cached for that pick, also deleted
+    }
+
+    // ---- R4: the full-size photo is decoded again when the held file's content changes ----
+
+    @Test fun the_photo_decode_key_follows_path_size_and_thumbnail() {
+        val base = UiLogic.photoDecodeKey("items/a.jpg", 100uL, "thumbs/h1.jpg")
+        assertEquals(base, UiLogic.photoDecodeKey("items/a.jpg", 100uL, "thumbs/h1.jpg"))
+        assertFalse(base == UiLogic.photoDecodeKey("items/a.jpg", 101uL, "thumbs/h1.jpg")) // edited, size changed
+        assertFalse(base == UiLogic.photoDecodeKey("items/a.jpg", 100uL, "thumbs/h2.jpg")) // edited, same size, new thumbnail
+        assertFalse(base == UiLogic.photoDecodeKey("items/b.jpg", 100uL, "thumbs/h1.jpg"))
     }
 }

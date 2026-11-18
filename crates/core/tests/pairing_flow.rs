@@ -4,8 +4,11 @@
 mod common;
 
 use std::{
+    future::Future,
+    pin::Pin,
     process::{Command, Stdio},
     sync::Arc,
+    task::{Context, Poll, Waker},
     time::Duration,
 };
 
@@ -16,6 +19,7 @@ use tugboat_core::{
 };
 use tugboat_net::{
     node::{AccessGate, Node, NodeConfig, Role as NetRole},
+    pairing::{pc_read_hello, pc_send_decision, PairDecision, PairingWindow},
     NetError, ALPN_SYNC,
 };
 
@@ -88,6 +92,7 @@ async fn s12b_cancel_on_the_pc_stores_nothing() {
     assert_eq!(pairing_code_of(&err), "cancelled");
     until("phone event", 5, || r.phone.cancelled().is_some()).await;
     assert_eq!(r.phone.cancelled().unwrap(), ("cancelled".into(), "Pairing cancelled".into()));
+    until("PC event", 5, || r.pc.cancelled().is_some()).await;
     assert_eq!(r.pc.cancelled().unwrap().0, "cancelled");
     for d in [&r.pc, &r.phone] {
         assert!(d.core.paired_device().unwrap().is_none(), "{}: nothing stored", d.name);
@@ -121,6 +126,7 @@ async fn s12c_second_use_of_the_secret_cancels_for_both_phones() {
     until("the PC saw the cancellation", 10, || pc.cancelled().is_some()).await;
     assert_eq!(pc.cancelled().unwrap(), ("secret_reused".into(), "PAIRING BLOCKED - someone else used this code".into()));
     for d in [&a, &b] {
+        until("the phone saw the cancellation", 10, || d.cancelled().is_some()).await;
         assert_eq!(d.cancelled().unwrap().0, "secret_reused", "{}", d.name);
         assert!(d.core.paired_device().unwrap().is_none());
     }
@@ -150,6 +156,7 @@ async fn s12d_expiry_wrong_secret_and_replace_rules() {
     // Expiry: the PC clock passes the 2 minutes.
     r.pc.clock.advance(121_000);
     r.pc.core.tick().unwrap();
+    until("the PC saw the expiry", 10, || r.pc.cancelled().is_some()).await;
     assert_eq!(r.pc.cancelled().unwrap().0, "expired");
     assert_eq!(r.pc.cancelled().unwrap().1, "PAIRING CODE EXPIRED - show a new QR");
     let err = r.phone.core.pair_with(&payload).await.unwrap_err();
@@ -167,6 +174,121 @@ async fn s12d_expiry_wrong_secret_and_replace_rules() {
     // A garbage QR is a pairing error, not a crash.
     let err = r.phone.core.pair_with("hello").await.unwrap_err();
     assert_eq!(pairing_code_of(&err), "bad_payload");
+    r.shutdown().await;
+}
+
+// The PC's confirm waits up to 15 s for the phone to take the decision. A window opened during that
+// wait is a new one: confirm must not close it or shut the pairing port behind it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_window_opened_during_confirm_is_left_alone() {
+    let r = Rig::unconnected();
+    r.pc.start().await;
+    r.phone.start().await;
+    let payload = r.pc.core.begin_pairing(false).unwrap();
+    let phone = r.phone.core.clone();
+    let task = tokio::spawn(async move { phone.pair_with(&payload).await });
+    until("codes", 10, || r.pc.code().is_some() && r.phone.code().is_some()).await;
+
+    // Run confirm up to its delivery wait, then open a new window while it is parked there.
+    let pc = r.pc.core.clone();
+    let mut confirm = Box::pin(async move { pc.confirm_pairing(true).await });
+    let first = Pin::new(&mut confirm).poll(&mut Context::from_waker(Waker::noop()));
+    // Always true, however fast the loopback round trip is: confirm takes the spent window and
+    // closes the port before its first await. (The delivery wait itself waits on a transport ACK
+    // that a test cannot hold, so on a very slow runner the first poll may be Ready.)
+    assert!(!r.pc.core.pairing_open(), "confirm took the spent window before its delivery wait");
+    let new_payload = r.pc.core.begin_pairing(true).unwrap();
+    match first {
+        Poll::Ready(res) => res.unwrap(),
+        Poll::Pending => confirm.await.unwrap(),
+    }
+    task.await.unwrap().unwrap();
+
+    assert!(r.pc.core.pairing_open(), "the new window is still open");
+    // And its QR still works: a second phone gets as far as the code.
+    let other = Dev::new(Role::Phone, "other phone", &TestClock::new(T0));
+    other.start().await;
+    let oc = other.core.clone();
+    let codes = r.pc.count_events(|e| matches!(e, Event::Pairing(PairingEvent::Code { .. })));
+    let t2 = tokio::spawn(async move { oc.pair_with(&new_payload).await });
+    until("the second phone's code reaches the PC", 10, || r.pc.count_events(|e| matches!(e, Event::Pairing(PairingEvent::Code { .. }))) > codes).await;
+    r.pc.core.confirm_pairing(false).await.unwrap();
+    let _ = t2.await;
+    other.stop().await;
+    r.shutdown().await;
+}
+
+// The user taps Cancel on the phone after the PC's decision has arrived: the pairing is already
+// stored on the PC, so it must be stored on the phone too. (The cancel used to drop the whole
+// exchange while the phone still waited for the PC to close, leaving the PC paired and the phone not.)
+#[tokio::test(flavor = "multi_thread")]
+async fn cancel_after_the_decision_arrived_still_completes_the_pairing() {
+    let phone = Dev::new(Role::Phone, "Test phone", &TestClock::new(T0));
+    phone.start().await;
+    let node = Node::start(NodeConfig { bind: "127.0.0.1:0".parse().unwrap(), role: NetRole::Pc, mdns: false, secret_key: random_secret() }, Arc::new(AllowAll)).await.unwrap();
+    node.set_pairing_open(true);
+    let mut window = PairingWindow::open(node.id(), T0).unwrap();
+    let payload = window.payload(node.qr_addrs(), "Fake PC").encode();
+
+    // A PC that accepts at once and then keeps the connection open: the phone's last step waits for the close.
+    // Readiness is signalled, never timed: `decided` fires once the whole decision is acknowledged
+    // by the phone's transport (so it is buffered there and beats the cancel); the connection
+    // stays open until `release`, which the test sends only after the phone is done, so no close
+    // can race the phone's read. (The phone leaves by itself 2 s after the PC's stream ends.)
+    let (decided_tx, decided_rx) = tokio::sync::oneshot::channel::<()>();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let fake = node.clone();
+    let pc_task = tokio::spawn(async move {
+        let acc = fake.accept().await.unwrap().unwrap();
+        let (mut tx, hello) = pc_read_hello(&acc.peer, Duration::from_secs(10)).await.unwrap();
+        window.on_hello(acc.peer.peer(), &hello, T0 + 1).unwrap();
+        window.confirm(T0 + 2).unwrap();
+        pc_send_decision(&mut tx, &PairDecision::Accepted { pc_name: "Fake PC".into() }).await.unwrap();
+        let _ = decided_tx.send(());
+        let _ = release_rx.await;
+        drop(acc);
+    });
+
+    let cancel = Arc::new(tokio::sync::Notify::new());
+    let (core, c2) = (phone.core.clone(), cancel.clone());
+    let task = tokio::spawn(async move {
+        let mut cancelled = std::pin::pin!(c2.notified());
+        cancelled.as_mut().enable();
+        core.pair_with_cancel(&payload, &mut cancelled).await
+    });
+    until("the phone shows the code", 10, || phone.code().is_some()).await;
+    tokio::time::timeout(Duration::from_secs(30), decided_rx).await.expect("the decision was delivered in time").unwrap(); // the decision is in; the phone waits for the close
+    cancel.notify_waiters();
+    let row = task.await.unwrap().expect("the cancel came too late to undo the pairing");
+    let _ = release_tx.send(());
+    assert_eq!(row.id, tugboat_core::DeviceId(node.id()));
+    assert!(phone.core.paired_device().unwrap().is_some(), "the phone stored the pairing");
+    pc_task.abort();
+    phone.stop().await;
+    node.shutdown().await;
+}
+
+// And before the decision a cancel still ends the exchange at once.
+#[tokio::test(flavor = "multi_thread")]
+async fn cancel_before_the_decision_ends_the_pairing_and_stores_nothing() {
+    let r = Rig::unconnected();
+    r.pc.start().await;
+    r.phone.start().await;
+    let payload = r.pc.core.begin_pairing(false).unwrap();
+    let cancel = Arc::new(tokio::sync::Notify::new());
+    let (core, c2) = (r.phone.core.clone(), cancel.clone());
+    let task = tokio::spawn(async move {
+        let mut cancelled = std::pin::pin!(c2.notified());
+        cancelled.as_mut().enable();
+        core.pair_with_cancel(&payload, &mut cancelled).await
+    });
+    until("codes", 10, || r.pc.code().is_some() && r.phone.code().is_some()).await;
+    cancel.notify_waiters();
+    let err = task.await.unwrap().unwrap_err();
+    assert_eq!(pairing_code_of(&err), "cancelled");
+    until("the phone saw the cancellation", 10, || r.phone.cancelled().is_some()).await;
+    assert_eq!(r.phone.cancelled().unwrap().0, "cancelled");
+    assert!(r.phone.core.paired_device().unwrap().is_none());
     r.shutdown().await;
 }
 
@@ -217,8 +339,8 @@ async fn s14b_unpair_while_apart_is_learned_on_the_next_connect() {
 
 struct AllowAll;
 impl AccessGate for AllowAll {
-    fn is_paired(&self, _: &[u8; 32]) -> bool {
-        true
+    fn is_paired(&self, _: &[u8; 32]) -> Result<bool, String> {
+        Ok(true)
     }
 }
 
@@ -247,17 +369,42 @@ async fn s15_unpaired_third_key_gets_nothing() {
 
 // ---------- S21: the fake_phone example against an in-process PC ----------
 
+/// The cargo flags that build into the profile directory this test binary lives in
+/// (`target/<profile>/deps/<test>`): `debug` is the dev profile, `release` is `--release`, any
+/// other name is a custom profile.
+fn profile_args(profile_dir: &str) -> Vec<String> {
+    match profile_dir {
+        "debug" => vec![],
+        "release" => vec!["--release".into()],
+        other => vec!["--profile".into(), other.into()],
+    }
+}
+
 fn fake_phone_exe() -> std::path::PathBuf {
     let me = std::env::current_exe().unwrap();
-    let debug = me.parent().and_then(|p| p.parent()).expect("target/debug").to_path_buf();
-    let exe = debug.join("examples").join(format!("fake_phone{}", std::env::consts::EXE_SUFFIX));
+    let profile_dir = me.parent().and_then(|p| p.parent()).expect("target/<profile>").to_path_buf();
+    let exe = profile_dir.join("examples").join(format!("fake_phone{}", std::env::consts::EXE_SUFFIX));
     if !exe.exists() {
-        // `cargo test --test x` does not build examples: build this one.
+        // `cargo test --test x` does not build examples: build this one, in the same profile
+        // (a `--release` test run looks in target/release, not target/debug).
         let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-        let ok = Command::new(cargo).args(["build", "-p", "tugboat-core", "--example", "fake_phone"]).status().unwrap().success();
+        let profile = profile_dir.file_name().and_then(|n| n.to_str()).expect("profile directory name").to_string();
+        let ok = Command::new(cargo)
+            .args(["build", "-p", "tugboat-core", "--example", "fake_phone"])
+            .args(profile_args(&profile))
+            .status()
+            .unwrap()
+            .success();
         assert!(ok && exe.exists(), "could not build the fake_phone example at {}", exe.display());
     }
     exe
+}
+
+#[test]
+fn the_example_is_built_in_the_profile_the_test_runs_in() {
+    assert!(profile_args("debug").is_empty());
+    assert_eq!(profile_args("release"), vec!["--release"]);
+    assert_eq!(profile_args("dist"), vec!["--profile", "dist"]);
 }
 
 async fn run_fake(args: Vec<String>) -> (bool, String) {

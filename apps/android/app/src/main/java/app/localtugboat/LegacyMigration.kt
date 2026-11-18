@@ -168,7 +168,8 @@ object LegacyMigration {
             else -> newDb.exists()
         }
         if (dbWentOver) {
-            for (s in SIDECARS) rename(filesDir, OLD_DB + s, NEW_DB + s, "")
+            // A -wal or -journal left behind holds committed data: a core opened without it loses it, so it stops the core. -shm is rebuilt by SQLite.
+            for (s in SIDECARS) rename(filesDir, OLD_DB + s, NEW_DB + s, "", main = s != "-shm")
             val backups = filesDir.listFiles { f -> f.isFile && f.name.startsWith("$OLD_DB.bak-") }.orEmpty().sortedBy { it.name }
             for (b in backups) rename(filesDir, b.name, NEW_DB + b.name.removePrefix(OLD_DB), "")
         }

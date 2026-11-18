@@ -79,7 +79,7 @@ try {
     const hit = await evaluate(`(() => {
       const want = ${JSON.stringify(arg)};
       const els = [...document.querySelectorAll("button, summary, [role=option]")];
-      const el = els.find((e) => (e.getAttribute("aria-label") ?? e.innerText).trim() === want) ?? els.find((e) => e.innerText.trim().startsWith(want));
+      const el = els.find((e) => (e.getAttribute("aria-label") ?? e.innerText).trim() === want);
       if (!el) return false;
       el.click();
       return true;

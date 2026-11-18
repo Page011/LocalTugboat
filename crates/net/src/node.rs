@@ -83,15 +83,19 @@ pub struct NodeConfig {
 
 /// Decides which remote keys may use the sync ALPN. Implemented by tugboat-core
 /// (paired = device row with paired_at set and unpaired_at null). Must not block.
+///
+/// `Err` means the answer could not be found (a database fault), which is not the same as "not
+/// paired": the connection is closed without `NOT_PAIRED`, because the other device answers that
+/// code by deleting its pairing.
 pub trait AccessGate: Send + Sync + 'static {
-    fn is_paired(&self, peer: &[u8; 32]) -> bool;
+    fn is_paired(&self, peer: &[u8; 32]) -> Result<bool, String>;
 }
 
 /// Endpoint hooks that enforce PLAN Network "An unknown key gets nothing else".
 /// - before_connect: `Reject` if the EndpointAddr has any relay URL or any IP address that
 ///   `local::is_local_addr` rejects (second line behind `Node::dial`'s own check).
 /// - after_handshake, ALPN_SYNC: `Reject{close::NOT_PAIRED, "not paired"}` unless
-///   `gate.is_paired(remote_id)`. Applies to both sides (the phone also refuses a PC it
+///   `gate.is_paired(remote_id)` is `Ok(true)`; a gate `Err` rejects with `close::NORMAL`. Applies to both sides (the phone also refuses a PC it
 ///   no longer pairs with).
 /// - after_handshake, ALPN_PAIR on an incoming (server side) connection:
 ///   `Reject{close::PAIRING_CLOSED}` unless `pairing_open` is true (belt and braces with the
@@ -132,11 +136,16 @@ impl EndpointHooks for GateHooks {
         };
         let alpn = conn.alpn();
         if alpn == ALPN_SYNC {
-            if self.gate.0.is_paired(conn.remote_id().as_bytes()) {
-                AfterHandshakeOutcome::Accept
-            } else {
-                debug!(peer = %conn.remote_id().fmt_short(), "sync refused: key not paired");
-                reject(close::NOT_PAIRED, "not paired")
+            match self.gate.0.is_paired(conn.remote_id().as_bytes()) {
+                Ok(true) => AfterHandshakeOutcome::Accept,
+                Ok(false) => {
+                    debug!(peer = %conn.remote_id().fmt_short(), "sync refused: key not paired");
+                    reject(close::NOT_PAIRED, "not paired")
+                }
+                Err(e) => {
+                    warn!(peer = %conn.remote_id().fmt_short(), "sync refused: could not check pairing: {e}");
+                    reject(close::NORMAL, "could not check pairing")
+                }
             }
         } else if alpn == ALPN_PAIR {
             if conn.side().is_client() || self.pairing_open.load(Ordering::SeqCst) {

@@ -138,9 +138,17 @@ pub fn max_lamport(c: &Connection) -> Result<u64> {
     Ok(to_u(v))
 }
 
+/// Largest lamport this device accepts from a peer. Far above any real edit count; a value near
+/// i64::MAX would pin the clock so `next_version` (value + 1) fails and every local write with it.
+pub const MAX_LAMPORT: u64 = 1 << 62;
+
 /// Raise the stored lamport to `seen` if higher (every remote version and the handshake's
-/// max_lamport go through this BEFORE any local write in the same session).
+/// max_lamport go through this BEFORE any local write in the same session). A value above
+/// `MAX_LAMPORT` is a protocol error and writes nothing.
 pub fn observe_lamport(c: &Connection, seen: u64) -> Result<()> {
+    if seen > MAX_LAMPORT {
+        return Err(CoreError::Protocol("version out of range".into()));
+    }
     c.execute("UPDATE lamport SET value = MAX(value, ?1) WHERE id = 1", [to_i(seen)])?;
     Ok(())
 }
@@ -444,15 +452,25 @@ pub fn items_holding(c: &Connection, hash: BlobHash) -> Result<Vec<ItemId>> {
 
 /// Ids of items in the given local states, oldest captured first, at most `limit`.
 pub fn items_in_state(c: &Connection, states: &[LocalFileState], limit: u32) -> Result<Vec<ItemId>> {
+    Ok(items_in_state_after(c, states, None, limit)?.into_iter().map(|(_, id)| id).collect())
+}
+
+/// Same order, as (captured_at, id), starting after `after` (a keyset cursor taken from the last
+/// row of the previous page), so a caller can walk past rows it skips.
+pub fn items_in_state_after(c: &Connection, states: &[LocalFileState], after: Option<(i64, ItemId)>, limit: u32) -> Result<Vec<(i64, ItemId)>> {
     if states.is_empty() {
         return Ok(Vec::new());
     }
     // The strings come from lfs_str (fixed set), never from outside, so inlining is safe.
     let list = states.iter().map(|s| format!("'{}'", lfs_str(*s))).collect::<Vec<_>>().join(", ");
     let mut st = c.prepare(&format!(
-        "SELECT id FROM item WHERE local_file_state IN ({list}) ORDER BY captured_at, id LIMIT ?1"
+        "SELECT captured_at, id FROM item WHERE local_file_state IN ({list})          AND (?2 IS NULL OR captured_at > ?2 OR (captured_at = ?2 AND id > ?3)) ORDER BY captured_at, id LIMIT ?1"
     ))?;
-    let rows = st.query_map([limit as i64], |r| Ok(ItemId(Uuid::from_bytes(b16(r, 0)?))))?;
+    let (cap, id): (Option<i64>, Option<Vec<u8>>) = match after {
+        Some((cap, id)) => (Some(cap), Some(id.0.as_bytes().to_vec())),
+        None => (None, None),
+    };
+    let rows = st.query_map(params![limit as i64, cap, id], |r| Ok((r.get::<_, i64>(0)?, ItemId(Uuid::from_bytes(b16(r, 1)?)))))?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
@@ -879,9 +897,18 @@ pub fn get_file_ref(c: &Connection, item: ItemId) -> Result<Option<FileRef>> {
     .optional()?)
 }
 
+/// Upsert on item_id. If the NTFS identity is already recorded for another item, that item
+/// loses only the identity (its path stays); a REPLACE would delete its whole row.
 pub fn put_file_ref(c: &Connection, r: &FileRef) -> Result<()> {
+    if let (Some(vol), Some(fid)) = (r.volume_serial, r.file_id) {
+        c.execute(
+            "UPDATE file_ref SET volume_serial = NULL, file_id = NULL WHERE volume_serial = ?1 AND file_id = ?2 AND item_id <> ?3",
+            params![vol as i64, &fid[..], r.item.0.as_bytes().as_slice()],
+        )?;
+    }
     c.execute(
-        "INSERT OR REPLACE INTO file_ref (item_id, path, volume_serial, file_id) VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO file_ref (item_id, path, volume_serial, file_id) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(item_id) DO UPDATE SET path = excluded.path, volume_serial = excluded.volume_serial, file_id = excluded.file_id",
         params![
             r.item.0.as_bytes().as_slice(),
             r.path,
@@ -1517,6 +1544,26 @@ mod tests {
         assert_eq!(item_by_path(&db.conn, "C:\\lib\\a.jpg").unwrap(), Some(id));
         delete_file_ref(&db.conn, id).unwrap();
         assert_eq!(get_file_ref(&db.conn, id).unwrap(), None);
+    }
+
+    // An NTFS identity claimed by a second item must not delete the first item's whole row.
+    #[test]
+    fn put_file_ref_identity_conflict_keeps_the_other_path() {
+        let db = Db::open_in_memory().unwrap();
+        let (a, b) = (ItemId(Uuid::from_u128(1)), ItemId(Uuid::from_u128(2)));
+        let fa = FileRef { item: a, path: "C:/lib/a.jpg".into(), volume_serial: Some(5), file_id: Some([9; 16]) };
+        let fb = FileRef { item: b, path: "C:/lib/b.jpg".into(), volume_serial: Some(5), file_id: Some([9; 16]) };
+        put_file_ref(&db.conn, &fa).unwrap();
+        put_file_ref(&db.conn, &fb).unwrap();
+        let got_a = get_file_ref(&db.conn, a).unwrap().expect("A keeps its row");
+        assert_eq!(got_a.path, fa.path);
+        assert_eq!((got_a.volume_serial, got_a.file_id), (None, None), "A lost only the identity");
+        assert_eq!(get_file_ref(&db.conn, b).unwrap(), Some(fb.clone()));
+        assert_eq!(item_by_file_id(&db.conn, 5, [9; 16]).unwrap(), Some(b));
+        // Same item again: plain update.
+        let fb2 = FileRef { path: "C:/lib/b2.jpg".into(), ..fb };
+        put_file_ref(&db.conn, &fb2).unwrap();
+        assert_eq!(get_file_ref(&db.conn, b).unwrap(), Some(fb2));
     }
 
     // L25: settings defaults, validation, unparsable stored value names the key.

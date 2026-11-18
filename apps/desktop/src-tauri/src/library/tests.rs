@@ -687,6 +687,62 @@ fn choosing_a_new_library_copies_held_files_first_then_switches() {
     assert_eq!(r.lib.status().health, LibraryHealth::Ready);
 }
 
+/// R5: a hidden folder passes the "must be empty" check, so its files can sit exactly where a
+/// copy is about to go. The copy must refuse, never overwrite, and clean-up must not delete it.
+#[test]
+fn a_file_hidden_in_the_new_folder_is_never_overwritten_by_the_move() {
+    let mut r = Rig::new();
+    r.write("Work/a.jpg", 1);
+    r.settle();
+    let before = held_paths(&r);
+    let new_root = r._tmp.path().join("newlib");
+    let work = new_root.join("Work");
+    std::fs::create_dir_all(&work).unwrap();
+    let theirs = jpeg(9, 80);
+    std::fs::write(work.join("a.jpg"), &theirs).unwrap();
+    crate::winfs::hide(&work).unwrap();
+    let e = r.lib.choose(&new_root, false).unwrap_err();
+    assert!(e.message.contains("already exists"), "{}", e.message);
+    assert_eq!(std::fs::read(work.join("a.jpg")).unwrap(), theirs, "the user's own file is untouched");
+    assert_eq!(held_paths(&r), before, "every record still points at the old library");
+    assert!(r.root.join("Work").join("a.jpg").exists());
+    assert_eq!(r.lib.root().as_deref(), Some(r.root.as_path()));
+    assert_eq!(r.lib.status().health, LibraryHealth::Ready, "sync is not left paused");
+}
+
+/// R6: the old file goes only while it is still what was copied.
+#[test]
+fn an_old_file_is_deleted_only_while_it_is_what_was_copied() {
+    use super::reconcile::remove_if_unchanged;
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, dst) = (tmp.path().join("src.jpg"), tmp.path().join("dst.jpg"));
+    // Untouched: the copy keeps the source's time and length, so it is deleted.
+    std::fs::write(&src, jpeg(1, 64)).unwrap();
+    std::fs::copy(&src, &dst).unwrap();
+    assert!(remove_if_unchanged(&src, &dst));
+    assert!(!src.exists());
+    // Edited to a different length after the copy: kept.
+    std::fs::write(&src, jpeg(1, 64)).unwrap();
+    std::fs::copy(&src, &dst).unwrap();
+    std::fs::write(&src, jpeg(2, 99)).unwrap();
+    assert!(!remove_if_unchanged(&src, &dst));
+    assert_eq!(std::fs::read(&src).unwrap(), jpeg(2, 99));
+    // Same length, newer time (an in-place edit): kept.
+    std::fs::write(&src, jpeg(1, 64)).unwrap();
+    std::fs::copy(&src, &dst).unwrap();
+    std::fs::write(&src, jpeg(3, 64)).unwrap();
+    let f = std::fs::OpenOptions::new().write(true).open(&src).unwrap();
+    f.set_modified(std::time::SystemTime::now() + Duration::from_secs(60)).unwrap();
+    drop(f);
+    assert!(!remove_if_unchanged(&src, &dst));
+    assert_eq!(std::fs::read(&src).unwrap(), jpeg(3, 64));
+    // Source or copy missing: nothing to delete, reported as kept.
+    assert!(!remove_if_unchanged(&tmp.path().join("gone.jpg"), &dst));
+    std::fs::remove_file(&dst).unwrap();
+    assert!(!remove_if_unchanged(&src, &dst));
+    assert!(src.exists());
+}
+
 #[test]
 fn a_cloud_synced_location_is_refused_unless_the_user_insists() {
     let r = Rig::new();
@@ -712,6 +768,189 @@ fn a_failed_copy_leaves_the_old_library_untouched() {
     assert_eq!(r.lib.root().as_deref(), Some(r.root.as_path()));
     assert!(p.exists());
     assert_eq!(r.items().len(), 1);
+}
+
+/// Make `Locate` / `Choose` fail at the config write: a directory where the temp file goes.
+fn block_config_save(data: &Path) -> PathBuf {
+    let blocker = data.join("library.json.tmp");
+    std::fs::create_dir_all(&blocker).unwrap();
+    blocker
+}
+
+fn held_paths(r: &Rig) -> Vec<(ItemId, String)> {
+    let mut v: Vec<_> = r.core.held_files().unwrap().into_iter().map(|h| (h.item, h.path)).collect();
+    v.sort_by(|a, b| a.1.cmp(&b.1));
+    v
+}
+
+fn copy_dir(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for e in std::fs::read_dir(from).unwrap() {
+        let e = e.unwrap();
+        let dest = to.join(e.file_name());
+        if e.file_type().unwrap().is_dir() {
+            copy_dir(&e.path(), &dest);
+        } else {
+            std::fs::copy(e.path(), &dest).unwrap();
+        }
+    }
+}
+
+#[test]
+fn a_failed_config_save_is_retried_and_the_directory_map_reaches_the_disk() {
+    let mut r = Rig::new();
+    let blocker = block_config_save(&r.data);
+    std::fs::create_dir(r.root.join("Work")).unwrap();
+    r.scan(0);
+    let err = r.lib.status().last_error.expect("the failed save is shown");
+    assert!(err.contains("CANNOT SAVE LIBRARY CONFIG"), "{err}");
+    std::fs::remove_dir(&blocker).unwrap();
+    // Nothing changed on disk since: the retry must still happen.
+    r.scan(1);
+    assert_eq!(r.lib.status().last_error, None);
+    let cfg = LibraryConfig::load(&r.data).unwrap();
+    assert!(cfg.dirs.values().any(|e| e.name == "Work"), "library.json holds the new folder: {cfg:?}");
+}
+
+#[test]
+fn a_failed_choose_after_the_copies_rolls_everything_back_and_can_be_retried() {
+    let mut r = Rig::new();
+    r.write("a.jpg", 1);
+    r.write("Work/b.jpg", 2);
+    r.settle();
+    let before = held_paths(&r);
+    assert_eq!(before.len(), 2);
+    let blocker = block_config_save(&r.data);
+    let new_root = r._tmp.path().join("newlib");
+    assert!(r.lib.choose(&new_root, false).is_err(), "the config cannot be saved");
+    // The records, the old files, the config and the placement are all still the old library.
+    assert_eq!(held_paths(&r), before, "every record points at the old root again");
+    assert!(r.root.join("a.jpg").exists() && r.root.join("Work").join("b.jpg").exists());
+    assert!(!new_root.join("a.jpg").exists() && !new_root.join("Work").join("b.jpg").exists(), "the copies are gone");
+    assert!(!new_root.join(".tugboat").join("library-id").exists(), "the new marker is gone");
+    assert_eq!(r.lib.root().as_deref(), Some(r.root.as_path()));
+    assert_eq!(r.place.root().as_deref(), Some(r.root.as_path()));
+    assert_eq!(LibraryConfig::load(&r.data).unwrap().path.as_deref(), Some(r.root.as_path()));
+    assert_eq!(r.lib.status().health, LibraryHealth::Ready, "sync is not left paused");
+    let rep = r.scan(1);
+    assert_eq!((rep.imported, rep.binned, rep.moved), (0, 0, 0), "{rep:?}");
+    // The blocker gone, the same choice works.
+    std::fs::remove_dir(&blocker).unwrap();
+    r.lib.choose(&new_root, false).unwrap();
+    assert_eq!(r.lib.root().as_deref(), Some(new_root.as_path()));
+    assert!(new_root.join("a.jpg").exists() && new_root.join("Work").join("b.jpg").exists());
+    assert_eq!(LibraryConfig::load(&r.data).unwrap().path.as_deref(), Some(new_root.as_path()));
+}
+
+#[test]
+fn a_failed_locate_leaves_the_records_the_config_and_the_placement_on_the_old_root() {
+    let mut r = Rig::new();
+    r.write("a.jpg", 1);
+    r.write("Work/b.jpg", 2);
+    r.settle();
+    let before = held_paths(&r);
+    // The same library, copied elsewhere (marker included): the folder to Locate.
+    let copy = r._tmp.path().join("copy");
+    copy_dir(&r.root, &copy);
+    let blocker = block_config_save(&r.data);
+    assert!(r.lib.locate(&copy).is_err());
+    assert_eq!(held_paths(&r), before, "the scan and the placement use one root");
+    assert_eq!(r.lib.root().as_deref(), Some(r.root.as_path()));
+    assert_eq!(r.place.root().as_deref(), Some(r.root.as_path()));
+    assert_eq!(LibraryConfig::load(&r.data).unwrap().path.as_deref(), Some(r.root.as_path()), "library.json still names the old root");
+    let rep = r.scan(1);
+    assert_eq!((rep.imported, rep.binned, rep.moved), (0, 0, 0), "{rep:?}");
+    std::fs::remove_dir(&blocker).unwrap();
+    r.lib.locate(&copy).unwrap();
+    assert_eq!(r.lib.root().as_deref(), Some(copy.as_path()));
+    assert!(held_paths(&r).iter().all(|(_, p)| p.starts_with(copy.to_str().unwrap())));
+}
+
+#[test]
+fn a_dead_file_watcher_stays_on_screen_after_a_scan() {
+    let mut r = Rig::new();
+    super::lock(&r.lib.inner.st).watcher_error = Some("FILE WATCHER NOT RUNNING - test".into());
+    r.scan(0);
+    assert_eq!(r.lib.status().last_error.as_deref(), Some("FILE WATCHER NOT RUNNING - test"));
+    r.scan(1);
+    assert_eq!(r.lib.status().last_error.as_deref(), Some("FILE WATCHER NOT RUNNING - test"), "a clean pass does not hide it");
+    super::lock(&r.lib.inner.st).watcher_error = None;
+    r.scan(1);
+    assert_eq!(r.lib.status().last_error, None);
+}
+
+#[test]
+fn a_recovered_file_watcher_clears_its_error_without_waiting_for_the_next_event() {
+    let r = Rig::new();
+    let lib = &r.lib;
+    let worker = lib.start();
+    let wait = |what: &str, f: &dyn Fn() -> bool| {
+        let t = Instant::now();
+        while !f() {
+            assert!(t.elapsed() < Duration::from_secs(15), "timed out waiting for: {what}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    wait("the start-up scan ran", &|| lib.status().last_scan_at.is_some());
+    // The watcher died earlier (error on screen) and the next pass makes a new one that works.
+    {
+        let mut st = super::lock(&lib.inner.st);
+        st.watcher_error = Some("FILE WATCHER NOT RUNNING - test".into());
+        st.rewatch = true;
+    }
+    worker.request_scan(false);
+    // Rescan is every 600 s and no file changes: only the second pass can clear the line.
+    wait("the stale watcher error is gone", &|| lib.status().last_error.is_none() && super::lock(&lib.inner.st).watcher_error.is_none());
+    drop(worker);
+}
+
+#[test]
+fn a_choose_that_fails_leaves_no_folder_made_for_a_file_that_was_already_gone() {
+    let mut r = Rig::new();
+    r.write("a.jpg", 1);
+    r.write("Sub/c.jpg", 3);
+    r.settle();
+    // Edited away since the last scan: its record is still held, its source is gone.
+    std::fs::remove_file(r.root.join("Sub").join("c.jpg")).unwrap();
+    let blocker = block_config_save(&r.data);
+    let new_root = r._tmp.path().join("newlib");
+    assert!(r.lib.choose(&new_root, false).is_err());
+    assert!(!new_root.join("Sub").exists(), "the empty subfolder made for the missing file is gone");
+    assert!(!new_root.join("a.jpg").exists());
+    std::fs::remove_dir(&blocker).unwrap();
+    r.lib.choose(&new_root, false).expect("the retry is not refused with LIBRARY MUST BE EMPTY");
+    assert!(new_root.join("a.jpg").exists());
+}
+
+#[test]
+fn the_watcher_moves_to_a_library_chosen_after_start() {
+    // No library yet (the default folder holds the user's own photo): the worker starts with no
+    // watcher. Rescan every 10 minutes, so only a watcher event can import the drop below.
+    let r = Rig::with_default_root(|t| t.join("Local Tugboat"), |root| {
+        std::fs::create_dir_all(root).unwrap();
+        std::fs::write(root.join("holiday.jpg"), jpeg(1, 64)).unwrap();
+    });
+    let opts = LibraryOptions { stable_for: Duration::from_millis(150), debounce: Duration::from_millis(100), max_debounce: Duration::from_secs(1), rescan_every: Duration::from_secs(600) };
+    let lib = Library::open(r.core.clone(), r.place.clone(), r.data.clone(), LibraryConfig::default(), &r.root, opts, Box::new(|_| {})).unwrap();
+    assert!(lib.root().is_none());
+    let worker = lib.start();
+    let wait = |what: &str, f: &dyn Fn() -> bool| {
+        let t = Instant::now();
+        while !f() {
+            assert!(t.elapsed() < Duration::from_secs(15), "timed out waiting for: {what}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    wait("the start-up scan ran", &|| lib.status().last_scan_at.is_some());
+    let new_root = r._tmp.path().join("chosen");
+    lib.choose(&new_root, false).unwrap();
+    let scanned = lib.status().last_scan_at;
+    worker.request_scan(true);
+    wait("the scan after Choose ran", &|| lib.status().last_scan_at != scanned);
+    std::thread::sleep(Duration::from_millis(500)); // the new watcher is made right after that scan
+    std::fs::write(new_root.join("fresh.jpg"), jpeg(2, 64)).unwrap();
+    wait("a file dropped in the chosen folder is imported by the watcher", &|| r.items().iter().any(|i| i.name == "fresh.jpg"));
+    drop(worker);
 }
 
 // ---------- the placement and the scan must not fight ----------
@@ -849,6 +1088,20 @@ mod placement {
         assert_eq!(placed, root.join("x.jpg"));
         assert!(!src.exists(), "the part was consumed");
         assert!(crate::winfs::is_hidden_or_system(&std::fs::metadata(root.join(".tugboat")).unwrap()));
+    }
+
+    #[test]
+    fn nothing_is_placed_while_the_library_is_being_switched() {
+        let (_t, p, root) = rig();
+        let t = inbox(1, "x.jpg");
+        let src = part(&p, &t, &jpeg(1, 64));
+        p.set_switching(true);
+        assert!(p.commit(&src, &t).is_err(), "a download finishing now is refused (and fetched again)");
+        assert!(p.adopt(&src, &t).is_err());
+        assert!(!root.join("x.jpg").exists(), "no file under the old root");
+        assert!(src.exists(), "the part is kept for the retry");
+        p.set_switching(false);
+        assert_eq!(p.commit(&src, &t).unwrap(), root.join("x.jpg"));
     }
 
     #[test]
@@ -998,6 +1251,76 @@ mod placement {
         let none = PcLibrary::new(None, PathBuf::from("bin"), Default::default());
         assert!(none.available_space().is_err());
         assert!(none.part_path(&BlobHash([1; 32])).is_err());
+    }
+
+    #[test]
+    fn move_across_replaces_only_when_told_to() {
+        let d = tempfile::tempdir().unwrap();
+        let (a, b) = (d.path().join("a.jpg"), d.path().join("b.jpg"));
+        std::fs::write(&a, b"AAA").unwrap();
+        std::fs::write(&b, b"BBB").unwrap();
+        let e =crate::library::placement::move_across(&a, &b, false).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists, "{e}");
+        assert_eq!(std::fs::read(&a).unwrap(), b"AAA");
+        assert_eq!(std::fs::read(&b).unwrap(), b"BBB", "someone else's file survives");
+       crate::library::placement::move_across(&a, &b, true).unwrap();
+        assert_eq!(std::fs::read(&b).unwrap(), b"AAA");
+        assert!(!a.exists());
+    }
+
+    #[test]
+    fn a_missing_file_is_found_at_its_new_place_only_when_the_bytes_are_its_own() {
+        let (_t, p, root) = rig();
+        let work = FolderId(uuid::Uuid::from_u128(0x100));
+        let mut t = target(1, "x.jpg", work, FolderKind::User, "Work");
+        t.current = Some(root.join("gone.jpg"));
+        let dir = root.join("Work");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Another item's (or the user's) file with the wanted name: never recorded for this item.
+        std::fs::write(dir.join("x.jpg"), jpeg(9, 64)).unwrap();
+        assert!(p.relocate(&t).is_err());
+        assert_eq!(std::fs::read(dir.join("x.jpg")).unwrap(), jpeg(9, 64), "the other file is untouched");
+        // The same bytes: the watcher moved it already (C6).
+        t.hash = tugboat_core::ops::hash_file(&dir.join("x.jpg")).unwrap().0;
+        assert_eq!(p.relocate(&t).unwrap(), dir.join("x.jpg"));
+    }
+
+    #[test]
+    fn a_locked_bin_file_makes_from_bin_fail_cleanly_and_retry_without_copies() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let (_t, p, root) = rig();
+        let t = inbox(1, "x.jpg");
+        let placed = p.commit(&part(&p, &t, &jpeg(1, 64)), &t).unwrap();
+        let binned = p.to_bin(&FileTarget { current: Some(placed), ..t.clone() }).unwrap();
+        let tb = FileTarget { current: Some(binned.clone()), ..t.clone() };
+        // Readers may copy it, nobody may delete it.
+        let held = std::fs::OpenOptions::new().read(true).share_mode(1).open(&binned).unwrap();
+        assert!(p.from_bin(&tb).is_err());
+        assert!(binned.exists(), "the Bin copy is intact");
+        assert!(!root.join("x.jpg").exists() && !root.join("x (2).jpg").exists(), "no restored copy is left in the library");
+        assert!(std::fs::read_dir(root.join(".tugboat")).unwrap().next().is_none(), "no staging file left");
+        drop(held);
+        assert_eq!(p.from_bin(&tb).unwrap(), root.join("x.jpg"), "the retry gets the plain name");
+        assert!(!binned.exists());
+    }
+
+    #[test]
+    fn a_locked_old_file_makes_commit_fail_with_the_part_and_the_old_file_as_they_were() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let (_t, p, root) = rig();
+        let first = inbox(1, "old.jpg");
+        let old = p.commit(&part(&p, &first, &jpeg(1, 64)), &first).unwrap();
+        // The same item, new content under a new name: the old file has to go.
+        let renamed = FileTarget { current: Some(old.clone()), ..inbox(1, "new.jpg") };
+        let pt = part(&p, &renamed, &jpeg(2, 64));
+        let held = std::fs::OpenOptions::new().read(true).share_mode(1).open(&old).unwrap();
+        assert!(p.commit(&pt, &renamed).is_err());
+        assert!(pt.exists(), "the part is back where it was");
+        assert!(!root.join("new.jpg").exists(), "no unrecorded copy in the library");
+        assert_eq!(std::fs::read(&old).unwrap(), jpeg(1, 64));
+        drop(held);
+        assert_eq!(p.commit(&pt, &renamed).unwrap(), root.join("new.jpg"));
+        assert!(!old.exists(), "the old file went with the successful commit");
     }
 
     #[test]

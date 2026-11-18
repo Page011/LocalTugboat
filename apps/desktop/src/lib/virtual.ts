@@ -32,6 +32,13 @@ export function visibleRows(layout: GridLayout, scrollTop: number, viewport: num
   return [first, Math.max(last, first + 1)];
 }
 
+/** Index of the focused item. The grid keeps a number, but items arrive at the top during sync and
+ *  shift every index: follow the selected item by id, and use `fallback` only when it is not in the list. */
+export function focusIndexFor(items: ReadonlyArray<{ id: string }>, selectedId: string | null, fallback: number): number {
+  const i = selectedId === null ? -1 : items.findIndex((it) => it.id === selectedId);
+  return i >= 0 ? i : fallback;
+}
+
 /** Item index after an arrow key. Does not wrap; null = the key does not move. */
 export function arrowTarget(index: number, key: string, cols: number, count: number): number | null {
   const step = ({ ArrowLeft: -1, ArrowRight: 1, ArrowUp: -cols, ArrowDown: cols } as Record<string, number>)[key];

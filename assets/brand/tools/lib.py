@@ -7,6 +7,14 @@ S = os.path.dirname(os.path.abspath(__file__))
 NAVY = "#1A2733"
 
 
+def source_png():
+    """The original Tugboat.png the logo was traced from: TUG_SOURCE, else the Downloads copy."""
+    p = os.environ.get("TUG_SOURCE", r"C:\Users\Nigel\Downloads\Tugboat.png")
+    if not os.path.isfile(p):
+        raise SystemExit("Source logo PNG not found at %s: set TUG_SOURCE to the path of Tugboat.png" % p)
+    return p
+
+
 def load():
     return json.load(open(S + r"\geom.json"))
 
