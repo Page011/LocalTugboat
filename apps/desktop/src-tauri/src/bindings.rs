@@ -1,0 +1,107 @@
+//! TypeScript types for the webview, generated from the Rust types with ts-rs and checked in
+//! at `apps/desktop/src/lib/bindings`. This test is the drift check: it regenerates every type
+//! and fails when a committed file differs, so a Rust type can never change without the UI's
+//! types changing with it. Update them with:
+//!
+//!     set UPDATE_BINDINGS=1 && cargo test -p tugboat-desktop bindings
+//!
+//! `large_int = number`: ids and times cross the Tauri bridge as JSON numbers (ts-rs would
+//! otherwise say `bigint`, which JSON never produces).
+
+use std::path::{Path, PathBuf};
+
+use tugboat_core::{events::Event, ActivityEntry, FolderView, ItemQuery, ItemView, Page, Settings};
+use ts_rs::{Config, TS};
+
+use crate::{
+    backend::{AppInfo, PairedDevice, PairingStart},
+    error::CmdError,
+    firewall::{FirewallInfo, FirewallStatus},
+    library::{LibraryHealth, LibraryStatus, NotSyncedFile},
+    tray::TrayState,
+};
+
+fn export_all(dir: &Path) {
+    let cfg = Config::new().with_out_dir(dir).with_large_int("number");
+    macro_rules! all {
+        ($($t:ty),* $(,)?) => { $( <$t as TS>::export_all(&cfg).unwrap_or_else(|e| panic!("export {}: {e}", stringify!($t))); )* };
+    }
+    all!(
+        Event,
+        ItemView,
+        FolderView,
+        ItemQuery,
+        Page<ItemView>,
+        ActivityEntry,
+        Settings,
+        AppInfo,
+        PairedDevice,
+        PairingStart,
+        LibraryStatus,
+        LibraryHealth,
+        NotSyncedFile,
+        FirewallInfo,
+        FirewallStatus,
+        TrayState,
+        CmdError,
+    );
+}
+
+fn committed_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../src/lib/bindings")
+}
+
+/// File name -> text with LF line endings (git may check files out with CRLF).
+fn read_dir_texts(dir: &Path) -> std::collections::BTreeMap<String, String> {
+    let mut m = std::collections::BTreeMap::new();
+    let Ok(rd) = std::fs::read_dir(dir) else { return m };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name.ends_with(".ts") {
+            m.insert(name, std::fs::read_to_string(e.path()).unwrap_or_default().replace("\r\n", "\n"));
+        }
+    }
+    m
+}
+
+#[test]
+fn bindings_match_the_committed_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    export_all(tmp.path());
+    let generated = read_dir_texts(tmp.path());
+    assert!(generated.len() > 20, "the export produced {} files", generated.len());
+    let dir = committed_dir();
+    if std::env::var_os("UPDATE_BINDINGS").is_some() {
+        std::fs::create_dir_all(&dir).unwrap();
+        for old in read_dir_texts(&dir).keys() {
+            std::fs::remove_file(dir.join(old)).unwrap();
+        }
+        for (name, text) in &generated {
+            std::fs::write(dir.join(name), text).unwrap();
+        }
+        return;
+    }
+    let committed = read_dir_texts(&dir);
+    let only_generated: Vec<_> = generated.keys().filter(|k| !committed.contains_key(*k)).collect();
+    let only_committed: Vec<_> = committed.keys().filter(|k| !generated.contains_key(*k)).collect();
+    let changed: Vec<_> = generated.iter().filter(|(k, v)| committed.get(*k).is_some_and(|c| c != *v)).map(|(k, _)| k).collect();
+    assert!(
+        only_generated.is_empty() && only_committed.is_empty() && changed.is_empty(),
+        "TS bindings drifted. New: {only_generated:?}. Gone: {only_committed:?}. Changed: {changed:?}. \
+         Run: set UPDATE_BINDINGS=1 && cargo test -p tugboat-desktop bindings"
+    );
+}
+
+/// The shapes the UI relies on: ids and times are numbers/strings, not bigint.
+#[test]
+fn generated_types_have_the_shapes_the_ui_uses() {
+    let tmp = tempfile::tempdir().unwrap();
+    export_all(tmp.path());
+    let t = read_dir_texts(tmp.path());
+    assert!(!t.values().any(|v| v.contains("bigint")), "no bigint anywhere (JSON has no bigint)");
+    assert!(t["ItemView.ts"].contains("captured_at: number"));
+    assert!(t["SyncStatus.ts"].contains("last_synced_at: number | null"));
+    assert!(t["DeviceId.ts"].contains("string"));
+    assert!(t["Event.ts"].contains("\"t\": \"sync\""));
+    assert!(t["CmdError.ts"].contains("kind: string"));
+}

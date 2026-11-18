@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Deep-sea blue: the launcher icon background (assets/brand/android-background.svg). White boat on it = 11.35:1. -->
+    <color name="ic_launcher_background">#0F3D5E</color>
+</resources>

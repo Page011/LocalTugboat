@@ -1,0 +1,32 @@
+[package]
+name = "tugboat-core"
+description = "Tugboat core: store, merge rules, expiry, Bin, activity, names, sync engine, facade"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[features]
+# TypeScript bindings for the desktop UI (ts-rs). Off for Android/UniFFI builds.
+ts = ["dep:ts-rs"]
+
+[dependencies]
+tugboat-net = { path = "../net" }
+rusqlite = { workspace = true }
+uuid = { workspace = true }
+blake3 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+unicode-normalization = { workspace = true }
+hex = { workspace = true }
+fs4 = { workspace = true }
+ts-rs = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+# fake_phone example only: the throwaway test key.
+getrandom = { workspace = true }

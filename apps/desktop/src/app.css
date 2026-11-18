@@ -1,0 +1,324 @@
+/* Design tokens and shared controls. Light is the base; dark follows the system.
+ *
+ * Ocean palette: deep-sea navy (the rail), harbour teal (--accent: links, focus, selection), sea-foam
+ * surfaces, and a warm buoy orange (--action) for the main action only. Red stays red for blockers.
+ * The Android app (apps/android/.../Theme.kt) uses the same hexes where the roles match.
+ *
+ * Contrast is measured, not eyeballed: src/lib/theme.test.ts parses this file and fails when a
+ * text pair drops under 4.5:1 or a control edge / focus ring under 3:1. The ratios below are
+ * what that test measured (WCAG 2.x relative luminance); keep them in step when a token moves.
+ *
+ * Rules (standing): status is a chip/badge/dot plus text and an icon, never colour alone;
+ * selected = tint + full 1px border; no accent stripe on one edge of anything; urgent = red.
+ */
+
+:root {
+  color-scheme: light;
+  --logo-ink: #1a2733; /* logo ink on a light surface (assets/brand/README.md) */
+  --bg: #eff6f6;
+  --surface: #fbfefe;
+  --surface-2: #deebec;
+  --border: #b9cfd2;
+  --border-strong: #5a7881;
+  --fg: #0b2533;
+  --fg-muted: #3e5865;
+  --accent: #0a6572;
+  --on-accent: #ffffff;
+  --accent-tint: #d0e9ec;
+  --action: #c24e0a;
+  --on-action: #ffffff;
+  --ok: #17663a;
+  --ok-bg: #dff1e6;
+  --warn: #764300;
+  --warn-bg: #fdefc9;
+  --danger: #b3261e;
+  --danger-bg: #fce6e4;
+  --danger-solid: #b3261e;
+  --on-danger: #ffffff;
+  --rail: #0b2a3c;
+  --rail-fg: #eaf4f4;
+  --rail-muted: #a9c4cc;
+  --rail-hover: #16394d;
+  --rail-current: #1b4a5f;
+  --rail-edge: #7fc4ce;
+  --rail-buoy: #ff8e45;
+  --scrim: rgba(10, 20, 30, 0.45);
+  /* Measured, light (WCAG ratio, fg on bg):
+     fg/bg 14.5  fg/surface 15.6  fg/surface-2 13.0  fg/accent-tint 12.5
+     fg-muted/bg 6.9  fg-muted/surface 7.4  fg-muted/surface-2 6.2  fg-muted/accent-tint 5.9
+     accent/surface 6.6  accent/bg 6.2  accent/surface-2 5.5  on-accent/accent 6.7
+     on-action/action 4.8 (white on buoy orange)
+     ok/ok-bg 6.0  ok/surface 6.9  ok/bg 6.4  warn/warn-bg 7.1  warn/surface 8.0
+     danger/danger-bg 5.5  danger/surface 6.4  danger/bg 6.0  on-danger/danger-solid 6.5
+     rail (navy): rail-fg/rail 13.3  rail-muted/rail 8.1  rail-fg/rail-hover 10.9  rail-muted/rail-hover 6.6  rail-fg/rail-current 8.6
+     UI edges (>= 3): border-strong/surface 4.7  border-strong/bg 4.3  accent/surface 6.6 and accent/bg 6.2 (focus ring)
+     danger-solid/surface 6.4  danger-solid/bg 6.0  action/surface 4.7  action/bg 4.4  rail-edge/rail 7.6  rail-buoy/rail 6.5 */
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --logo-ink: #ffffff;
+    --bg: #08171f;
+    --surface: #0f2530;
+    --surface-2: #17323f;
+    --border: #2b4857;
+    --border-strong: #7fa0ae;
+    --fg: #e4f1f1;
+    --fg-muted: #a5c0c8;
+    --accent: #5fc3cf;
+    --on-accent: #05242b;
+    --accent-tint: #12404c;
+    --action: #ff8e45;
+    --on-action: #2b1200;
+    --ok: #84d99e;
+    --ok-bg: #173223;
+    --warn: #f1bc5e;
+    --warn-bg: #3a2d10;
+    --danger: #ff6b60;
+    --danger-bg: #4a1714;
+    --danger-solid: #d93025;
+    --on-danger: #ffffff;
+    --rail: #0b2a3c;
+    --rail-fg: #e4f1f1;
+    --rail-muted: #9db8c1;
+    --rail-hover: #16394d;
+    --rail-current: #1b4a5f;
+    --rail-edge: #5fc3cf;
+    --rail-buoy: #ff8e45;
+    --scrim: rgba(0, 0, 0, 0.6);
+    /* Measured, dark (fg on bg):
+       fg/bg 15.7  fg/surface 13.7  fg/surface-2 11.6  fg/accent-tint 9.7
+       fg-muted/bg 9.5  fg-muted/surface 8.3  fg-muted/surface-2 7.0  fg-muted/accent-tint 5.9
+       accent/surface 7.7  accent/bg 8.8  accent/surface-2 6.5  on-accent/accent 7.9
+       on-action/action 7.7 (navy-black on light orange)
+       ok/ok-bg 8.2  ok/surface 9.3  ok/bg 10.8  warn/warn-bg 7.7  warn/surface 9.1
+       danger/danger-bg 5.3  danger/surface 5.7  danger/bg 6.5  on-danger/danger-solid 4.8 (danger is clear red, not pink)
+       rail (navy, 1.2:1 off --bg so it stays a separate rail): rail-fg/rail 12.9  rail-muted/rail 7.1  rail-fg/rail-hover 10.5  rail-muted/rail-hover 5.8  rail-fg/rail-current 8.3
+       UI edges (>= 3): border-strong/surface 5.7  border-strong/bg 6.5  accent/surface 7.7 and accent/bg 8.8 (focus ring)
+       danger-solid/surface 3.3  danger-solid/bg 3.8 (a filled red button is red in the dark theme too: never pink)
+       action/surface 6.9  action/bg 8.0  rail-edge/rail 7.2  rail-buoy/rail 6.5 */
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+}
+
+#app {
+  height: 100%;
+}
+
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font: 14px/1.4 "Segoe UI", system-ui, sans-serif;
+  overflow: hidden;
+}
+
+h1 {
+  font-size: 18px;
+  margin: 0;
+  font-weight: 600;
+}
+h2 {
+  font-size: 15px;
+  margin: 0;
+  font-weight: 600;
+}
+p {
+  margin: 0;
+}
+.muted {
+  color: var(--fg-muted);
+}
+.mono {
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+/* Visible keyboard focus everywhere; mouse clicks do not draw it. */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+button,
+select,
+input {
+  font: inherit;
+  color: inherit;
+}
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 32px;
+  padding: 4px 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  background: var(--surface);
+  cursor: pointer;
+}
+.btn:not(.primary):not(.danger):hover:not(:disabled) {
+  background: var(--surface-2);
+}
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+/* The main action is the buoy orange; teal (--accent) is for selection, links and focus. */
+.btn.primary {
+  background: var(--action);
+  border-color: var(--action);
+  color: var(--on-action);
+}
+.btn.primary:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+.btn.danger {
+  background: var(--danger-solid);
+  border-color: var(--danger-solid);
+  color: var(--on-danger);
+}
+.btn.danger:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+/* Selected = tint + full 1px border + weight: the tint alone is 1.2:1 against the surface. */
+.btn[aria-pressed="true"] {
+  background: var(--accent-tint);
+  border-color: var(--accent);
+  font-weight: 600;
+}
+
+select.btn {
+  padding-right: 8px;
+}
+
+/* A status chip: icon + text on a tint. Tone never travels by colour alone. */
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 100%;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  background: var(--surface-2);
+  color: var(--fg);
+  white-space: nowrap;
+}
+.chip span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.chip.ok {
+  background: var(--ok-bg);
+  color: var(--ok);
+}
+.chip.warn {
+  background: var(--warn-bg);
+  color: var(--warn);
+}
+.chip.danger {
+  background: var(--danger-bg);
+  color: var(--danger);
+}
+
+/* Screens */
+.screen {
+  container-type: inline-size;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  height: 100%;
+  min-height: 0;
+  padding: 16px 20px;
+}
+.screen-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.empty {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  text-align: center;
+  color: var(--fg-muted);
+}
+.empty h2 {
+  color: var(--fg);
+}
+/* One icon per state, so empty, filtered, offline and failed are told apart at a glance. */
+.ico {
+  display: inline-flex;
+  color: var(--fg-muted);
+}
+.ico.ok {
+  color: var(--ok);
+}
+.ico.danger {
+  color: var(--danger);
+}
+/* The one illustration: the Tugboat logo above "Nothing yet." Decorative, so it adds no text. */
+.art {
+  display: inline-flex;
+}
+.empty.error h2 {
+  color: var(--danger);
+}
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 14px 16px;
+}
+
+/* Action bar under a grid: the selected item and what can be done to it. */
+.bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.bar .info {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1 1 220px;
+  min-width: 0;
+}
+/* Narrow window: the two secondary buttons keep their icon, title and aria-label, lose the word. */
+@container (max-width: 760px) {
+  .bar .lbl {
+    display: none;
+  }
+}
+.bar .info strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* Only the name gives way: the size stays on one line (it used to wrap to "256" / "KB"). */
+.bar .info .muted {
+  flex-shrink: 0;
+  white-space: nowrap;
+}

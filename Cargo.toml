@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+members = ["crates/net", "crates/core", "crates/ffi", "apps/desktop/src-tauri"]
+exclude = ["spike"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+license = "Apache-2.0"
+authors = ["Nigel Scott"]
+
+[workspace.dependencies]
+# iroh: default-features = false drops "portmapper" (UPnP/NAT-PMP), "metrics" and
+# "fast-apple-datapath". Only "tls-ring" (the mandatory crypto provider) is enabled.
+# Versions pinned exactly: the M0 spike proved this pair (spike/RESULTS.md).
+iroh = { version = "=1.4.1", default-features = false, features = ["tls-ring"] }
+iroh-mdns-address-lookup = "=0.6.1"
+n0-future = "0.3.2"
+tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "fs", "io-util", "time", "sync"] }
+blake3 = "1.8.7"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+tracing = "0.1.44"
+fs4 = "1.1.0"
+getrandom = "0.4.3"
+hex = "0.4.3"
+rusqlite = { version = "0.43", features = ["bundled"] }
+uuid = { version = "1.29", features = ["v7", "serde"] }
+unicode-normalization = "0.1.26"
+# no-serde-warnings: ts-rs cannot parse #[serde(transparent)] and warned on every build; it ignored the attribute either way (those ids carry ts(type = "string")).
+ts-rs = { version = "12.0.1", features = ["no-serde-warnings"] }
+tempfile = "3.27"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
