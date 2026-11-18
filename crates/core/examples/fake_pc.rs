@@ -249,28 +249,45 @@ async fn on_event(core: &Core, opts: &Opts, e: Event) -> Result<(), String> {
 /// Print every item the phone made that this side now holds and has verified. Items are
 /// polled, not taken from events, because a file is "received" only when its download is done.
 fn report_received(core: &Core, me: tugboat_core::DeviceId, reported: &mut HashSet<ItemId>) {
-    let page = match core.items(&ItemQuery { folder: None, bin: false, after: None, limit: 500 }) {
-        Ok(p) => p,
-        Err(e) => {
-            emit(json!({"event": "error", "kind": e.kind(), "message": e.to_string()}));
-            return;
+    // Every page, not only the first: an item past the first 500 must still be reported.
+    let mut after = None;
+    loop {
+        let page = match core.items(&ItemQuery { folder: None, bin: false, after, limit: 500 }) {
+            Ok(p) => p,
+            Err(e) => {
+                emit(json!({"event": "error", "kind": e.kind(), "message": e.to_string()}));
+                return;
+            }
+        };
+        let (more, last) = (page.next.is_some(), page.rows.last().map(|v| v.id));
+        for v in page.rows {
+            if v.origin == me || v.local != LocalFileState::Present || reported.contains(&v.id) {
+                continue;
+            }
+            let blake3 = v.path.as_deref().map(|p| hash_file(Path::new(p)).map(|(h, _)| h.to_string()));
+            reported.insert(v.id);
+            emit(json!({
+                "event": "received", "id": v.id.0.to_string(), "name": v.name, "size": v.size, "path": v.path,
+                "thumb_path": v.thumb_path, "blake3": match blake3 { Some(Ok(h)) => Value::String(h), Some(Err(e)) => Value::String(format!("hash failed: {e}")), None => Value::Null },
+                "folder": v.folder.0.to_string(),
+            }));
         }
-    };
-    for v in page.rows {
-        if v.origin != me && v.local == LocalFileState::Refused && reported.insert(v.id) {
-            emit(json!({"event": "refused_item", "id": v.id.0.to_string(), "name": v.name}));
-            continue;
+        match (more, last) {
+            (true, Some(id)) => after = Some(id),
+            _ => break,
         }
-        if v.origin == me || v.local != LocalFileState::Present || reported.contains(&v.id) {
-            continue;
+    }
+    // Refused records are never listed by `items` on the PC (they are never held), so they come
+    // from their own query.
+    match core.refused_items(500) {
+        Ok(rows) => {
+            for v in rows {
+                if v.origin != me && reported.insert(v.id) {
+                    emit(json!({"event": "refused_item", "id": v.id.0.to_string(), "name": v.name}));
+                }
+            }
         }
-        let blake3 = v.path.as_deref().map(|p| hash_file(Path::new(p)).map(|(h, _)| h.to_string()));
-        reported.insert(v.id);
-        emit(json!({
-            "event": "received", "id": v.id.0.to_string(), "name": v.name, "size": v.size, "path": v.path,
-            "thumb_path": v.thumb_path, "blake3": match blake3 { Some(Ok(h)) => Value::String(h), Some(Err(e)) => Value::String(format!("hash failed: {e}")), None => Value::Null },
-            "folder": v.folder.0.to_string(),
-        }));
+        Err(e) => emit(json!({"event": "error", "kind": e.kind(), "message": e.to_string()})),
     }
 }
 

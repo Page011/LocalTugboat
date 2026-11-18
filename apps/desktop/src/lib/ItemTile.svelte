@@ -1,6 +1,6 @@
 <script lang="ts">
   import { Film, Image as ImageIcon } from "@lucide/svelte";
-  import { thumbUrl } from "./api";
+  import { thumbSrc } from "./api";
   import type { ItemView } from "./api";
   import Chip from "./Chip.svelte";
   import { fileIcon, itemMeta, kindText, peerNote, type Label } from "./format";
@@ -24,8 +24,10 @@
     onopen: () => void;
   } = $props();
 
-  // A missing thumbnail (404: nothing held yet, or a format the Shell cannot render) shows an icon.
-  let failed = $state(false);
+  // No thumbnail yet (none held, or a format the Shell cannot render) shows an icon. A load error is
+  // remembered against the URL that failed, so the new URL made when the thumbnail appears is tried.
+  const src = $derived(thumbSrc(item));
+  let failedFor = $state<string | null>(null);
   // Only photos and videos have thumbnails; any other file is a tile with an icon for its type (no thumbnail request at all).
   const isFile = $derived(item.kind === "file");
   const Kind = $derived(item.kind === "video" ? Film : isFile ? fileIcons[fileIcon(item.ext)] : ImageIcon);
@@ -48,8 +50,8 @@
   <span class="thumb">
     {#if isFile}
       <Kind size={40} aria-hidden="true" />
-    {:else if !failed}
-      <img src={thumbUrl(item.id)} alt="" loading="lazy" draggable="false" onerror={() => (failed = true)} />
+    {:else if src !== null && failedFor !== src}
+      <img {src} alt="" loading="lazy" draggable="false" onerror={() => (failedFor = src)} />
     {:else}
       <Kind size={28} aria-hidden="true" />
     {/if}

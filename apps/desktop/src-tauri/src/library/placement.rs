@@ -112,9 +112,12 @@ fn remove_if_exists(p: &Path) -> Result<()> {
 
 /// Move a file; across drives (the Bin is under %LOCALAPPDATA%, the library may be anywhere)
 /// copy next to the destination, then rename, then delete the source. A failure at any step
-/// leaves the source in place (C4).
-pub fn move_across(from: &Path, to: &Path) -> io::Result<()> {
-    match std::fs::rename(from, to) {
+/// leaves the source in place (C4). `replace` = an existing `to` may be overwritten (the Bin
+/// holds only this item's own file); false = `ErrorKind::AlreadyExists` instead, so a file that
+/// appeared at `to` meanwhile is never lost.
+pub fn move_across(from: &Path, to: &Path, replace: bool) -> io::Result<()> {
+    let rename = |a: &Path, b: &Path| if replace { std::fs::rename(a, b) } else { winfs::rename_no_replace(a, b) };
+    match rename(from, to) {
         Ok(()) => Ok(()),
         Err(e) if e.raw_os_error() == Some(ERROR_NOT_SAME_DEVICE) => {
             let tmp = to.with_extension("tugboat-move");
@@ -122,7 +125,7 @@ pub fn move_across(from: &Path, to: &Path) -> io::Result<()> {
                 let _ = std::fs::remove_file(&tmp);
                 return Err(e);
             }
-            if let Err(e) = std::fs::rename(&tmp, to) {
+            if let Err(e) = rename(&tmp, to) {
                 let _ = std::fs::remove_file(&tmp);
                 return Err(e);
             }
@@ -157,8 +160,9 @@ pub(crate) fn place_new(src: &Path, dir: &Path, name: &str, own: Option<&Path>) 
                 // No hard links on this volume (FAT/exFAT), or src is on another drive.
                 // A move that never replaces: a file created under `candidate` since the check
                 // (std::fs::rename would overwrite it on Windows) sends us to the next free name.
-                match winfs::move_no_replace(src, &candidate) {
+                match move_across(src, &candidate, false) {
                     Ok(()) => return Ok(candidate),
+                    // Appeared after the check above: the rename refused, pick the next name.
                     Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
                     Err(e) => return Err(e),
                 }
@@ -170,6 +174,10 @@ pub(crate) fn place_new(src: &Path, dir: &Path, name: &str, own: Option<&Path>) 
 
 pub struct PcLibrary {
     root: RwLock<Option<PathBuf>>,
+    /// Set while Choose copies the library to a new folder: every placement that would write
+    /// or rename a file under the old root is refused (retryable), so nothing can land there
+    /// after the list of files to copy was taken.
+    switching: AtomicBool,
     bin: PathBuf,
     dirs: Mutex<BTreeMap<String, DirEntry>>,
     dirty: AtomicBool,
@@ -189,6 +197,7 @@ impl PcLibrary {
     pub fn new(root: Option<PathBuf>, bin: PathBuf, dirs: BTreeMap<String, DirEntry>) -> PcLibrary {
         PcLibrary {
             root: RwLock::new(root),
+            switching: AtomicBool::new(false),
             bin,
             dirs: Mutex::new(dirs),
             dirty: AtomicBool::new(false),
@@ -206,6 +215,18 @@ impl PcLibrary {
 
     pub fn set_root(&self, root: Option<PathBuf>) {
         *self.root.write().unwrap_or_else(|e| e.into_inner()) = root;
+    }
+
+    /// Start or end the refusal of placements (see `switching`).
+    pub fn set_switching(&self, on: bool) {
+        self.switching.store(on, Ordering::SeqCst);
+    }
+
+    fn not_switching(&self) -> Result<()> {
+        if self.switching.load(Ordering::SeqCst) {
+            return Err(CoreError::Paused("MOVING LIBRARY - please wait".into()));
+        }
+        Ok(())
     }
 
     pub fn bin_dir(&self) -> &Path {
@@ -368,6 +389,7 @@ impl Placement for PcLibrary {
     }
 
     fn commit(&self, part: &Path, t: &FileTarget) -> Result<PathBuf> {
+        self.not_switching()?;
         // A record extension that is not safe fails here, before anything is placed (C4).
         let bin = self.bin_path(t)?;
         let dir = self.dir_for(t)?;
@@ -375,19 +397,32 @@ impl Placement for PcLibrary {
         // C7: the mark goes on the part first; the hard link / rename below carries the stream with the file.
         self.mark_downloaded(part)?;
         let dest = place_new(part, &dir, &name, t.current.as_deref()).map_err(|e| CoreError::io(part, e))?;
-        Self::touch(&self.arrived, &dest);
         // Same item, new content that landed under another name or folder: its old file goes.
         if let Some(old) = &t.current {
             if !same_path(old, &dest) {
-                remove_if_exists(old)?;
+                if let Err(e) = remove_if_exists(old) {
+                    // The old file is locked: undo the placement (C4) so the part and the old
+                    // file are as they were, and no unrecorded copy is left in the library for
+                    // a rescan to import as a duplicate. The next attempt starts clean.
+                    if let Err(back) = winfs::rename_no_replace(&dest, part) {
+                        tracing::warn!("could not put {} back to {}: {back}", dest.display(), part.display());
+                    }
+                    return Err(e);
+                }
                 Self::touch(&self.departed, old);
             }
         }
-        remove_if_exists(&bin)?;
+        Self::touch(&self.arrived, &dest);
+        // A stale Bin copy is this item's own: to_bin and purge replace or remove it later, so a
+        // failure here must not undo a commit that worked.
+        if let Err(e) = remove_if_exists(&bin) {
+            tracing::warn!("stale Bin copy not removed: {e}");
+        }
         Ok(dest)
     }
 
     fn adopt(&self, src: &Path, t: &FileTarget) -> Result<PathBuf> {
+        self.not_switching()?;
         let root = self.need_root()?;
         if is_inside(&root, src) && !is_inside(&root.join(HIDDEN_DIR), src) {
             // The user's own file, already in the library: nothing to move.
@@ -401,7 +436,11 @@ impl Placement for PcLibrary {
         let dir = self.dir_for(t)?;
         let name = self.disk_name(t, src)?;
         let stage = self.part_dir()?.join(format!("{}.adopt", t.item.0.hyphenated()));
-        std::fs::copy(src, &stage).map_err(|e| CoreError::io(src, e))?;
+        if let Err(e) = std::fs::copy(src, &stage) {
+            // A partial staging file must not stay behind.
+            let _ = std::fs::remove_file(&stage);
+            return Err(CoreError::io(src, e));
+        }
         match place_new(&stage, &dir, &name, None).map_err(|e| CoreError::io(&stage, e)) {
             Ok(dest) => {
                 Self::touch(&self.arrived, &dest);
@@ -415,12 +454,18 @@ impl Placement for PcLibrary {
     }
 
     fn relocate(&self, t: &FileTarget) -> Result<PathBuf> {
+        self.not_switching()?;
         let cur = t.current.clone().ok_or_else(|| CoreError::Invalid("relocate: the file is not held".into()))?;
         let dir = self.dir_for(t)?;
         if !cur.exists() {
             // C6: the watcher may have moved it already; if the wanted place has it, done.
+            // Only when the file there is this item's own bytes: another item's or the user's
+            // file of the same name would be recorded for this item and later binned or purged.
             let want = dir.join(stem_name(t));
-            return if want.exists() { Ok(want) } else { Err(not_found(&cur)) };
+            return match tugboat_core::ops::hash_file(&want) {
+                Ok((h, _)) if h == t.hash => Ok(want),
+                _ => Err(not_found(&cur)),
+            };
         }
         let name = self.disk_name(t, &cur)?;
         let taken = |n: &str| {
@@ -431,8 +476,10 @@ impl Placement for PcLibrary {
         if same_path(&wanted, &cur) {
             return Ok(cur);
         }
-        // A case-only rename (work -> Work) is a rename of the same file: allowed.
-        std::fs::rename(&cur, &wanted).map_err(|e| CoreError::io(&cur, e))?;
+        // A case-only rename (work -> Work) is a rename of the same file: allowed. A file that
+        // appeared at `wanted` after the check above is never overwritten: the error leaves the
+        // file where it was (C4) and the next pass tries again.
+        winfs::rename_no_replace(&cur, &wanted).map_err(|e| CoreError::io(&cur, e))?;
         Self::touch(&self.arrived, &wanted);
         Self::touch(&self.departed, &cur);
         Ok(wanted)
@@ -442,7 +489,7 @@ impl Placement for PcLibrary {
         let bin_path = self.bin_path(t)?;
         if let Some(cur) = t.current.as_ref().filter(|c| c.exists() && !same_path(c, &bin_path)) {
             std::fs::create_dir_all(&self.bin).map_err(|e| CoreError::io(&self.bin, e))?;
-            move_across(cur, &bin_path).map_err(|e| CoreError::io(cur, e))?;
+            move_across(cur, &bin_path, true).map_err(|e| CoreError::io(cur, e))?;
             Self::touch(&self.departed, cur);
             return Ok(bin_path);
         }
@@ -453,6 +500,7 @@ impl Placement for PcLibrary {
     }
 
     fn from_bin(&self, t: &FileTarget) -> Result<PathBuf> {
+        self.not_switching()?;
         let bin_path = self.bin_path(t)?;
         if !bin_path.exists() {
             // Already back (C6) when the held path exists.
@@ -468,8 +516,13 @@ impl Placement for PcLibrary {
         std::fs::copy(&bin_path, &stage).map_err(|e| CoreError::io(&bin_path, e))?;
         match place_new(&stage, &dir, &name, None) {
             Ok(dest) => {
+                if let Err(e) = remove_if_exists(&bin_path) {
+                    // The Bin copy is locked: take the restored file back out (the Bin copy is
+                    // still whole), or every retry would publish another "x (2).jpg" (C4).
+                    let _ = std::fs::remove_file(&dest);
+                    return Err(e);
+                }
                 Self::touch(&self.arrived, &dest);
-                remove_if_exists(&bin_path)?;
                 Ok(dest)
             }
             Err(e) => {

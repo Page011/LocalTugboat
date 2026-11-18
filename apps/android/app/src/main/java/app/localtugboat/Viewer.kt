@@ -203,7 +203,7 @@ private fun ViewerPage(item: ItemInfo, active: Boolean, bin: Boolean, onOpen: ()
         item.kind == MediaKind.FILE -> FilePage(item, note ?: if (path == null) "FILE MISSING on this phone" else null, bin, onOpen)
         note != null || path == null -> NoFile(item, note ?: "FILE MISSING on this phone")
         item.kind == MediaKind.VIDEO -> if (active) VideoPlayer(path) else ThumbImage(item.thumbPath, "Video", Modifier.fillMaxSize(), ContentScale.Fit)
-        else -> PhotoPage(path, item.name, onZoomed)
+        else -> PhotoPage(item, path, onZoomed)
     }
 }
 
@@ -236,15 +236,34 @@ private fun NoFile(item: ItemInfo, note: String) {
     }
 }
 
+private sealed interface PhotoState {
+    data object Loading : PhotoState
+    class Ready(val bitmap: ImageBitmap) : PhotoState
+    data object Failed : PhotoState
+}
+
 @Composable
-private fun PhotoPage(path: String, name: String, onZoomed: (Boolean) -> Unit) {
-    // Full-size decode off the main thread, capped so a 50 MP photo never exhausts memory.
-    val bmp by produceState<ImageBitmap?>(null, path) { value = withContext(Dispatchers.IO) { Thumbs.imageBitmap(File(path), 2048)?.asImageBitmap() } }
-    val b = bmp
-    if (b == null) {
-        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator(color = Color.White) }
-    } else {
-        ZoomableImage(b, name, onZoomed)
+private fun PhotoPage(item: ItemInfo, path: String, onZoomed: (Boolean) -> Unit) {
+    val ctx = LocalContext.current
+    // Full-size decode off the main thread, capped so a 50 MP photo never exhausts memory. A file that cannot be
+    // decoded (or runs out of memory) ends in Failed, never in a spinner that never stops or a crash.
+    val state by produceState<PhotoState>(PhotoState.Loading, UiLogic.photoDecodeKey(path, item.size, item.thumbPath)) {
+        value = withContext(Dispatchers.IO) {
+            try {
+                Thumbs.imageBitmap(File(path), 2048)?.let { PhotoState.Ready(it.asImageBitmap()) } ?: PhotoState.Failed
+            } catch (e: Exception) {
+                KLog.log(ctx, "photo decode failed: $e")
+                PhotoState.Failed
+            } catch (e: OutOfMemoryError) {
+                KLog.log(ctx, "photo decode failed: out of memory")
+                PhotoState.Failed
+            }
+        }
+    }
+    when (val s = state) {
+        PhotoState.Loading -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator(color = Color.White) }
+        is PhotoState.Ready -> ZoomableImage(s.bitmap, item.name, onZoomed)
+        PhotoState.Failed -> NoFile(item, "CANNOT SHOW THIS PHOTO - Share or Save it instead")
     }
 }
 
@@ -336,7 +355,7 @@ private fun VideoPlayer(path: String) {
     }
     LifecycleEventEffect(Lifecycle.Event.ON_STOP) { player.pause() }
     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-        AndroidView({ c -> PlayerView(c).apply { this.player = player; useController = true } }, Modifier.fillMaxSize())
+        AndroidView({ c -> PlayerView(c).apply { this.player = player; useController = true } }, Modifier.fillMaxSize(), update = { it.player = player })
         if (failed) {
             Text(
                 "CANNOT PLAY THIS VIDEO - Share or Save it instead", color = Color.White, style = MaterialTheme.typography.titleMedium, textAlign = TextAlign.Center,

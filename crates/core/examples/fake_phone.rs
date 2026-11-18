@@ -181,15 +181,19 @@ async fn wait_confirmed(core: &Core, ids: &[ItemId]) -> Result<(), String> {
     let pc = core.paired_device().map_err(|e| e.to_string())?.ok_or("not paired")?.id;
     let t0 = Instant::now();
     loop {
-        let waiting = ids
-            .iter()
-            .filter(|id| {
-                core.debug_conn(|c| match store::get_item(c, **id) {
-                    Ok(Some((rec, _))) => !store::peer_has_receipt(c, rec.content.val.hash, pc).unwrap_or(false),
-                    _ => true,
-                })
-            })
-            .count();
+        // Confirmed means the item is there and the PC holds a receipt for its hash. A failed
+        // query or a missing item is not a confirmation: stop and say which one.
+        let mut waiting = 0;
+        for id in ids {
+            let held = core.debug_conn(|c| match store::get_item(c, *id) {
+                Ok(Some((rec, _))) => store::peer_has_receipt(c, rec.content.val.hash, pc).map_err(|e| format!("could not read item {}: {e}", id.0)),
+                Ok(None) => Err(format!("item {} is missing, it cannot be confirmed", id.0)),
+                Err(e) => Err(format!("could not read item {}: {e}", id.0)),
+            })?;
+            if !held {
+                waiting += 1;
+            }
+        }
         if waiting == 0 {
             return Ok(());
         }
@@ -243,9 +247,20 @@ fn print_items(core: &Core, ids: &[ItemId]) {
 async fn list(core: &Core) -> Result<(), String> {
     wait_synced(core).await?;
     // Let queued downloads finish: Synced is only reported when nothing is left to fetch.
-    let page = core.items(&ItemQuery { folder: None, bin: false, after: None, limit: 500 }).map_err(|e| e.to_string())?;
-    println!("{} items", page.rows.len());
-    for v in page.rows {
+    // Every page, then the true count first, so the total is never a silent first-page cut.
+    let mut rows = Vec::new();
+    let mut after = None;
+    loop {
+        let page = core.items(&ItemQuery { folder: None, bin: false, after, limit: 500 }).map_err(|e| e.to_string())?;
+        let (more, last) = (page.next.is_some(), page.rows.last().map(|v| v.id));
+        rows.extend(page.rows);
+        match (more, last) {
+            (true, Some(id)) => after = Some(id),
+            _ => break,
+        }
+    }
+    println!("{} items", rows.len());
+    for v in rows {
         println!("{}", serde_json::to_string(&v).map_err(|e| e.to_string())?);
     }
     Ok(())

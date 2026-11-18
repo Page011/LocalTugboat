@@ -15,19 +15,25 @@ import uniffi.tugboat_ffi.SyncState
 
 /** The one rule for "should the foreground service run": paired, and the setting is on. */
 object ServiceGate {
-    /** Blocking (opens the core). Starts the service if it is wanted and returns whether it was. */
-    fun startIfWanted(c: Context, why: String): Boolean {
+    /** Blocking (opens the core). Paired and the setting on. False when that cannot be read (reported). */
+    fun wanted(c: Context, why: String): Boolean {
         val core = c.applicationContext.core
         return try {
             val p = core.phone()
-            val wanted = p.pairedPc() != null && p.settings().stayConnected
-            KLog.log(c, "start check ($why): wanted=$wanted running=${core.serviceRunning}")
-            if (wanted && !core.serviceRunning) SnapService.start(c, why)
-            wanted
+            p.pairedPc() != null && p.settings().stayConnected
         } catch (e: Exception) {
             core.reportError("start check ($why) failed: ${e.message}")
             false
         }
+    }
+
+    /** Blocking (opens the core). Starts the service if it is wanted and returns whether it was. */
+    fun startIfWanted(c: Context, why: String): Boolean {
+        val core = c.applicationContext.core
+        val wanted = wanted(c, why)
+        KLog.log(c, "start check ($why): wanted=$wanted running=${core.serviceRunning}")
+        if (wanted && !core.serviceRunning) SnapService.start(c, why)
+        return wanted
     }
 }
 

@@ -339,7 +339,10 @@ pub fn move_item(c: &mut Connection, ctx: &Ctx<'_>, id: ItemId, folder: FolderId
         }
         let to = live_folder(&tx, folder)?;
         if rec.location.val.folder == folder {
-            return Ok(());
+            // Nothing to record, but an earlier try may have committed and failed to relocate:
+            // a retry with the same arguments must still bring the file to its place.
+            drop(tx);
+            return relocate_if_held(c, ctx, id);
         }
         let v = store::next_version(&tx, ctx.self_id)?;
         let mut new = rec.clone();
@@ -371,7 +374,9 @@ pub fn rename_item(c: &mut Connection, ctx: &Ctx<'_>, id: ItemId, name: &str) ->
             return Err(media_err(names::NameError::NotMedia));
         }
         if display == rec.name.val {
-            return Ok(());
+            // Same as move_item: a retry after a failed relocate must still relocate.
+            drop(tx);
+            return relocate_if_held(c, ctx, id);
         }
         let v = store::next_version(&tx, ctx.self_id)?;
         let mut new = rec.clone();
@@ -982,6 +987,70 @@ mod tests {
         r.run(|c, x| delete_item(c, x, id)).unwrap();
         assert!(matches!(r.run(|c, x| move_item(c, x, id, INBOX_ID)), Err(CoreError::Invalid(_))));
         assert!(matches!(r.run(|c, x| set_pinned(c, x, id, true)), Err(CoreError::Invalid(_))));
+    }
+
+    /// AppStorage whose relocate fails the first N times and counts every call.
+    struct FlakyRelocate {
+        inner: crate::placement::AppStorage,
+        fail_left: std::sync::atomic::AtomicU32,
+        calls: std::sync::atomic::AtomicU32,
+    }
+
+    impl crate::placement::Placement for FlakyRelocate {
+        fn part_path(&self, h: &BlobHash) -> Result<std::path::PathBuf> {
+            self.inner.part_path(h)
+        }
+        fn commit(&self, part: &Path, t: &crate::placement::FileTarget) -> Result<std::path::PathBuf> {
+            self.inner.commit(part, t)
+        }
+        fn adopt(&self, src: &Path, t: &crate::placement::FileTarget) -> Result<std::path::PathBuf> {
+            self.inner.adopt(src, t)
+        }
+        fn relocate(&self, t: &crate::placement::FileTarget) -> Result<std::path::PathBuf> {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.calls.fetch_add(1, SeqCst);
+            if self.fail_left.load(SeqCst) > 0 {
+                self.fail_left.fetch_sub(1, SeqCst);
+                return Err(CoreError::Io { path: "x".into(), msg: "relocate failed (test)".into() });
+            }
+            self.inner.relocate(t)
+        }
+        fn to_bin(&self, t: &crate::placement::FileTarget) -> Result<std::path::PathBuf> {
+            self.inner.to_bin(t)
+        }
+        fn from_bin(&self, t: &crate::placement::FileTarget) -> Result<std::path::PathBuf> {
+            self.inner.from_bin(t)
+        }
+        fn purge(&self, t: &crate::placement::FileTarget) -> Result<()> {
+            self.inner.purge(t)
+        }
+        fn available_space(&self) -> Result<u64> {
+            self.inner.available_space()
+        }
+    }
+
+    // A move or rename whose relocate failed is retried with the same arguments: the retry must
+    // call relocate again instead of returning at the "nothing changed" check.
+    #[test]
+    fn identical_retry_after_a_failed_relocate_relocates() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut r = Rig::new();
+        let id = r.add("a");
+        let fid = r.run(|c, x| create_folder(c, x, "Work", Retention::Keep)).unwrap();
+        let flaky = FlakyRelocate { inner: r.pl.clone(), fail_left: 1.into(), calls: 0.into() };
+        let ctx = Ctx { self_id: p(), now: r.now(), placement: &flaky };
+        assert!(move_item(&mut r.db.conn, &ctx, id, fid).is_err(), "first try: relocate fails after the commit");
+        assert_eq!(flaky.calls.load(SeqCst), 1);
+        assert_eq!(r.rec(id).location.val.folder, fid, "the record change stands");
+        move_item(&mut r.db.conn, &ctx, id, fid).unwrap();
+        assert_eq!(flaky.calls.load(SeqCst), 2, "the identical retry relocated");
+        assert!(r.path(id).is_some());
+        // Same for rename.
+        flaky.fail_left.store(1, SeqCst);
+        assert!(rename_item(&mut r.db.conn, &ctx, id, "b").is_err());
+        let calls = flaky.calls.load(SeqCst);
+        rename_item(&mut r.db.conn, &ctx, id, "b").unwrap();
+        assert_eq!(flaky.calls.load(SeqCst), calls + 1, "rename retry relocated");
     }
 
     // L18: delete of a pinned item writes pinned = false + deleted in one op.

@@ -9,6 +9,8 @@
   let autostart = $state<boolean | null>(null);
   let binText = $state("");
   let binError = $state<string | null>(null);
+  /** The user typed since the last save started: the saved value must not overwrite the text. */
+  let binDirty = $state(false);
   let confirmUnpair = $state(false);
   const uid = $props.id();
   // A missing or paused library has no scan to report and no folder to open.
@@ -20,7 +22,7 @@
 
   // Follow the saved value (another save, or the first load), but never overwrite what is being typed.
   $effect(() => {
-    if (app.settings && binError === null) binText = String(app.settings.bin_days);
+    if (app.settings && !binDirty && binError === null) binText = String(app.settings.bin_days);
   });
 
   async function setAutostart(on: boolean) {
@@ -29,15 +31,24 @@
   }
 
   async function saveBin() {
-    const r = parseBinDays(binText);
+    const text = binText;
+    const r = parseBinDays(text);
     if (!r.ok) {
+      binDirty = false;
       binError = r.message;
       return;
     }
     binError = null;
-    if (app.settings && r.days !== app.settings.bin_days) {
-      const next = { ...app.settings, bin_days: r.days };
-      if (await act(() => api.saveSettings(next))) app.settings = next;
+    if (!app.settings || r.days === app.settings.bin_days) {
+      binDirty = false;
+      return;
+    }
+    // Stay dirty while the save runs and if it fails: the effect above must not put the old saved value back
+    // over the typed text. After a success, release only when nothing was typed meanwhile.
+    const next = { ...app.settings, bin_days: r.days };
+    if (await act(() => api.saveSettings(next))) {
+      app.settings = next;
+      if (binText === text) binDirty = false;
     }
   }
 
@@ -74,6 +85,7 @@
           class="num"
           inputmode="numeric"
           bind:value={binText}
+          oninput={() => (binDirty = true)}
           aria-invalid={binError !== null}
           aria-describedby="{uid}-bin-help"
           onchange={saveBin}

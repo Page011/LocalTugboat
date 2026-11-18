@@ -219,7 +219,18 @@ pub(crate) async fn confirm(core: &Core, accept: bool) -> Result<()> {
         let mut g = lock(&core.inner.pairing);
         let Some(st) = g.as_mut() else { return Err(pair_err(&PairError::NotOpen)) };
         match st.window.confirm(now) {
-            Ok(_) => Ok(st.pending.take()),
+            Ok(_) => {
+                // The window is single use and now spent: take it out and close the pairing
+                // port while still holding the lock. The delivery wait below can last 15 s; a
+                // window opened meanwhile (begin_pairing is not serialized with this) is a new
+                // one and this call must never touch it again.
+                let pending = st.pending.take();
+                g.take();
+                if let Some(node) = node_of(core) {
+                    node.set_pairing_open(false);
+                }
+                Ok(pending)
+            }
             Err(e) => Err(e),
         }
     };
@@ -229,8 +240,10 @@ pub(crate) async fn confirm(core: &Core, accept: bool) -> Result<()> {
             return Err(pair_err(&e));
         }
         Ok(None) => {
-            finish_window(core, PairError::NotOpen);
-            return Err(pair_err(&PairError::NotOpen));
+            // The window is already gone (taken above): only the screen needs telling.
+            let e = PairError::NotOpen;
+            core.emit(Event::Pairing(PairingEvent::Cancelled { code: pair_code(&e), message: pair_text(&e) }));
+            return Err(pair_err(&e));
         }
         Ok(Some(p)) => p,
     };
@@ -240,11 +253,6 @@ pub(crate) async fn confirm(core: &Core, accept: bool) -> Result<()> {
         Ok(()) => tokio::time::timeout(Duration::from_secs(15), rrx).await.ok().and_then(|r| r.ok()),
         Err(_) => None,
     };
-    // Whatever happened, the window is over: it was single use.
-    lock(&core.inner.pairing).take();
-    if let Some(node) = node_of(core) {
-        node.set_pairing_open(false);
-    }
     match delivered {
         Some(Ok(())) => {}
         _ => {
@@ -299,7 +307,10 @@ fn code_ran_out(e: &NetError, expires_at_ms: i64, now_ms: i64) -> bool {
     )
 }
 
-pub(crate) async fn pair_with(core: &Core, payload: &str) -> Result<DeviceRow> {
+/// Phone: the whole exchange. `cancel` abandons it (the user tapped Cancel) at any point up to the
+/// PC's decision being read; after that the PC may already be paired with us, so the rest (drain,
+/// close, store the pairing) always runs to the end.
+pub(crate) async fn pair_with(core: &Core, payload: &str, mut cancel: impl std::future::Future<Output = ()> + Unpin) -> Result<DeviceRow> {
     if core.inner.cfg.role != Role::Phone {
         return Err(CoreError::Invalid("only the phone scans a pairing code".into()));
     }
@@ -316,9 +327,18 @@ pub(crate) async fn pair_with(core: &Core, payload: &str) -> Result<DeviceRow> {
         };
         core.emit(Event::Pairing(PairingEvent::Cancelled { code, message }));
     };
+    let user_cancelled = || {
+        let e = PairError::Cancelled;
+        core.emit(Event::Pairing(PairingEvent::Cancelled { code: pair_code(&e), message: pair_text(&e) }));
+        pair_err(&e)
+    };
     let proto = core.inner.pair_proto.load(std::sync::atomic::Ordering::SeqCst);
-    let started = phone_start_with_proto(&node, &parsed, &core.inner.cfg.device_name, &core.inner.cfg.app_version, DIAL_TIMEOUT, proto).await;
-    let phone = match started {
+    let started = tokio::select! {
+        biased;
+        r = phone_start_with_proto(&node, &parsed, &core.inner.cfg.device_name, &core.inner.cfg.app_version, DIAL_TIMEOUT, proto) => r,
+        _ = &mut cancel => return Err(user_cancelled()),
+    };
+    let mut phone = match started {
         Ok(p) => p,
         Err(e) => {
             // A PC whose pairing window ran out stops offering the pairing protocol, which reaches
@@ -333,7 +353,21 @@ pub(crate) async fn pair_with(core: &Core, payload: &str) -> Result<DeviceRow> {
     };
     core.emit(Event::Pairing(PairingEvent::Code { code: format_code(&phone.code), peer_name: parsed.pc_name.clone() }));
     let wait = Duration::from_millis(CONFIRM_TIMEOUT_MS as u64 + 10_000);
-    let pc_name = match phone.wait_decision(wait).await {
+    let read = tokio::select! {
+        // Biased: a decision that has already arrived always wins over a cancel.
+        biased;
+        r = phone.read_decision(wait) => r,
+        _ = &mut cancel => return Err(user_cancelled()),
+    };
+    let decision = match read {
+        Ok(d) => d,
+        Err(e) => {
+            cancelled(&e);
+            return Err(net_err(e));
+        }
+    };
+    // From here no cancel: the PC has decided and may already be paired with this phone.
+    let pc_name = match phone.finish(decision).await {
         Ok(n) => n,
         Err(e) => {
             // The wrong-secret answer of a PC that opened a new window comes back here, not at the

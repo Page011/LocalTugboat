@@ -5,7 +5,8 @@
   import type { ActivityEntry } from "./api";
   import { app } from "./app.svelte";
   import Chip from "./Chip.svelte";
-  import { actionLabel, fmtTime, isProblem } from "./format";
+  import { loadActivityPages } from "./activityPages";
+  import { actionLabel, deviceLabel, fmtTime, isProblem } from "./format";
 
   const PAGE = 100;
   let rows = $state<ActivityEntry[]>([]);
@@ -17,13 +18,18 @@
   /** Reload keeps as many rows as the user had paged in. */
   async function load(append: boolean) {
     const mine = ++token;
-    const before = append ? (rows.at(-1)?.id ?? null) : null;
-    const limit = append ? PAGE : Math.min(Math.max(rows.length, PAGE), 500);
     try {
-      const page = await api.activity(before, limit);
-      if (mine !== token) return;
-      rows = append ? rows.concat(page) : page;
-      more = page.length === limit;
+      if (append) {
+        const page = await api.activity(rows.at(-1)?.id ?? null, PAGE);
+        if (mine !== token) return;
+        rows = rows.concat(page);
+        more = page.length === PAGE;
+      } else {
+        const r = await loadActivityPages(api.activity, Math.max(rows.length, PAGE));
+        if (mine !== token) return;
+        rows = r.rows;
+        more = r.more;
+      }
       error = null;
       loaded = true;
     } catch (e) {
@@ -36,10 +42,7 @@
     untrack(() => load(false));
   });
 
-  function who(e: ActivityEntry): string {
-    if (e.device === null) return "System";
-    return app.paired && e.device === app.paired.id ? app.paired.name : "This PC";
-  }
+  const who = (e: ActivityEntry): string => deviceLabel(e.device, app.info?.device_id ?? null, app.paired);
 </script>
 
 <section class="screen" aria-labelledby="activity-h">

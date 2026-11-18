@@ -108,6 +108,9 @@ pub(crate) struct Inner {
     /// Hash (hex) of every blob or thumbnail request this device answered or refused (tests
     /// assert "zero", or that one hash was never asked for).
     pub blob_requests: Mutex<Vec<String>>,
+    /// Content hashes with a download task alive (any session). Two tasks must never write the
+    /// same part file, and a task outlives the session that started it.
+    pub fetching: Mutex<std::collections::HashSet<BlobHash>>,
 }
 
 #[derive(Clone)]
@@ -156,6 +159,7 @@ impl Core {
                 storage_low: std::sync::atomic::AtomicBool::new(false),
                 guard_recheck_ms: AtomicU64::new(30_000),
                 blob_requests: Mutex::new(Vec::new()),
+                fetching: Mutex::new(std::collections::HashSet::new()),
             }),
         };
         core.sweep_and_emit()?;
@@ -560,39 +564,40 @@ impl Core {
             return Err(CoreError::Paused(p));
         }
         // The thumbnail is hashed and copied here; ops::add_local_file takes the finished Thumb.
-        let mut made_thumb: Option<PathBuf> = None;
         // Only photos and videos get a thumbnail: a thumbnail offered for any other file is dropped.
         if names::media_family_of_name(&f.name).is_none() {
             f.thumb = None;
         }
+        // Thumbnails are content-addressed and shared between items, so a failed add leaves its
+        // thumbnail in place: another import may already point at the same file (no thumbnail GC
+        // exists, the cost is one small file).
         let thumb = match f.thumb.take() {
             None => None,
             Some(src) => {
                 let (hash, size) = ops::hash_file(&src)?;
                 let dest = self.thumb_path(hash);
                 if !dest.exists() {
-                    // Copy next to the final name, then rename: never a half-written thumbnail.
-                    let tmp = dest.with_extension("jpg.tmp");
-                    std::fs::copy(&src, &tmp).map_err(|e| CoreError::io(&src, e))?;
-                    std::fs::rename(&tmp, &dest).map_err(|e| CoreError::io(&dest, e))?;
-                    made_thumb = Some(dest);
+                    // Copy to a name unique to this call, then rename: never a half-written
+                    // thumbnail, and two imports of the same bytes never share a temp file.
+                    let tmp = self.thumbs_dir().join(format!("{}.{}.tmp", hex::encode(hash.0), uuid::Uuid::now_v7().simple()));
+                    if let Err(e) = std::fs::copy(&src, &tmp) {
+                        let _ = std::fs::remove_file(&tmp);
+                        return Err(CoreError::io(&src, e));
+                    }
+                    if let Err(e) = std::fs::rename(&tmp, &dest) {
+                        let _ = std::fs::remove_file(&tmp);
+                        // A concurrent import published the same thumbnail first: that is success.
+                        if !dest.exists() {
+                            return Err(CoreError::io(&dest, e));
+                        }
+                    }
                 }
                 Some(Thumb { hash, size })
             }
         };
-        let r = self.with_ctx(|c, ctx| ops::add_local_file(c, ctx, &f, thumb.clone()));
-        match r {
-            Ok(id) => {
-                self.wrote(&[id], false, false);
-                Ok(id)
-            }
-            Err(e) => {
-                if let Some(p) = made_thumb {
-                    let _ = std::fs::remove_file(p);
-                }
-                Err(e)
-            }
-        }
+        let id = self.with_ctx(|c, ctx| ops::add_local_file(c, ctx, &f, thumb.clone()))?;
+        self.wrote(&[id], false, false);
+        Ok(id)
     }
 
     pub fn set_pinned(&self, id: ItemId, pinned: bool) -> Result<()> {
@@ -646,9 +651,10 @@ impl Core {
 
     pub fn set_retention(&self, id: FolderId, retention: Retention) -> Result<()> {
         self.with_ctx(|c, ctx| ops::set_retention(c, ctx, id, retention))?;
+        // The change is committed: tell the UI and the peer before the sweep can fail.
+        self.wrote(&[], true, false);
         // A shorter retention can expire items at once: let the sweep move their files.
         self.sweep_and_emit()?;
-        self.wrote(&[], true, false);
         Ok(())
     }
 
@@ -724,8 +730,14 @@ impl Core {
     /// Rescan/watcher: these held files are gone from the library (not matched to a move).
     /// The desktop applies the bulk-missing pause rule BEFORE calling this.
     pub fn local_files_missing(&self, ids: &[ItemId]) -> Result<()> {
+        // Each id commits on its own: on a failure the ones already done still get their event
+        // and wake the sync session, then the error is returned.
+        let mut done: Vec<ItemId> = Vec::new();
         for id in ids {
-            self.with_ctx(|c, ctx| {
+            // The local-state write autocommits outside the delete's transaction: once it ran, the
+            // item changed even if a later step fails.
+            let mut state_written = false;
+            let r = self.with_ctx(|c, ctx| {
                 // The file is already gone: record that first, so the delete does not try to
                 // move a file that is not there. The item is Binned with no file ref (not
                 // Purged: Purged items are tombstones the Bin screen never lists), so it shows
@@ -733,11 +745,25 @@ impl Core {
                 if let Some((_, lfs)) = store::get_item(c, *id)? {
                     if matches!(lfs, LocalFileState::Present | LocalFileState::Binned) {
                         store::set_local_state(c, *id, LocalFileState::Binned, ctx.now)?;
+                        state_written = true;
                         store::delete_file_ref(c, *id)?;
                     }
                 }
                 ops::delete_item(c, ctx, *id)
-            })?;
+            });
+            // Same rule as delete_item: a placement (Io) failure after the record change stands.
+            if matches!(r, Ok(()) | Err(CoreError::Io { .. })) || state_written {
+                done.push(*id);
+            }
+            match r {
+                Ok(()) => {}
+                Err(e) => {
+                    if !done.is_empty() {
+                        self.wrote(&done, false, false);
+                    }
+                    return Err(e);
+                }
+            }
         }
         self.wrote(ids, false, false);
         Ok(())
@@ -924,7 +950,14 @@ impl Core {
 
     /// Phone: pair from a scanned QR payload. Emits Pairing(Code), then Completed/Cancelled.
     pub async fn pair_with(&self, payload: &str) -> Result<DeviceRow> {
-        pair::pair_with(self, payload).await
+        pair::pair_with(self, payload, std::future::pending::<()>()).await
+    }
+
+    /// `pair_with` that the user can abandon: `cancel` resolving ends it with a `cancelled`
+    /// pairing error (and the Cancelled event) as long as the PC's decision has not been read.
+    /// After that the pairing completes whatever `cancel` does, so both devices agree.
+    pub async fn pair_with_cancel(&self, payload: &str, cancel: impl std::future::Future<Output = ()> + Unpin) -> Result<DeviceRow> {
+        pair::pair_with(self, payload, cancel).await
     }
 
     /// Unpair the peer: sends Unpair if connected, then ops::unpair. Files stay.

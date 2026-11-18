@@ -163,7 +163,11 @@ impl Placement for AppStorage {
         // Copy next to the final place, then rename: a crash leaves a stray .tmp, never a
         // half-written file under the final name.
         let tmp = self.root.join("parts").join(format!("{}.adopt", t.item.0.hyphenated()));
-        std::fs::copy(src, &tmp).map_err(|e| CoreError::io(src, e))?;
+        if let Err(e) = std::fs::copy(src, &tmp) {
+            // A partial copy (disk full) must not stay behind and add to the shortage.
+            let _ = std::fs::remove_file(&tmp);
+            return Err(CoreError::io(src, e));
+        }
         if let Err(e) = move_file(&tmp, &dest) {
             let _ = std::fs::remove_file(&tmp);
             return Err(e);
@@ -235,6 +239,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = AppStorage::new(dir.path().join("store")).unwrap();
         (dir, s)
+    }
+
+    // A failed copy leaves no .adopt file in parts/.
+    #[test]
+    fn failed_adopt_leaves_no_adopt_file() {
+        let (dir, s) = rig();
+        let t = target(3, "jpg");
+        let tmp = s.root.join("parts").join(format!("{}.adopt", t.item.0.hyphenated()));
+        std::fs::write(&tmp, b"partial").unwrap();
+        assert!(s.adopt(&dir.path().join("missing.jpg"), &t).is_err());
+        assert!(!tmp.exists(), "stale or partial copy removed");
+        assert!(std::fs::read_dir(s.root.join("parts")).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().ends_with(".adopt")));
     }
 
     // L27: commit / adopt / to_bin / from_bin / purge, purge idempotent, adopt leaves source,

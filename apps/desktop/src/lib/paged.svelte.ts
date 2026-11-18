@@ -69,6 +69,7 @@ export class PagedItems {
       this.rows = this.rows.concat(page.rows);
       this.#next = page.next;
       this.hasMore = page.next !== null;
+      this.error = null;
     } catch (e) {
       if (token === this.#token) this.error = e instanceof Error ? e.message : String(e);
     } finally {

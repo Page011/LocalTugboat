@@ -6,6 +6,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -116,6 +117,10 @@ class SnapViewModel(app: Application) : AndroidViewModel(app) {
     private val _permsContinued = MutableStateFlow(false)
     val permsContinued: StateFlow<Boolean> = _permsContinued
 
+    /** One refresh at a time, in call order: an older read must never publish after a newer one (stale paired/unpaired). Declared before init: init calls refresh(). */
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private val refreshDispatcher = Dispatchers.IO.limitedParallelism(1)
+
     /** Core events for screens that show lists: re-read what is on screen when one arrives. */
     val events: SharedFlow<FfiEvent> get() = core.events
 
@@ -191,7 +196,7 @@ class SnapViewModel(app: Application) : AndroidViewModel(app) {
 
     /** Re-read the small facts behind the banners. Safe to call often. */
     fun refresh() {
-        viewModelScope.launch(Dispatchers.IO) {
+        viewModelScope.launch(refreshDispatcher) {
             val perms = Perms.snapshot(ctx)
             try {
                 val p = core.phone()
@@ -263,7 +268,6 @@ class SnapViewModel(app: Application) : AndroidViewModel(app) {
         if (_pairing.value is PairUi.Dialing || _pairing.value is PairUi.Code) return
         _pairing.value = PairUi.Dialing
         viewModelScope.launch(Dispatchers.IO) {
-            core.hold("pairing").join() // pairing needs the endpoint up
             // The code's expiry (the PC's stamp, compared with this phone's clock) is read before dialing: a failure
             // after it means "expired", whatever words the PC's newer window used to refuse the old secret.
             val expiresAt = try {
@@ -271,12 +275,16 @@ class SnapViewModel(app: Application) : AndroidViewModel(app) {
             } catch (e: Exception) {
                 null
             }
+            // The hold is inside the try: if this job is cancelled while waiting for it, the release in finally still runs.
             try {
+                core.hold("pairing").join() // pairing needs the endpoint up
                 val pc = core.phone().pairWith(payload)
                 _pairing.value = PairUi.Done(pc.name)
                 // The service takes over the network hold before "pairing" lets go: no gap in between.
                 ServiceGate.startIfWanted(ctx, "paired")
                 refresh()
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 val line = Texts.pairFailure(e, Perms.localNetworkAllowed(ctx), codeExpired = expiresAt != null && System.currentTimeMillis() >= expiresAt)
                 // The onboarding screen shows this failure; a banner after a later success would be stale, so log only.
@@ -397,16 +405,23 @@ class SnapViewModel(app: Application) : AndroidViewModel(app) {
 
     // ---- settings and maintenance ----
 
+    /** Settings are saved as one whole record: read, change one field, save must not interleave with another setter. */
+    private val settingsLock = Any()
+
     fun setStayConnected(on: Boolean) = act("Settings") {
-        val p = core.phone()
-        p.saveSettings(p.settings().copy(stayConnected = on))
-        if (on) ServiceGate.startIfWanted(ctx, "setting on") else SnapService.stop(ctx)
+        synchronized(settingsLock) {
+            val p = core.phone()
+            p.saveSettings(p.settings().copy(stayConnected = on))
+            if (on) ServiceGate.startIfWanted(ctx, "setting on") else SnapService.stop(ctx)
+        }
         refresh()
     }
 
     fun setBinDays(days: UInt) = act("Settings") {
-        val p = core.phone()
-        p.saveSettings(p.settings().copy(binDays = days))
+        synchronized(settingsLock) {
+            val p = core.phone()
+            p.saveSettings(p.settings().copy(binDays = days))
+        }
         refresh()
     }
 

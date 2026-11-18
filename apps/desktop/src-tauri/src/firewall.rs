@@ -68,6 +68,8 @@ pub struct RuleInfo {
     pub remote_addresses: String,
     /// LocalPorts: `*`, numbers, `a-b` ranges or keywords such as `RPC`.
     pub local_ports: String,
+    /// LocalAddresses: same format as `remote_addresses`; the PC's own addresses the rule covers.
+    pub local_addresses: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -231,8 +233,10 @@ fn v4_range(tok: &str) -> Result<Option<(u32, u32)>, String> {
     Ok(Some((a, a)))
 }
 
-/// Can the rule's remote addresses include a phone on the LAN?
-fn remote_fit(spec: &str) -> Fit {
+/// Can the rule's remote addresses include a phone on the LAN? A block rule matches when any
+/// LAN address is in it (a block must never be hidden). An allow rule counts only when it takes
+/// every LAN phone: an explicit address list is `Maybe`, which an allow path does not count.
+fn remote_fit(spec: &str, allow: bool) -> Fit {
     if is_any(spec) {
         return Fit::Yes;
     }
@@ -248,7 +252,10 @@ fn remote_fit(spec: &str) -> Fit {
             _ => match v4_range(tok) {
                 Ok(Some((s, e))) => {
                     if LAN_V4.iter().any(|&(ps, pe)| s <= pe && e >= ps) {
-                        return Fit::Yes;
+                        if !allow {
+                            return Fit::Yes;
+                        }
+                        maybe.get_or_insert("the rule allows only some addresses".to_string());
                     }
                 }
                 Ok(None) => {}
@@ -259,6 +266,17 @@ fn remote_fit(spec: &str) -> Fit {
         }
     }
     maybe.map_or(Fit::No, Fit::Maybe)
+}
+
+/// Does the rule cover every local address of this PC? Only an allow rule is judged on it: an
+/// allow limited to some local addresses (say 127.0.0.1) is `Maybe`, so it is not counted.
+/// A block rule keeps ignoring it (a possible block stays reported).
+fn local_addr_fit(spec: &str, allow: bool) -> Fit {
+    if !allow || is_any(spec) {
+        Fit::Yes
+    } else {
+        Fit::Maybe("the rule covers only some of this PC's addresses".into())
+    }
 }
 
 /// Do the rule's local ports include Tugboat's UDP port?
@@ -412,7 +430,8 @@ fn rule_fit(r: &RuleInfo, exe_n: &str, port: Option<u16>, applies: ScopeFn) -> F
         &|| if r.service.trim().is_empty() { Fit::Yes } else { Fit::No },
         &|| if r.package.trim().is_empty() { Fit::Yes } else { Fit::No },
         &|| interface_fit(&r.interface_types),
-        &|| remote_fit(&r.remote_addresses),
+        &|| remote_fit(&r.remote_addresses, r.allow),
+        &|| local_addr_fit(&r.local_addresses, r.allow),
         &|| ports_fit(&r.local_ports, port),
         &|| user_fit(&r.user_scope, applies),
     ])
@@ -555,25 +574,52 @@ fn read_snapshot() -> Result<Snapshot, String> {
         let mut item = [VARIANT::default()];
         let mut fetched = 0u32;
         let hr = unsafe { enumr.Next(&mut item, &mut fetched) };
-        if hr.is_err() || fetched == 0 {
+        // A failed read is an error, not the end of the list: a partial list could hide a block rule.
+        if hr.is_err() {
+            return Err(werr("rule list", windows::core::Error::from(hr)));
+        }
+        if fetched == 0 {
             break;
         }
-        let Ok(disp) = IDispatch::try_from(&item[0]) else { continue };
-        let Ok(rule) = disp.cast::<INetFwRule>() else { continue };
+        let disp = IDispatch::try_from(&item[0]).map_err(|e| werr("rule item", e))?;
+        let rule = disp.cast::<INetFwRule>().map_err(|e| werr("rule item", e))?;
         // INetFwRule3 (Windows 8 and later) carries the user scope and the app package.
         let rule3 = disp.cast::<INetFwRule3>();
-        let text = |r: windows::core::Result<BSTR>| r.map(|b| b.to_string()).unwrap_or_default();
-        let enabled = unsafe { rule.Enabled() }.map(|b| b.as_bool()).unwrap_or(false);
+        // Cosmetic only (the rule's display name): a failed read may fall back to "".
+        let name = unsafe { rule.Name() }.map(|b| b.to_string()).unwrap_or_default();
+        // Every field the verdict reads propagates its error: "" means "any" / "no restriction"
+        // to the evaluator, so a failed read must never become "" (an allow rule would count as
+        // full cover).
+        let text = |what: &'static str, r: windows::core::Result<BSTR>| r.map(|b| b.to_string()).map_err(|e| werr(what, e));
+        // The fields that decide the verdict propagate their errors: a failed read is Unknown,
+        // never a guessed false/0 that could hide a block rule or count a wrong one.
+        let enabled = unsafe { rule.Enabled() }.map_err(|e| werr("rule enabled", e))?.as_bool();
+        let inbound = unsafe { rule.Direction() }.map_err(|e| werr("rule direction", e))? == NET_FW_RULE_DIR_IN;
+        let allow = unsafe { rule.Action() }.map_err(|e| werr("rule action", e))? == NET_FW_ACTION_ALLOW;
+        let protocol = unsafe { rule.Protocol() }.map_err(|e| werr("rule protocol", e))?;
+        let rule_profiles = unsafe { rule.Profiles() }.map_err(|e| werr("rule profiles", e))?;
+        let local_addresses = text("rule local addresses", unsafe { rule.LocalAddresses() })?;
+        let app = text("rule program", unsafe { rule.ApplicationName() })?;
+        let service = text("rule service", unsafe { rule.ServiceName() })?;
+        // Without INetFwRule3 (before Windows 8) there is no package restriction: "" is right.
+        let package = match &rule3 {
+            Ok(r) => text("rule app package", unsafe { r.LocalAppPackageId() })?,
+            Err(_) => String::new(),
+        };
+        let interface_types = text("rule interface types", unsafe { rule.InterfaceTypes() })?;
+        let remote_addresses = text("rule remote addresses", unsafe { rule.RemoteAddresses() })?;
+        let local_ports = text("rule local ports", unsafe { rule.LocalPorts() })?;
         rules.push(RuleInfo {
-            name: text(unsafe { rule.Name() }),
+            name,
             enabled,
-            inbound: unsafe { rule.Direction() }.map(|d| d == NET_FW_RULE_DIR_IN).unwrap_or(false),
-            allow: unsafe { rule.Action() }.map(|a| a == NET_FW_ACTION_ALLOW).unwrap_or(false),
-            app: text(unsafe { rule.ApplicationName() }),
-            protocol: unsafe { rule.Protocol() }.unwrap_or(0),
-            profiles: unsafe { rule.Profiles() }.unwrap_or(0),
-            service: text(unsafe { rule.ServiceName() }),
-            package: rule3.as_ref().map(|r| text(unsafe { r.LocalAppPackageId() })).unwrap_or_default(),
+            inbound,
+            allow,
+            app,
+            protocol,
+            profiles: rule_profiles,
+            local_addresses,
+            service,
+            package,
             user_scope: match &rule3 {
                 Ok(r) => match unsafe { r.LocalUserAuthorizedList() } {
                     Ok(b) => UserScope::Sddl(b.to_string()),
@@ -581,9 +627,9 @@ fn read_snapshot() -> Result<Snapshot, String> {
                 },
                 Err(e) => UserScope::Unreadable(format!("cannot read the rule's user scope ({e})")),
             },
-            interface_types: text(unsafe { rule.InterfaceTypes() }),
-            remote_addresses: text(unsafe { rule.RemoteAddresses() }),
-            local_ports: text(unsafe { rule.LocalPorts() }),
+            interface_types,
+            remote_addresses,
+            local_ports,
         });
     }
     Ok(Snapshot { rules, profiles, current_profiles, modify_state })
@@ -599,6 +645,21 @@ pub fn check(port: Option<u16>) -> FirewallInfo {
     FirewallInfo::from_status(status)
 }
 
+/// Full path of `netsh.exe` in the Windows system folder. ShellExecute with a bare name can
+/// search the current directory, so a planted netsh.exe would run elevated; never fall back to
+/// the bare name.
+pub fn netsh_path() -> Result<PathBuf, String> {
+    use windows::Win32::{
+        System::Com::CoTaskMemFree,
+        UI::Shell::{FOLDERID_System, SHGetKnownFolderPath, KF_FLAG_DEFAULT},
+    };
+    let raw = unsafe { SHGetKnownFolderPath(&FOLDERID_System, KF_FLAG_DEFAULT, None) }.map_err(|e| werr("Windows system folder", e))?;
+    let dir = unsafe { raw.to_string() };
+    unsafe { CoTaskMemFree(Some(raw.0 as *const c_void)) };
+    let dir = dir.map_err(|_| "cannot read the Windows system folder path".to_string())?;
+    Ok(PathBuf::from(dir).join("netsh.exe"))
+}
+
 /// The [Fix] button: run `netsh` elevated (a UAC prompt) to add the allow rule. Returns once the
 /// request was handed to Windows; the caller re-checks after a moment.
 pub fn fix() -> Result<(), String> {
@@ -609,8 +670,9 @@ pub fn fix() -> Result<(), String> {
     let exe = current_exe()?;
     let current = snapshot().map(|s| s.current_profiles).unwrap_or(PROFILE_PRIVATE | PROFILE_PUBLIC);
     let args = fix_arguments(&exe, current)?;
+    let netsh = netsh_path()?;
     let wide = |s: &str| s.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
-    let (verb, file, params) = (wide("runas"), wide("netsh.exe"), wide(&args));
+    let (verb, file, params) = (wide("runas"), wide(&netsh.to_string_lossy()), wide(&args));
     let h = unsafe { ShellExecuteW(None, PCWSTR(verb.as_ptr()), PCWSTR(file.as_ptr()), PCWSTR(params.as_ptr()), PCWSTR::null(), SW_HIDE) };
     // ShellExecute reports success with a value above 32.
     if h.0 as isize > 32 {
@@ -715,6 +777,38 @@ mod tests {
         );
         assert!(fix_arguments(Path::new(EXE), PROFILE_DOMAIN).unwrap().contains("profile=private,public,domain"));
         assert!(fix_arguments(Path::new("C:\\a\"b\\x.exe"), PROFILE_PRIVATE).is_err());
+    }
+
+    #[test]
+    fn netsh_is_run_from_the_absolute_system_folder() {
+        let p = netsh_path().expect("system folder");
+        assert!(p.is_absolute(), "{p:?}");
+        assert!(p.to_string_lossy().to_lowercase().ends_with("system32\\netsh.exe"), "{p:?}");
+        assert!(p.exists(), "{p:?}");
+    }
+
+    #[test]
+    fn an_allow_limited_to_some_remote_addresses_is_not_full_cover() {
+        let one = RuleInfo { remote_addresses: "192.168.1.10".into(), ..rule(PROFILE_PRIVATE | PROFILE_PUBLIC) };
+        assert_eq!(verdict(&snap(vec![one], PROFILE_PRIVATE)), FirewallStatus::RuleMissing);
+        // The same list on a block rule is still a block.
+        let blocked = RuleInfo { allow: false, remote_addresses: "192.168.1.10".into(), ..rule(PROFILE_PRIVATE | PROFILE_PUBLIC) };
+        assert!(matches!(verdict(&snap(vec![rule(PROFILE_PRIVATE), blocked], PROFILE_PRIVATE)), FirewallStatus::BlockedByRule { .. }));
+        for any in ["LocalSubnet", "*", "Intranet", "10.0.0.5,LocalSubnet"] {
+            let ok = RuleInfo { remote_addresses: any.into(), ..rule(PROFILE_PRIVATE | PROFILE_PUBLIC) };
+            assert_eq!(verdict(&snap(vec![ok], PROFILE_PRIVATE)), FirewallStatus::Ok, "{any}");
+        }
+    }
+
+    #[test]
+    fn an_allow_limited_to_some_local_addresses_is_not_counted() {
+        let lo = RuleInfo { local_addresses: "127.0.0.1".into(), ..rule(PROFILE_PRIVATE | PROFILE_PUBLIC) };
+        assert_eq!(verdict(&snap(vec![lo], PROFILE_PRIVATE)), FirewallStatus::RuleMissing);
+        let any = RuleInfo { local_addresses: "*".into(), ..rule(PROFILE_PRIVATE | PROFILE_PUBLIC) };
+        assert_eq!(verdict(&snap(vec![any], PROFILE_PRIVATE)), FirewallStatus::Ok);
+        // A block rule limited to 127.0.0.1 is still reported (a possible block is never hidden).
+        let block = RuleInfo { allow: false, local_addresses: "127.0.0.1".into(), ..rule(PROFILE_PRIVATE | PROFILE_PUBLIC) };
+        assert!(matches!(verdict(&snap(vec![rule(PROFILE_PRIVATE), block], PROFILE_PRIVATE)), FirewallStatus::BlockedByRule { .. }));
     }
 
     #[test]

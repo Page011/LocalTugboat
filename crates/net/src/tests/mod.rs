@@ -41,8 +41,8 @@ impl Gate {
 }
 
 impl AccessGate for Gate {
-    fn is_paired(&self, peer: &[u8; 32]) -> bool {
-        self.0.lock().unwrap().contains(peer)
+    fn is_paired(&self, peer: &[u8; 32]) -> Result<bool, String> {
+        Ok(self.0.lock().unwrap().contains(peer))
     }
 }
 

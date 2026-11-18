@@ -95,6 +95,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import uniffi.tugboat_ffi.GeoFix
+import uniffi.tugboat_ffi.LocationFix
 import androidx.compose.ui.text.style.TextOverflow
 
 /** Zoom numbers the lens chips and the pinch gesture share. */
@@ -138,6 +139,8 @@ fun CameraScreen(vm: SnapViewModel, ui: UiState, banners: List<UiLogic.BannerUi>
     var focusAt by remember { mutableStateOf<Offset?>(null) }
     var shutterFlash by remember { mutableStateOf(false) }
     var target by remember { mutableStateOf<Target?>(null) }
+    // The chip pick [target] was computed for: a shutter press only trusts [target] while it still matches the live pick.
+    var targetPick by remember { mutableStateOf<String?>(null) }
     val tracker = remember { LocationTracker(ctx) }
 
     val previewView = remember { PreviewView(ctx).apply { scaleType = PreviewView.ScaleType.FILL_CENTER } }
@@ -165,7 +168,10 @@ fun CameraScreen(vm: SnapViewModel, ui: UiState, banners: List<UiLogic.BannerUi>
         var lastError: String? = null
         while (true) {
             try {
-                target = withContext(Dispatchers.IO) { Capture.target(ctx, tracker.current()) }
+                val pickNow = ctx.core.nextShotFolder.value
+                val t = withContext(Dispatchers.IO) { Capture.target(ctx, tracker.current(), pickNow) }
+                target = t
+                targetPick = pickNow
                 lastError = null
             } catch (e: CancellationException) {
                 throw e
@@ -181,11 +187,14 @@ fun CameraScreen(vm: SnapViewModel, ui: UiState, banners: List<UiLogic.BannerUi>
     // Bind CameraX. Photo mode: preview + ImageCapture. Video mode: preview + VideoCapture. Rebinds on a change.
     DisposableEffect(owner, cameraOk, front, video) {
         var provider: ProcessCameraProvider? = null
+        // Set first thing on dispose: a provider future that completes after this screen left must not bind the camera.
+        var disposed = false
         var zoomLive: androidx.lifecycle.LiveData<androidx.camera.core.ZoomState>? = null
         val zoomObserver = Observer<androidx.camera.core.ZoomState> { zoom = ZoomInfo(it.zoomRatio, it.minZoomRatio, it.maxZoomRatio) }
         if (cameraOk) {
             val future = ProcessCameraProvider.getInstance(ctx)
             future.addListener({
+                if (disposed) return@addListener
                 try {
                     val p = future.get()
                     provider = p
@@ -217,6 +226,7 @@ fun CameraScreen(vm: SnapViewModel, ui: UiState, banners: List<UiLogic.BannerUi>
             }, main)
         }
         onDispose {
+            disposed = true
             // A recording in progress is stopped so its file is finished and kept (the finalize event hands it to the core).
             recording?.stop()
             zoomLive?.removeObserver(zoomObserver)
@@ -283,16 +293,20 @@ fun CameraScreen(vm: SnapViewModel, ui: UiState, banners: List<UiLogic.BannerUi>
     fun takePhoto() {
         val ic = imageCapture ?: return
         val file = newFile("IMG_", "jpg")
-        val folderId = target?.folderId
+        val folderId = UiLogic.shotFolder(ctx.core.nextShotFolder.value, folders.map { it.id }, target?.folderId, targetPick)
+        val fix = tracker.current()
         val geo = geoNow()
         val at = System.currentTimeMillis()
+        // Before the camera writes the file: a process death after that leaves a shot recover() can still route and date.
+        ShotMeta.write(ctx, file, ShotMeta(folderId, at, geo))
         shutterFlash = true
         haptic.performHapticFeedback(HapticFeedbackType.LongPress)
         Capture.shotTaken(ctx)
         ic.takePicture(ImageCapture.OutputFileOptions.Builder(file).build(), main, object : ImageCapture.OnImageSavedCallback {
-            override fun onImageSaved(r: ImageCapture.OutputFileResults) = handOff(vm, ctx, file, folderId, at, geo, false)
+            override fun onImageSaved(r: ImageCapture.OutputFileResults) = handOff(vm, ctx, file, folderId, at, geo, fix, false)
             override fun onError(e: ImageCaptureException) {
                 file.delete()
+                ShotMeta.delete(ctx, file)
                 ctx.core.reportError("photo: ${e.message}")
                 vm.say("Photo failed: ${e.message}")
             }
@@ -307,9 +321,11 @@ fun CameraScreen(vm: SnapViewModel, ui: UiState, banners: List<UiLogic.BannerUi>
         }
         val vc = videoCapture ?: return
         val file = newFile("VID_", "mp4")
-        val folderId = target?.folderId
+        val folderId = UiLogic.shotFolder(ctx.core.nextShotFolder.value, folders.map { it.id }, target?.folderId, targetPick)
+        val fix = tracker.current()
         val geo = geoNow()
         val at = System.currentTimeMillis()
+        ShotMeta.write(ctx, file, ShotMeta(folderId, at, geo)) // before recording starts: a killed process leaves a file recover() can route
         var pending = vc.output.prepareRecording(ctx, FileOutputOptions.Builder(file).build())
         if (ContextCompat.checkSelfPermission(ctx, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) pending = pending.withAudioEnabled()
         haptic.performHapticFeedback(HapticFeedbackType.LongPress)
@@ -325,7 +341,10 @@ fun CameraScreen(vm: SnapViewModel, ui: UiState, banners: List<UiLogic.BannerUi>
                         ctx.core.reportError("video: error ${ev.error} ${ev.cause?.message.orEmpty()}")
                         vm.say("Video stopped: ${videoErrorText(ev.error)}")
                     }
-                    if (file.length() > 0) handOff(vm, ctx, file, folderId, at, geo, true) else file.delete()
+                    if (file.length() > 0) handOff(vm, ctx, file, folderId, at, geo, fix, true) else {
+                        file.delete()
+                        ShotMeta.delete(ctx, file)
+                    }
                 }
                 else -> {}
             }
@@ -449,10 +468,14 @@ fun CameraScreen(vm: SnapViewModel, ui: UiState, banners: List<UiLogic.BannerUi>
 private const val PREF_MIC_ASKED = "mic_asked"
 
 /** Hand a finished file to the core on the process scope: it carries on if the user leaves the screen. */
-private fun handOff(vm: SnapViewModel, ctx: android.content.Context, file: File, folderId: String?, atMs: Long, geo: GeoFix?, video: Boolean) {
+private fun handOff(vm: SnapViewModel, ctx: android.content.Context, file: File, folderId: String?, atMs: Long, geo: GeoFix?, fix: LocationFix?, video: Boolean) {
     ctx.core.scope.launch {
         try {
-            Capture.add(ctx, file, file.name, folderId, atMs, geo, imported = false, video = video)
+            // No folder known at the press (the chip was still being recomputed): decide it now by the place rule, never the live pick (that is for the next shot).
+            val folder = folderId ?: runCatching { Capture.target(ctx, fix, null).folderId }.getOrNull()
+            // What the shot was meant for stays next to the file, so a retry by Capture.recover keeps folder, time and place.
+            ShotMeta.write(ctx, file, ShotMeta(folder, atMs, geo))
+            Capture.add(ctx, file, file.name, folder, atMs, geo, imported = false, video = video)
             vm.refreshLatest()
         } catch (e: Exception) {
             // The file stays in shots/ and Capture.recover retries it: nothing is lost.

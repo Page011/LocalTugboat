@@ -110,6 +110,38 @@ fn n17_name_decoding_and_cleaning() {
     assert_eq!(clean_name(&"\u{4e2d}".repeat(200), "f").chars().count(), MAX_NAME_CHARS);
 }
 
+/// A long non-ASCII PC name must not make the producer emit a code its own parser refuses.
+#[test]
+fn n17_long_non_ascii_names_still_encode_within_the_limit() {
+    for name in ["\u{754c}".repeat(64), "\u{1F600}".repeat(64), "Office PC".to_string()] {
+        let mut p = payload();
+        p.addrs = vec![
+            "192.168.1.20:47300".parse().unwrap(),
+            "192.168.1.21:47300".parse().unwrap(),
+            "192.168.1.22:47300".parse().unwrap(),
+            "192.168.1.23:47300".parse().unwrap(),
+        ];
+        p.pc_name = name.clone();
+        let text = p.encode();
+        assert!(text.len() <= MAX_PAYLOAD_LEN, "{} bytes for {name:?}", text.len());
+        let back = PairPayload::parse(&text).expect("the parser accepts what the encoder made");
+        assert!(name.starts_with(&back.pc_name), "the name is only ever shortened");
+        assert_eq!((back.pc_key, back.addrs, back.secret, back.expires_at_ms), (p.pc_key, p.addrs, p.secret, p.expires_at_ms));
+        if name == "Office PC" {
+            assert_eq!(back.pc_name, name, "a short name is unchanged");
+        } else {
+            assert!(!back.pc_name.is_empty());
+        }
+    }
+}
+
+/// A phone that stopped reading did not necessarily get the whole decision: not delivered.
+#[test]
+fn n20_a_stop_from_the_phone_is_not_delivery() {
+    assert!(decision_delivery(None).is_ok());
+    assert!(matches!(decision_delivery(Some(0)), Err(NetError::Stream(_))));
+}
+
 /// N18: known-answer vector, sensitivity to every input byte, zero padding.
 #[test]
 fn n18_pairing_code() {

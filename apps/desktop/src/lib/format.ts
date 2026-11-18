@@ -3,6 +3,7 @@
 // Times are unix ms; `now` is always passed in so a test controls the clock.
 
 import type { ActivityAction } from "./bindings/ActivityAction";
+import type { DeviceId } from "./bindings/DeviceId";
 import type { ItemView } from "./bindings/ItemView";
 import type { Retention } from "./bindings/Retention";
 import type { SyncStatus } from "./bindings/SyncStatus";
@@ -209,6 +210,14 @@ export const actionLabel = (a: ActivityAction): string => ACTIONS[a];
 
 /** Actions that mean something went wrong: the Activity list marks them with an alert icon. */
 export const isProblem = (a: ActivityAction): boolean => a === "refused" || a === "conflict" || a === "lost" || a === "paused" || a === "sync_error";
+
+/** Who an Activity row came from: this PC, the paired phone, or a phone that is no longer paired. */
+export function deviceLabel(device: DeviceId | null, selfId: DeviceId | null, paired: { id: DeviceId; name: string } | null): string {
+  if (device === null) return "System";
+  if (device === selfId) return "This PC";
+  if (paired && device === paired.id) return paired.name;
+  return "Earlier phone";
+}
 
 /** Bin days field: a whole number 1..365 (the same range Core enforces, so the error shows before the save). */
 export function parseBinDays(text: string): { ok: true; days: number } | { ok: false; message: string } {

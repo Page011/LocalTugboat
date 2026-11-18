@@ -117,23 +117,23 @@ pub fn folder_views(c: &Connection, now: i64, hide_refused: bool) -> Result<Vec<
 /// Number of items that `set_retention(folder, new)` would move to the Bin at `now`
 /// (M4 confirmation "This moves 132 items to the Bin").
 pub fn retention_preview(c: &Connection, folder: FolderId, new: Retention, now: i64) -> Result<u32> {
-    let mut map: HashMap<FolderId, FolderRecord> = store::all_folders(c)?.into_iter().map(|f| (f.id, f)).collect();
+    let map: HashMap<FolderId, FolderRecord> = store::all_folders(c)?.into_iter().map(|f| (f.id, f)).collect();
     let Some(current) = map.get(&folder).cloned() else { return Ok(0) };
     let mut changed = current;
     changed.retention.val = new;
+    // The proposed map never changes inside the loop: build it once.
+    let mut with_new = map.clone();
+    with_new.insert(folder, changed);
     let mut n = 0;
     for id in store::item_ids_in_folder(c, folder)? {
         let Some((rec, _)) = store::get_item(c, id)? else { continue };
         if expiry::in_bin(bin::derive_state_in(c, &map, &rec, now)?) {
             continue;
         }
-        let mut with_new = map.clone();
-        with_new.insert(folder, changed.clone());
         if expiry::in_bin(bin::derive_state_in(c, &with_new, &rec, now)?) {
             n += 1;
         }
     }
-    map.clear();
     Ok(n)
 }
 

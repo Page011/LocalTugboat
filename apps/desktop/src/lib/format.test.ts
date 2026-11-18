@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { actionLabel, ago, binLabel, duration, fileIcon, fmtSize, isProblem, itemLabel, itemMeta, kindText, lastSeenText, parseBinDays, peerNote, shortPath, syncLabel } from "./format";
+import { actionLabel, ago, binLabel, deviceLabel, duration, fileIcon, fmtSize, isProblem, itemLabel, itemMeta, kindText, lastSeenText, parseBinDays, peerNote, shortPath, syncLabel } from "./format";
 import type { ItemView } from "./bindings/ItemView";
 import type { SyncStatus } from "./bindings/SyncStatus";
 
@@ -160,6 +160,18 @@ describe("last seen", () => {
     expect(lastSeenText(paired, { state: "connecting" }, NOW)).toBe("Last seen 3 h ago");
     expect(lastSeenText(paired, null, NOW)).toBe("Last seen 3 h ago");
     expect(lastSeenText({ last_seen_at: null }, { state: "offline" }, NOW)).toBe("Last seen never");
+  });
+});
+
+describe("deviceLabel", () => {
+  const me = "aa" as never;
+  const phone = { id: "bb" as never, name: "Sam's phone" };
+  test("system, this PC, the paired phone and a former phone", () => {
+    expect(deviceLabel(null, me, phone)).toBe("System");
+    expect(deviceLabel(me, me, phone)).toBe("This PC");
+    expect(deviceLabel(phone.id, me, phone)).toBe("Sam's phone");
+    expect(deviceLabel("cc" as never, me, phone)).toBe("Earlier phone");
+    expect(deviceLabel("cc" as never, me, null)).toBe("Earlier phone");
   });
 });
 

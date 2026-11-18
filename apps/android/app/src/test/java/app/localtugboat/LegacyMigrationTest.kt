@@ -138,6 +138,17 @@ class LegacyMigrationTest {
         assertEquals(2, r.moved.size)
     }
 
+    @Test fun a_resumed_run_with_a_conflicting_wal_stops_the_core_and_changes_nothing() {
+        put(files, "tugboat.db", "DB")
+        put(files, "snapferry.db-wal", "OLD-WAL-WITH-COMMITTED-DATA")
+        put(files, "tugboat.db-wal", "OTHER-WAL")
+        val before = everyFile()
+        val r = LegacyMigration.runIn(files, prefs)
+        assertTrue(r.blocksCore)
+        assertTrue(r.stopMessage!!.startsWith("UPGRADE STOPPED"))
+        assertEquals(before, everyFile())
+    }
+
     @Test fun a_wal_without_any_database_is_not_touched() {
         put(files, "snapferry.db-wal", "ORPHAN")
         val r = LegacyMigration.runIn(files, prefs)

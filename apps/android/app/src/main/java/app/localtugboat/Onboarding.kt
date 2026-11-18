@@ -207,7 +207,10 @@ fun QrScanner(onPayload: (String) -> Unit, onError: (String) -> Unit, modifier: 
         val future = ProcessCameraProvider.getInstance(ctx)
         val main = ContextCompat.getMainExecutor(ctx)
         var provider: ProcessCameraProvider? = null
+        // Set first thing on dispose: a provider future that completes after the scanner left must not bind the camera.
+        var disposed = false
         future.addListener({
+            if (disposed) return@addListener
             try {
                 val p = future.get()
                 provider = p
@@ -221,6 +224,7 @@ fun QrScanner(onPayload: (String) -> Unit, onError: (String) -> Unit, modifier: 
             }
         }, main)
         onDispose {
+            disposed = true
             provider?.unbindAll()
             executor.shutdown()
             analyzer.close()

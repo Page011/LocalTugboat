@@ -207,6 +207,22 @@ pub(super) fn check_new_library(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Delete `src` only while it is still what was copied: same length and, within the 2 s a FAT
+/// volume rounds to, same last-write time (the copy keeps the source's time). A file another
+/// program edited while a big library copied is kept, and shows as an old file not deleted.
+/// Any metadata or delete error also keeps it. True = the source is gone.
+pub(super) fn remove_if_unchanged(src: &Path, copy: &Path) -> bool {
+    const SLACK: Duration = Duration::from_secs(2);
+    let (Ok(a), Ok(b)) = (std::fs::metadata(src), std::fs::metadata(copy)) else {
+        return false;
+    };
+    let (Ok(x), Ok(y)) = (a.modified(), b.modified()) else {
+        return false;
+    };
+    let gap = x.max(y).duration_since(x.min(y)).unwrap_or_default();
+    a.len() == b.len() && gap <= SLACK && std::fs::remove_file(src).is_ok()
+}
+
 impl Inner {
     /// The status the UI shows: the scan's own Not synced list, then what Core refused to take from
     /// the other device (those have no file on this PC, so their path is empty).
@@ -337,7 +353,8 @@ impl Inner {
         if !errors.is_empty() && rep.retry_after.is_none() {
             rep.retry_after = Some(self.opts.stable_for.max(Duration::from_secs(5)));
         }
-        st.last_error = errors.into_iter().next().or_else(|| leftover_message(&mut st));
+        let watcher_error = st.watcher_error.clone();
+        st.last_error = errors.into_iter().next().or(watcher_error).or_else(|| leftover_message(&mut st));
         st.last_scan_at = Some(unix_ms());
         self.persist(&mut st);
         self.publish(&mut st);
@@ -360,8 +377,11 @@ impl Inner {
         let dirs = self.place.dirs();
         self.place.take_dirty();
         if st.cfg.dirs != dirs {
-            st.cfg.dirs = dirs;
+            // The in-memory copy changes only when the file did: after a failed save the next
+            // pass sees the difference again and retries, instead of believing it is saved.
+            let old = std::mem::replace(&mut st.cfg.dirs, dirs);
             if let Err(e) = st.cfg.save(&self.data_dir) {
+                st.cfg.dirs = old;
                 st.last_error = Some(format!("CANNOT SAVE LIBRARY CONFIG - {e}"));
             }
         }
@@ -1150,7 +1170,8 @@ impl Inner {
         let mut rep = PassReport::default();
         let mut errors = Vec::new();
         self.pass_inner(&mut st, true, Instant::now(), true, &mut rep, &mut errors);
-        st.last_error = errors.first().cloned().or_else(|| leftover_message(&mut st));
+        let watcher_error = st.watcher_error.clone();
+        st.last_error = errors.first().cloned().or(watcher_error).or_else(|| leftover_message(&mut st));
         self.persist(&mut st);
         self.publish(&mut st);
         match errors.into_iter().next() {
@@ -1165,13 +1186,39 @@ impl Inner {
         if config::read_marker(path).as_deref() != Some(want.as_str()) {
             return Err(CmdError::new("not_library", format!("NOT YOUR LIBRARY - {} has no matching Tugboat marker", path.display())));
         }
+        let old_cfg = st.cfg.clone();
+        let old_dirs = self.place.dirs();
+        let mut moved: Vec<HeldFile> = Vec::new();
+        if let Err(e) = self.locate_switch(&mut st, path, &mut moved) {
+            // Undo (C4): the scans and the placement must keep using the same, old root, and the
+            // saved config still names it.
+            for h in &moved {
+                if let Err(re) = self.core.local_file_moved(h.item, PathBuf::from(&h.path), h.folder, &h.name) {
+                    tracing::error!("locate undo: {} not pointed back: {re}", h.name);
+                }
+            }
+            self.place.replace_dirs(old_dirs);
+            st.cfg = old_cfg;
+            return Err(e);
+        }
+        self.place.set_root(Some(path.to_path_buf()));
+        st.ids.clear();
+        st.mtimes.clear();
+        st.pending.clear();
+        Ok(())
+    }
+
+    /// The steps of Locate that can fail. Every item whose record moved is pushed to `moved`
+    /// (with its OLD path) so the caller can move it back.
+    fn locate_switch(&self, st: &mut State, path: &Path, moved: &mut Vec<HeldFile>) -> Result<(), CmdError> {
         // Held files point into the old folder. Move every path over to the same place under the
         // new root, or the scan would find the files there as new ones and import each a second
         // time (a library copied to another drive has new NTFS ids, so only the path can match).
         if let Some(old) = st.cfg.path.clone().filter(|o| !same_path(o, path)) {
-            for h in self.core.held_files()?.iter().filter(|h| is_inside(&old, Path::new(&h.path))) {
+            for h in self.core.held_files()?.into_iter().filter(|h| is_inside(&old, Path::new(&h.path))) {
                 let rel = Path::new(&h.path).strip_prefix(&old).map(Path::to_path_buf).unwrap_or_else(|_| PathBuf::from(Path::new(&h.path).file_name().unwrap_or_default()));
                 self.core.local_file_moved(h.item, path.join(rel), h.folder, &h.name)?;
+                moved.push(h);
             }
         }
         // The pre-0.2.0 list follows the library to its new place (identities belong to the old copy).
@@ -1195,10 +1242,6 @@ impl Inner {
         st.cfg.dirs = dirs;
         st.cfg.path = Some(path.to_path_buf());
         st.cfg.save(&self.data_dir)?;
-        self.place.set_root(Some(path.to_path_buf()));
-        st.ids.clear();
-        st.mtimes.clear();
-        st.pending.clear();
         Ok(())
     }
 
@@ -1224,46 +1267,174 @@ impl Inner {
         }
         std::fs::create_dir_all(path)?;
 
-        // Copy every held file first; switch only if all copies worked.
-        let held = self.core.held_files()?;
-        let mut copies: Vec<(HeldFile, PathBuf)> = Vec::new();
-        // Files whose source is already gone (the old drive died, or one was deleted since the
-        // last scan). Nothing to copy: their record moves to the new place and the next scan
-        // finds them missing, where the bulk guard asks the user before anything is binned.
-        let mut lost: Vec<(HeldFile, PathBuf)> = Vec::new();
-        if let Some(old) = &old_root {
+        // Refuse every placement under the old root BEFORE the first look at what Core holds.
+        // Pausing alone does not stop a download that already finished its blob: it commits
+        // inside Core's lock a moment later. With the gate shut that commit fails (retryable,
+        // rolled back, fetched again under the new root), and one that got the lock first is
+        // already in the list read below, because Core serialises both on the same lock.
+        let moving = old_root.is_some();
+        if moving {
+            self.place.set_switching(true);
             self.core.set_paused(Some("MOVING LIBRARY - please wait".into()));
-            for h in held.iter().filter(|h| is_inside(old, Path::new(&h.path))) {
-                let rel = Path::new(&h.path).strip_prefix(old).map(Path::to_path_buf).unwrap_or_default();
-                let dest = path.join(&rel);
-                let r = dest
-                    .parent()
-                    .map(std::fs::create_dir_all)
-                    .transpose()
-                    .and_then(|_| std::fs::copy(&h.path, &dest))
-                    .and_then(|n| if n == h.size { Ok(()) } else { Err(std::io::Error::other("copy is shorter than the original")) });
-                match r {
-                    Ok(()) => copies.push((h.clone(), dest)),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound && !Path::new(&h.path).exists() => lost.push((h.clone(), dest)),
+        }
+        let res = self.choose_move(&mut st, path, old_root.as_deref());
+        if moving {
+            // Open the gate again: on success the placement points at the new root now.
+            self.place.set_switching(false);
+            if res.is_err() {
+                self.core.set_paused(st.pause_reason.clone());
+            }
+        }
+        res
+    }
+
+    /// Copy, switch, clean up. An error leaves everything as it was (old library, old paths),
+    /// except the one case named in `switch_library`'s rollback: a copy is kept when a record
+    /// cannot be pointed back at its old file.
+    fn choose_move(&self, st: &mut State, path: &Path, old_root: Option<&Path>) -> Result<(), CmdError> {
+        // (file, its place in the new library, copied?). Files whose source is already gone (the
+        // old drive died, or one was deleted since the last scan) are not copied: their record
+        // moves to the new place and the next scan finds them missing, where the bulk guard asks
+        // the user before anything is binned.
+        let mut items: Vec<(HeldFile, PathBuf, bool)> = Vec::new();
+        // Remove what this attempt put in the new library: the copy (when there is one) and the
+        // subfolder made for it when empty, or the library folder would no longer be empty and
+        // the same choice would be refused on a retry. A not-copied item made its subfolder too.
+        let clean = |dest: &Path, copied: bool| {
+            if copied {
+                let _ = std::fs::remove_file(dest);
+            }
+            if let Some(dir) = dest.parent().filter(|d| !same_path(d, path)) {
+                let _ = std::fs::remove_dir(dir);
+            }
+        };
+        let discard = |items: &[(HeldFile, PathBuf, bool)]| {
+            for (_, dest, copied) in items {
+                clean(dest, *copied);
+            }
+        };
+        if let Some(old) = old_root {
+            // Copy every held file first. The placement gate is shut, so no file can arrive
+            // under the old root after this point; the list is still read until nothing new
+            // appears, to take in a commit that landed between the gate and the first read.
+            let mut seen: HashSet<ItemId> = HashSet::new();
+            loop {
+                let held = match self.core.held_files() {
+                    Ok(h) => h,
                     Err(e) => {
-                        for (_, c) in &copies {
-                            let _ = std::fs::remove_file(c);
+                        discard(&items);
+                        return Err(e.into());
+                    }
+                };
+                let fresh: Vec<HeldFile> = held.into_iter().filter(|h| is_inside(old, Path::new(&h.path)) && seen.insert(h.item)).collect();
+                if fresh.is_empty() {
+                    break;
+                }
+                for h in fresh {
+                    let rel = Path::new(&h.path).strip_prefix(old).map(Path::to_path_buf).unwrap_or_default();
+                    let dest = path.join(&rel);
+                    // Reserve the place first: create_new fails on ANY existing entry, hidden
+                    // ones included (check_new_library skips those). The copy then lands on a
+                    // file this attempt made, so no clean-up below can touch a user's file.
+                    let reserved = dest
+                        .parent()
+                        .map(std::fs::create_dir_all)
+                        .transpose()
+                        .and_then(|_| std::fs::OpenOptions::new().write(true).create_new(true).open(&dest).map(drop));
+                    if let Err(e) = reserved {
+                        discard(&items);
+                        clean(&dest, false);
+                        let why = if e.kind() == std::io::ErrorKind::AlreadyExists { "already exists in the new folder".to_string() } else { e.to_string() };
+                        return Err(CmdError::new("io", format!("MOVE FAILED - {}: {why}", h.name)));
+                    }
+                    let r = std::fs::copy(&h.path, &dest).and_then(|n| if n == h.size { Ok(()) } else { Err(std::io::Error::other("copy is shorter than the original")) });
+                    match r {
+                        Ok(()) => items.push((h, dest, true)),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !Path::new(&h.path).exists() => {
+                            // Nothing to copy: give the reserved empty file back.
+                            let _ = std::fs::remove_file(&dest);
+                            items.push((h, dest, false));
                         }
-                        self.core.set_paused(st.pause_reason.clone());
-                        return Err(CmdError::new("io", format!("MOVE FAILED - {}: {e}", h.name)));
+                        Err(e) => {
+                            // This item's own partial copy (a short or failed one) is not in
+                            // `items`, so it is cleaned here.
+                            clean(&dest, true);
+                            discard(&items);
+                            return Err(CmdError::new("io", format!("MOVE FAILED - {}: {e}", h.name)));
+                        }
                     }
                 }
             }
         }
-        let id = config::write_new_marker(path)?;
-        for (h, dest) in &copies {
-            self.core.local_file_moved(h.item, dest.clone(), h.folder, &h.name)?;
-            if let Ok(i) = winfs::identity_of(dest) {
-                let _ = self.core.set_file_identity(h.item, i.volume_serial, i.file_id);
+
+        let old_cfg = st.cfg.clone();
+        let old_dirs = self.place.dirs();
+        let (mut done, mut new_id) = (0usize, None::<String>);
+        if let Err(e) = self.switch_library(st, path, &items, &mut done, &mut new_id) {
+            // Undo (C4): the records, the directory map and the config go back to the old
+            // library, so a restart loads the old config and finds every file where it is.
+            let mut reverted = true;
+            for (h, _, _) in &items[..done] {
+                if let Err(re) = self.core.local_file_moved(h.item, PathBuf::from(&h.path), h.folder, &h.name) {
+                    tracing::error!("choose undo: {} not pointed back: {re}", h.name);
+                    reverted = false;
+                    continue;
+                }
+                if let (Some(v), Some(f)) = (h.volume_serial, h.file_id) {
+                    let _ = self.core.set_file_identity(h.item, v, f);
+                }
             }
+            self.place.replace_dirs(old_dirs);
+            st.cfg = old_cfg;
+            if let Some(id) = &new_id {
+                // Only the marker this attempt wrote.
+                if config::read_marker(path).as_deref() == Some(id.as_str()) {
+                    let dir = path.join(HIDDEN_DIR);
+                    let _ = std::fs::remove_file(dir.join(config::MARKER_FILE));
+                    let _ = std::fs::remove_dir(&dir);
+                }
+            }
+            // A copy is deleted only when no record can point at it any more.
+            if reverted {
+                discard(&items);
+            }
+            return Err(e);
         }
-        for (h, dest) in &lost {
+        self.place.set_root(Some(path.to_path_buf()));
+        self.place.set_switching(false);
+        st.ids.clear();
+        st.mtimes.clear();
+        st.pending.clear();
+        st.rejected.clear();
+        st.bulk = None;
+        st.pause = None;
+        st.pause_reason = None;
+        self.core.set_paused(None);
+        // The old files go last; failures are reported, never fatal (the new copies are live).
+        st.leftovers = items
+            .iter()
+            .filter(|(_, _, copied)| *copied)
+            .filter(|(h, dest, _)| !remove_if_unchanged(Path::new(&h.path), dest))
+            .map(|(h, _, _)| PathBuf::from(&h.path))
+            .collect();
+        st.last_error = leftover_message(st);
+        self.publish(st);
+        Ok(())
+    }
+
+    /// The steps of Choose that can fail after the copies exist. `done` counts the records
+    /// already pointed at their copy; `new_id` is the marker this attempt wrote.
+    fn switch_library(&self, st: &mut State, path: &Path, items: &[(HeldFile, PathBuf, bool)], done: &mut usize, new_id: &mut Option<String>) -> Result<(), CmdError> {
+        let id = config::write_new_marker(path)?;
+        *new_id = Some(id.clone());
+        for (h, dest, copied) in items {
             self.core.local_file_moved(h.item, dest.clone(), h.folder, &h.name)?;
+            *done += 1;
+            if *copied {
+                if let Ok(i) = winfs::identity_of(dest) {
+                    let _ = self.core.set_file_identity(h.item, i.volume_serial, i.file_id);
+                }
+            }
         }
         // Directory identities belong to the old drive location: relearn them by name.
         let mut dirs = self.place.dirs();
@@ -1274,19 +1445,6 @@ impl Inner {
         self.place.replace_dirs(dirs.clone());
         st.cfg = config::LibraryConfig { path: Some(path.to_path_buf()), id: Some(id), dirs, legacy_done: true, legacy: Vec::new() };
         st.cfg.save(&self.data_dir)?;
-        self.place.set_root(Some(path.to_path_buf()));
-        st.ids.clear();
-        st.mtimes.clear();
-        st.pending.clear();
-        st.rejected.clear();
-        st.bulk = None;
-        st.pause = None;
-        st.pause_reason = None;
-        self.core.set_paused(None);
-        // The old files go last; failures are reported, never fatal (the new copies are live).
-        st.leftovers = copies.iter().map(|(h, _)| PathBuf::from(&h.path)).filter(|p| std::fs::remove_file(p).is_err()).collect();
-        st.last_error = leftover_message(&mut st);
-        self.publish(&mut st);
         Ok(())
     }
 }

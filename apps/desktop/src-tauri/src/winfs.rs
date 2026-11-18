@@ -19,7 +19,7 @@ use windows::{
         Storage::FileSystem::{
             CopyFileExW, GetFileInformationByHandle, MoveFileExW, MOVEFILE_COPY_ALLOWED, GetFileInformationByHandleEx, GetVolumeInformationW, GetVolumePathNameW, SetFileAttributesW,
             BY_HANDLE_FILE_INFORMATION, COPYFILE_FLAGS, COPYPROGRESSROUTINE_PROGRESS, COPY_FILE_FAIL_IF_EXISTS, FILE_ATTRIBUTE_HIDDEN,
-            FILE_ATTRIBUTE_NORMAL, FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_INFO, FileIdInfo, LPPROGRESS_ROUTINE_CALLBACK_REASON, PROGRESS_CONTINUE,
+            FILE_ATTRIBUTE_NORMAL, FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_INFO, FileIdInfo, LPPROGRESS_ROUTINE_CALLBACK_REASON, MOVE_FILE_FLAGS, PROGRESS_CONTINUE,
         },
     },
 };
@@ -171,6 +171,28 @@ pub fn move_no_replace(from: &Path, to: &Path) -> io::Result<()> {
         .map_err(|e| io::Error::from_raw_os_error((e.code().0 as u32 & 0xFFFF) as i32))
 }
 
+/// Rename `from` to `to`, failing with `ErrorKind::AlreadyExists` when `to` exists. `std::fs::rename`
+/// replaces an existing file on Windows, so a file that appears between an `exists()` check and
+/// the rename would be silently overwritten; this call (MoveFileExW without
+/// MOVEFILE_REPLACE_EXISTING) makes the check and the rename one step. A rename that only
+/// changes the case of the name is still allowed (same file). Across drives it fails with
+/// ERROR_NOT_SAME_DEVICE (os error 17), as `std::fs::rename` does.
+pub fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    let wide = |p: &Path| -> Vec<u16> { p.as_os_str().encode_wide().chain(std::iter::once(0)).collect() };
+    let (a, b) = (wide(from), wide(to));
+    unsafe { MoveFileExW(PCWSTR(a.as_ptr()), PCWSTR(b.as_ptr()), MOVE_FILE_FLAGS(0)) }.map_err(|e| {
+        // A Win32 error comes back as 0x8007xxxx; std maps ERROR_ALREADY_EXISTS (183) and
+        // ERROR_FILE_EXISTS (80) to AlreadyExists.
+        let code = e.code().0 as u32;
+        if code >> 16 == 0x8007 {
+            io::Error::from_raw_os_error((code & 0xFFFF) as i32)
+        } else {
+            io::Error::other(format!("rename {} to {}: {e}", from.display(), to.display()))
+        }
+    })
+}
+
 /// Hidden or system file (desktop.ini, Thumbs.db, .tmp markers): never listed as "not synced".
 pub fn is_hidden_or_system(meta: &std::fs::Metadata) -> bool {
     meta.file_attributes() & (FILE_ATTRIBUTE_HIDDEN.0 | FILE_ATTRIBUTE_SYSTEM) != 0
@@ -246,6 +268,27 @@ mod tests {
         std::fs::rename(&dir, &renamed).unwrap();
         assert_eq!(identity_of(&renamed).unwrap(), id);
         assert!(identity_of(&d.path().join("missing")).is_err());
+    }
+
+    #[test]
+    fn rename_no_replace_never_overwrites() {
+        let d = tempfile::tempdir().unwrap();
+        let (a, b) = (d.path().join("a.txt"), d.path().join("b.txt"));
+        std::fs::write(&a, b"AAA").unwrap();
+        std::fs::write(&b, b"BBB").unwrap();
+        let e = rename_no_replace(&a, &b).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::AlreadyExists, "{e}");
+        assert_eq!(std::fs::read(&a).unwrap(), b"AAA");
+        assert_eq!(std::fs::read(&b).unwrap(), b"BBB");
+        // A free name works and carries the bytes.
+        let c = d.path().join("c.txt");
+        rename_no_replace(&a, &c).unwrap();
+        assert!(!a.exists());
+        assert_eq!(std::fs::read(&c).unwrap(), b"AAA");
+        // A case-only rename of the same file is still a rename.
+        let upper = d.path().join("C.TXT");
+        rename_no_replace(&c, &upper).unwrap();
+        assert_eq!(std::fs::read_dir(d.path()).unwrap().filter_map(|e| e.ok()).filter(|e| e.file_name() == "C.TXT").count(), 1);
     }
 
     #[test]

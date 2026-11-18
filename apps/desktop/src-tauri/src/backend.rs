@@ -68,6 +68,8 @@ pub trait Emitter: Send + Sync + 'static {
 pub struct AppInfo {
     pub version: String,
     pub device_name: String,
+    /// This PC's own device id: the activity list uses it to tell "This PC" from a former phone.
+    pub device_id: DeviceId,
     /// The UDP address the endpoint is bound to.
     pub bind: String,
     /// Set when the network could not start (port in use, no interface): sync is down.
@@ -295,6 +297,7 @@ impl Backend {
         AppInfo {
             version: self.app_version.clone(),
             device_name: self.core.config().device_name.clone(),
+            device_id: self.core.config().self_id,
             bind: lock(&self.bind).to_string(),
             network_error: lock(&self.network_error).clone(),
             data_dir: self.paths.data_dir.display().to_string(),

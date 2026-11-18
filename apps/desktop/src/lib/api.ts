@@ -139,6 +139,12 @@ export const onResync = (cb: () => void): Promise<UnlistenFn> => listen(EVENTS.r
 /** URL of an item's thumbnail (served by the `snapthumb` scheme; 404 when it has none). */
 export const thumbUrl = (id: ItemId): string => `http://snapthumb.localhost/${id}`;
 
+/** What a tile's <img> loads: null when the item has no thumbnail yet (show the icon, make no request).
+ *  The query changes when the thumbnail path does, so a tile that was mounted before the thumbnail existed
+ *  asks again; the scheme handler reads only the path and ignores the query. */
+export const thumbSrc = (item: { id: ItemId; thumb_path: string | null }): string | null =>
+  item.thumb_path === null ? null : `${thumbUrl(item.id)}?v=${encodeURIComponent(item.thumb_path)}`;
+
 /** Folder picker for the library location. null = cancelled. */
 export async function pickFolder(): Promise<string | null> {
   const p = await open({ directory: true, multiple: false });
