@@ -19,7 +19,7 @@ use tugboat_net::{
     close,
     pairing::{
         format_code, pc_read_hello, pc_send_decision, phone_start_with_proto, HelloOutcome, PairDecision, PairError, PairPayload, PairingWindow,
-        CONFIRM_TIMEOUT_MS,
+        CONFIRM_TIMEOUT_MS, PC_SAVE_WAIT,
     },
     NetError,
 };
@@ -38,7 +38,9 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 /// Dialing the PC from the QR addresses.
 const DIAL_TIMEOUT: Duration = Duration::from_secs(8);
 
-type Decision = (PairDecision, oneshot::Sender<std::result::Result<(), NetError>>);
+/// The decision for the phone, the channel that reports its delivery and, for Accepted, the
+/// signal that the PC has finished saving the pairing (sent or dropped once saving ended).
+type Decision = (PairDecision, oneshot::Sender<std::result::Result<(), NetError>>, Option<oneshot::Receiver<()>>);
 
 pub(crate) struct PendingConn {
     phone_key: [u8; 32],
@@ -104,7 +106,7 @@ pub(crate) fn begin(core: &Core, replace_existing: bool) -> Result<String> {
     if let Some(PairState { pending: Some(p), .. }) = old {
         // A window that was still waiting for a click is replaced: tell that phone.
         let (rtx, _) = oneshot::channel();
-        let _ = p.decide.send((PairDecision::Refused { reason: PairError::Cancelled }, rtx));
+        let _ = p.decide.send((PairDecision::Refused { reason: PairError::Cancelled }, rtx, None));
     }
     node.set_pairing_open(true);
     core.emit(Event::Pairing(PairingEvent::WindowOpen { payload: payload.clone(), expires_at }));
@@ -120,7 +122,7 @@ fn finish_window(core: &Core, reason: PairError) {
     }
     if let Some(p) = st.pending {
         let (rtx, _) = oneshot::channel();
-        let _ = p.decide.send((PairDecision::Refused { reason: reason.clone() }, rtx));
+        let _ = p.decide.send((PairDecision::Refused { reason: reason.clone() }, rtx, None));
     }
     core.emit(Event::Pairing(PairingEvent::Cancelled { code: pair_code(&reason), message: pair_text(&reason) }));
 }
@@ -193,10 +195,16 @@ pub(crate) async fn handle_conn(core: Core, peer: tugboat_net::node::PeerConn) {
             }
             tokio::select! {
                 d = decision => match d {
-                    Ok((decision, reply)) => {
+                    Ok((decision, reply, stored)) => {
                         let accepted = matches!(decision, PairDecision::Accepted { .. });
                         let r = pc_send_decision(&mut tx, &decision).await;
                         let _ = reply.send(r);
+                        // The phone dials to sync as soon as this connection closes. Close only once
+                        // the pairing is saved here (or saving failed): a sync dial that arrives first
+                        // is refused as "not paired", and the phone then unpairs itself.
+                        if let Some(stored) = stored {
+                            let _ = tokio::time::timeout(PC_SAVE_WAIT, stored).await;
+                        }
                         peer.close(if accepted { close::NORMAL } else { close::PAIRING_CLOSED }, "pairing finished");
                     }
                     Err(_) => peer.close(close::PAIRING_CLOSED, "pairing superseded"),
@@ -248,8 +256,10 @@ pub(crate) async fn confirm(core: &Core, accept: bool) -> Result<()> {
         Ok(Some(p)) => p,
     };
     let (rtx, rrx) = oneshot::channel();
+    // Held until the pairing is saved; dropping it on any early return also lets the connection close.
+    let (stored_tx, stored_rx) = oneshot::channel();
     let accepted = PairDecision::Accepted { pc_name: core.inner.cfg.device_name.clone() };
-    let delivered = match pending.decide.send((accepted, rtx)) {
+    let delivered = match pending.decide.send((accepted, rtx, Some(stored_rx))) {
         Ok(()) => tokio::time::timeout(Duration::from_secs(15), rrx).await.ok().and_then(|r| r.ok()),
         Err(_) => None,
     };
@@ -272,8 +282,14 @@ pub(crate) async fn confirm(core: &Core, accept: bool) -> Result<()> {
         last_seen_at: None,
         addresses: Vec::new(),
     };
+    let delay = core.inner.pair_save_delay_ms.load(std::sync::atomic::Ordering::SeqCst);
+    if delay > 0 {
+        tokio::time::sleep(Duration::from_millis(delay)).await;
+    }
     core.with_ctx(|c, ctx| ops::pairing_completed(c, ctx, &row))?;
     drop_other_sessions(core, row.id);
+    // Saved: the pairing connection may close now, and the phone's first sync dial is accepted.
+    let _ = stored_tx.send(());
     core.emit(Event::Pairing(PairingEvent::Completed { peer: row.id, peer_name: row.name.clone() }));
     core.emit(Event::ActivityAdded);
     core.emit_status();
