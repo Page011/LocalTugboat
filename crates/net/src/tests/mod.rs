@@ -1,7 +1,7 @@
 //! Test helpers shared by the net tests. Every endpoint binds 127.0.0.1 only (binding 0.0.0.0
 //! pops a Windows Firewall dialog on the user's screen), and mDNS is always off.
 //!
-//! Numbering follows notes/core-design.md section 16 (N1..N24).
+//! Tests are numbered N1..N24 in their doc comments.
 
 mod blob;
 mod frame;

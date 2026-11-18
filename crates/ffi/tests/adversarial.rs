@@ -1,5 +1,5 @@
-//! Adversarial checks of the exported phone API (verifier stage). Binds 127.0.0.1 only.
-//! A failing test here is a finding, not a broken test: see the doc comment on each.
+//! Adversarial checks of the exported phone API. Binds 127.0.0.1 only.
+//! A failing test here means the rule in its doc comment is broken.
 
 use std::{
     path::Path,

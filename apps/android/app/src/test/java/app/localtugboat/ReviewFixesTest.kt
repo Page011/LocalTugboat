@@ -11,7 +11,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import uniffi.tugboat_ffi.GeoFix
 
-/** Fixes from the PR 1 review that have a pure part. */
+/** Regression tests for fixes that have a pure part: shot metadata, EXIF orientation, share-import tokens, orphan sweep. */
 class ReviewFixesTest {
     // ---- shot meta (a failed hand-off keeps what the shot was meant for) ----
 
@@ -87,7 +87,7 @@ class ReviewFixesTest {
         assertFalse(ShareRuns.interrupted(null)) // nothing was started
     }
 
-    // ---- R1: meta is written at the shutter, orphans are swept ----
+    // ---- meta is written at the shutter, orphans are swept ----
 
     @Test fun sweep_removes_an_old_orphan_meta_and_keeps_the_rest() {
         val dir = Files.createTempDirectory("shots").toFile()

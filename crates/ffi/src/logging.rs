@@ -1,5 +1,5 @@
 //! Rust log file: <data_dir>/logs/tugboat.log, rotated at 5 MB, three files kept
-//! (tugboat.log, tugboat.log.1, tugboat.log.2). PLAN question 3: "app log 3 x 5 MB".
+//! (tugboat.log, tugboat.log.1, tugboat.log.2).
 //! The phone cannot show logcat on the user's device, so this file is what "Export log" shares.
 //! A failure to open or write the log is reported once through the callback, never swallowed.
 

@@ -1,7 +1,7 @@
 // QA driver for a running dev app. The app must be started with
 //   WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9340
 //   TUGBOAT_PROFILE=<temp dir>  TUGBOAT_BIND=127.0.0.1
-// (see notes/qa-desktop.md). Refuses to touch an app that is not on a QA profile.
+// Refuses to touch an app that is not on a QA profile.
 //
 //   bun scripts/qa.mjs info                 title, visible text, buttons
 //   bun scripts/qa.mjs theme dark|light     emulate the system colour scheme (only while this call runs)

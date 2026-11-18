@@ -1,10 +1,10 @@
-//! Pairing flows over tugboat-net's pairing primitives. Owner: sync builder.
+//! Pairing flows over tugboat-net's pairing primitives.
 //!
 //! PC: `begin` opens the window (QR payload), `handle_conn` serves each incoming pairing
 //! connection, `confirm` is the [Pair] / [Cancel] click, `tick` expires the window.
 //! Phone: `pair_with` runs the whole exchange from a scanned payload.
 //!
-//! Rules (PLAN "How it works / Pairing", notes/core-design.md section 3):
+//! Rules:
 //! - The PC completes a pairing only after the decision reached the phone (`pc_send_decision`
 //!   returned Ok): a PC that is paired with a phone that never heard "accepted" would be a
 //!   silent half-pairing.
@@ -18,7 +18,7 @@ use std::time::Duration;
 use tugboat_net::{
     close,
     pairing::{
-        format_code, pc_read_hello, pc_send_decision, phone_start, HelloOutcome, PairDecision, PairError, PairPayload, PairingWindow,
+        format_code, pc_read_hello, pc_send_decision, phone_start_with_proto, HelloOutcome, PairDecision, PairError, PairPayload, PairingWindow,
         CONFIRM_TIMEOUT_MS, PC_SAVE_WAIT,
     },
     NetError,
@@ -58,7 +58,7 @@ pub fn pair_code(e: &PairError) -> String {
     serde_json::to_value(e).ok().and_then(|v| v.get("code").and_then(|c| c.as_str().map(String::from))).unwrap_or_else(|| "pairing".into())
 }
 
-/// One-line text, the same on both devices (notes/core-design.md section 3).
+/// One-line text, the same on both devices.
 pub fn pair_text(e: &PairError) -> String {
     match e {
         PairError::SecretReused => "PAIRING BLOCKED - someone else used this code".into(),
@@ -309,6 +309,20 @@ fn drop_other_sessions(core: &Core, keep: DeviceId) {
 
 // ---------- phone ----------
 
+/// A failed dial of the pairing protocol after the code's expiry time (phone clock): the failure
+/// means "expired". Transport-level failures count, and so does a wrong secret: the PC opens a new
+/// pairing window with a new secret when the old one runs out, so an old QR reaches an open window
+/// and is told BadSecret. Any other answer the PC really sent stays as it is.
+fn code_ran_out(e: &NetError, expires_at_ms: i64, now_ms: i64) -> bool {
+    if now_ms < expires_at_ms {
+        return false;
+    }
+    matches!(
+        e,
+        NetError::Pairing(PairError::NotOpen | PairError::BadSecret) | NetError::Connect(_) | NetError::ClosedByPeer { .. } | NetError::Timeout(_) | NetError::Stream(_)
+    )
+}
+
 /// Phone: the whole exchange. `cancel` abandons it (the user tapped Cancel) at any point up to the
 /// PC's decision being read; after that the PC may already be paired with us, so the rest (drain,
 /// close, store the pairing) always runs to the end.
@@ -334,14 +348,21 @@ pub(crate) async fn pair_with(core: &Core, payload: &str, mut cancel: impl std::
         core.emit(Event::Pairing(PairingEvent::Cancelled { code: pair_code(&e), message: pair_text(&e) }));
         pair_err(&e)
     };
+    let proto = core.inner.pair_proto.load(std::sync::atomic::Ordering::SeqCst);
     let started = tokio::select! {
         biased;
-        r = phone_start(&node, &parsed, &core.inner.cfg.device_name, &core.inner.cfg.app_version, DIAL_TIMEOUT) => r,
+        r = phone_start_with_proto(&node, &parsed, &core.inner.cfg.device_name, &core.inner.cfg.app_version, DIAL_TIMEOUT, proto) => r,
         _ = &mut cancel => return Err(user_cancelled()),
     };
     let mut phone = match started {
         Ok(p) => p,
         Err(e) => {
+            // A PC whose pairing window ran out stops offering the pairing protocol, which reaches
+            // the phone as a failed dial ("not open", a closed or timed-out connection), never as
+            // "expired". When the code's own expiry time has passed by this phone's clock, that
+            // is what it means: say so ("PAIRING CODE EXPIRED - show a new QR"). A refusal the PC
+            // really sent (wrong secret, version, ...) keeps its own text.
+            let e = if code_ran_out(&e, parsed.expires_at_ms, core.now()) { NetError::Pairing(PairError::Expired) } else { e };
             cancelled(&e);
             return Err(net_err(e));
         }
@@ -365,6 +386,10 @@ pub(crate) async fn pair_with(core: &Core, payload: &str, mut cancel: impl std::
     let pc_name = match phone.finish(decision).await {
         Ok(n) => n,
         Err(e) => {
+            // The wrong-secret answer of a PC that opened a new window comes back here, not at the
+            // dial. Only that one is mapped: a decline or a drop after a good start keeps its text.
+            let stale = matches!(e, NetError::Pairing(PairError::BadSecret)) && core.now() >= parsed.expires_at_ms;
+            let e = if stale { NetError::Pairing(PairError::Expired) } else { e };
             cancelled(&e);
             return Err(net_err(e));
         }

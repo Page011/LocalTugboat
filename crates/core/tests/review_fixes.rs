@@ -1,4 +1,4 @@
-//! Tests for the verifier's second-round findings: violations and refused dials are surfaced,
+//! Tests that failures are surfaced and delivered: violations and refused dials are surfaced,
 //! an unpair made while apart reaches the other device, a missing file is retried quietly.
 //! Network tests bind 127.0.0.1 only (common harness).
 
@@ -13,8 +13,8 @@ use tugboat_core::{
     ActivityAction, LocalFileState, Retention, Role, TestClock, INBOX_ID,
 };
 
-// PLAN Network "iroh 1.4.1 cannot turn NAT traversal off": the live guard closes a connection
-// whose path leaves the LAN. PLAN: errors are surfaced, never swallowed. The enforcing device
+// iroh 1.4.1 cannot turn NAT traversal off, so the live guard closes a connection
+// whose path leaves the LAN. Errors are surfaced, never swallowed. The enforcing device
 // must show an error and an activity row, not only a debug log line.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_blocked_path_is_shown_to_the_user_and_the_session_recovers() {
@@ -65,7 +65,7 @@ async fn a_database_error_in_the_pairing_check_is_reported() {
     r.shutdown().await;
 }
 
-// PLAN Security: "Unpair removes the key on both devices". The phone unpairs while the PC is
+// An unpair removes the key on both devices. The phone unpairs while the PC is
 // out of reach: it must tell the PC as soon as it can, not leave the PC paired with a phone
 // that has forgotten it. Before the fix the phone stopped dialing and the PC stayed paired.
 #[tokio::test(flavor = "multi_thread")]

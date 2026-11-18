@@ -1,5 +1,5 @@
 // Pure text helpers: every label the screens show comes from here, so the rules (when an
-// item says "Expires in 5h", when it says "Waiting for phone") are tested without a window.
+// item says "Expires in 5h", what a file tile says about its type) are tested without a window.
 // Times are unix ms; `now` is always passed in so a test controls the clock.
 
 import type { ActivityAction } from "./bindings/ActivityAction";
@@ -44,8 +44,6 @@ export function itemLabel(it: ItemView, now: number): Label {
       return { text: "Kept", tone: "ok", icon: "pin" };
     case "folder_keep":
       return { text: "Folder keeps", tone: "ok", icon: "infinity" };
-    case "waiting":
-      return { text: "Waiting for phone", tone: "warn", icon: "hourglass" };
     case "live":
       return s.expires_at <= now
         ? { text: "Expiring now", tone: "warn", icon: "clock" }
@@ -56,6 +54,38 @@ export function itemLabel(it: ItemView, now: number): Label {
       return { text: "Expired", tone: "neutral", icon: "trash" };
   }
 }
+
+/** Which icon a file tile gets (lucide, monochrome); the tile maps the key to a component. */
+export type FileIconKey = "file" | "text" | "sheet" | "archive" | "audio" | "code" | "image" | "video";
+
+const FILE_ICON_BY_EXT: Record<string, FileIconKey> = {
+  pdf: "text", doc: "text", docx: "text", odt: "text", rtf: "text", txt: "text", md: "text", log: "text",
+  xls: "sheet", xlsx: "sheet", ods: "sheet", csv: "sheet", tsv: "sheet",
+  zip: "archive", "7z": "archive", rar: "archive", tar: "archive", gz: "archive", tgz: "archive", bz2: "archive", xz: "archive",
+  mp3: "audio", wav: "audio", flac: "audio", ogg: "audio", m4a: "audio", aac: "audio", opus: "audio",
+  js: "code", ts: "code", json: "code", html: "code", css: "code", xml: "code", py: "code", rs: "code", sh: "code", bat: "code", ps1: "code", sql: "code", yml: "code", yaml: "code",
+  svg: "image", psd: "image", ai: "image", raw: "image", dng: "image", bmp: "image", tif: "image", tiff: "image",
+  avi: "video", mkv: "video", wmv: "video", flv: "video",
+};
+
+/** The icon for a file's extension (any case); anything unknown, and no extension, is a plain file. */
+export function fileIcon(ext: string): FileIconKey {
+  const e = ext.toLowerCase();
+  return Object.hasOwn(FILE_ICON_BY_EXT, e) ? FILE_ICON_BY_EXT[e]! : "file";
+}
+
+/** What kind of thing an item is, in one word: "Photo", "Video", "PDF" (the extension), or "File" when it has none. */
+export function kindText(it: Pick<ItemView, "kind" | "ext">): string {
+  if (it.kind === "image") return "Photo";
+  if (it.kind === "video") return "Video";
+  return it.ext === "" ? "File" : it.ext.toUpperCase();
+}
+
+/** The line under a tile's name: "PDF, 1.2 MB". */
+export const itemMeta = (it: Pick<ItemView, "kind" | "ext" | "size">): string => `${kindText(it)}, ${fmtSize(it.size)}`;
+
+/** Said in the Bin when the item expired and the phone never confirmed holding it (it may exist on this PC only). */
+export const peerNote = (it: Pick<ItemView, "never_reached_peer">): string | null => (it.never_reached_peer ? "NOT ON PHONE" : null);
 
 /** Label of an item in the Bin: why it is there and when this PC removes its file. */
 export function binLabel(it: ItemView, binDays: number, now: number): Label {
@@ -101,6 +131,11 @@ export function fmtSize(bytes: number): string {
     i++;
   }
   return `${v >= 100 ? v.toFixed(0) : v.toFixed(1)} ${units[i]}`;
+}
+
+/** The paired phone's contact line: "Connected now" while a session is open, else when it was last seen. */
+export function lastSeenText(paired: { last_seen_at: number | null }, sync: Pick<SyncStatus, "state"> | null, now: number): string {
+  return sync && (sync.state === "syncing" || sync.state === "synced") ? "Connected now" : `Last seen ${ago(paired.last_seen_at, now)}`;
 }
 
 /** Local date and time for the Activity list. */

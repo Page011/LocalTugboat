@@ -10,9 +10,8 @@ import uniffi.tugboat_ffi.ActivityAction
 import uniffi.tugboat_ffi.ItemStateInfo
 
 /**
- * Tests for the verifier's findings that were fixed. Logic is tested directly; the rest reads the sources and the
- * manifest like AdversarialTest does, because it needs an Android runtime (the emulator runs are in
- * notes/android-results.md).
+ * Regression tests for fixed bugs. Logic is tested directly; the rest reads the sources and the manifest like
+ * AdversarialTest does, because it needs an Android runtime (the emulator covers those).
  */
 class FixesTest {
     private val main: File = listOf(File("src/main"), File("app/src/main")).first { it.isDirectory }

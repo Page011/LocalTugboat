@@ -28,12 +28,13 @@ use tugboat_core::{
 };
 
 use super::{
-    config::{self, DirEntry, HIDDEN_DIR},
+    config::{self, DirEntry, LegacyFile, HIDDEN_DIR},
     lock,
     placement::{is_inside, norm, same_path},
     unix_ms, Bulk, Inner, LibraryHealth, LibraryStatus, NotSyncedFile, PauseKind, Seen, State,
 };
 use crate::{
+    drop::DropTarget,
     error::CmdError,
     winfs::{self, FileIdentity},
 };
@@ -57,6 +58,13 @@ pub struct PassReport {
 
 // ---------- disk walk ----------
 
+/// Listed in Not synced when the file's content fails the photo/video check.
+const MISMATCH_REASON: &str = "REFUSED - content does not match its type";
+const RENAME_REASON: &str = "REFUSED - a file without an extension cannot take a photo or video name";
+const IN_PROGRESS_REASON: &str = "IN PROGRESS - not synced yet";
+const LINK_REASON: &str = "LINK - shortcuts to other places never sync";
+const LEGACY_REASON: &str = "FROM BEFORE 0.2.0 - not synced";
+
 struct DiskFile {
     path: PathBuf,
     /// Directory name under the root; None = the root itself (Inbox).
@@ -64,6 +72,11 @@ struct DiskFile {
     name: String,
     size: u64,
     mtime: i64,
+    /// Why this file is never imported (an always-refused name, a download still in progress,
+    /// a link). It is listed, never skipped silently. A held item renamed to a refused name or a
+    /// link in Explorer is neither renamed back nor called missing; a held file whose name only
+    /// looks like a download is handled like any other held file.
+    skip: Option<&'static str>,
 }
 
 struct DiskDir {
@@ -73,7 +86,7 @@ struct DiskDir {
 
 #[derive(Default)]
 struct Walk {
-    /// Files with a photo/video extension.
+    /// Every file the user can see, whatever its type (`DiskFile.skip` marks the ones never imported).
     files: Vec<DiskFile>,
     dirs: Vec<DiskDir>,
     /// Directories Tugboat does not sync (dot-named or hidden/system). Listed so a folder the
@@ -88,12 +101,36 @@ fn mtime_ms(meta: &std::fs::Metadata) -> i64 {
     meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
+/// What the Not synced list says for a refusal from Core.
+fn refusal_text(e: &CoreError) -> String {
+    match e {
+        CoreError::Refused(m) => m.clone(),
+        _ => MISMATCH_REASON.to_string(),
+    }
+}
+
 fn not_synced(path: &Path, name: &str, reason: &str) -> NotSyncedFile {
     NotSyncedFile { path: path.display().to_string(), name: name.to_string(), reason: reason.to_string() }
 }
 
-fn is_media_name(name: &str) -> bool {
-    Path::new(name).extension().and_then(|e| e.to_str()).is_some_and(|e| names::ext_family(e).is_some())
+/// A download or editor lock file that is not the real file yet: Chrome `.crdownload`, `.part`,
+/// Office `~$x.docx`, LibreOffice `.~lock.x.odt#`, and this app's own cross-drive move copy. These are listed but not synced.
+fn is_in_progress(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.starts_with("~$") || lower.starts_with(".~lock.") || super::placement::is_move_temp(name) || ["crdownload", "part", "partial", "download", "opdownload"].contains(&names::ext_of(name).as_str())
+}
+
+fn disk_file(path: PathBuf, dir: Option<String>, name: String, meta: &std::fs::Metadata) -> DiskFile {
+    let skip = if names::is_refused_name(&name) {
+        Some(names::REFUSED_TEXT)
+    } else if meta.file_type().is_symlink() {
+        Some(LINK_REASON)
+    } else if is_in_progress(&name) {
+        Some(IN_PROGRESS_REASON)
+    } else {
+        None
+    };
+    DiskFile { path, dir, name, size: meta.len(), mtime: mtime_ms(meta), skip }
 }
 
 /// List the root and its subfolders (one level: folders are flat). The root failing is an
@@ -141,10 +178,8 @@ fn walk(root: &Path, with_files: bool) -> std::io::Result<Walk> {
                         }
                         if smeta.is_dir() {
                             w.not_synced.push(not_synced(&sub.path(), &sname, "NESTED FOLDER - folders are one level deep"));
-                        } else if is_media_name(&sname) {
-                            w.files.push(DiskFile { path: sub.path(), dir: Some(name.clone()), name: sname, size: smeta.len(), mtime: mtime_ms(&smeta) });
                         } else {
-                            w.not_synced.push(not_synced(&sub.path(), &sname, "NOT A PHOTO OR VIDEO"));
+                            w.files.push(disk_file(sub.path(), Some(name.clone()), sname, &smeta));
                         }
                     }
                 }
@@ -152,11 +187,7 @@ fn walk(root: &Path, with_files: bool) -> std::io::Result<Walk> {
         } else if hidden {
             continue; // desktop.ini, Thumbs.db: Windows' own files, not the user's
         } else if with_files {
-            if is_media_name(&name) {
-                w.files.push(DiskFile { path, dir: None, name, size: meta.len(), mtime: mtime_ms(&meta) });
-            } else {
-                w.not_synced.push(not_synced(&path, &name, "NOT A PHOTO OR VIDEO"));
-            }
+            w.files.push(disk_file(path, None, name, &meta));
         }
     }
     Ok(w)
@@ -164,7 +195,7 @@ fn walk(root: &Path, with_files: bool) -> std::io::Result<Walk> {
 
 /// Ok when `path` may become a library: it does not exist, or holds nothing but `.tugboat`
 /// and Windows' hidden files. Pointing the library at a folder of 10,000 photos would sync
-/// them all and start expiring them (PLAN).
+/// them all and start expiring them.
 pub(super) fn check_new_library(path: &Path) -> Result<(), String> {
     if !path.exists() {
         return Ok(());
@@ -202,25 +233,56 @@ pub(super) fn remove_if_unchanged(src: &Path, copy: &Path) -> bool {
     a.len() == b.len() && gap <= SLACK && std::fs::remove_file(src).is_ok()
 }
 
-pub(super) fn build_status(st: &State) -> LibraryStatus {
-    let path = st.cfg.path.as_ref().map(|p| p.display().to_string());
-    let (health, message) = match (&st.cfg.path, &st.pause) {
-        (None, _) | (_, Some(PauseKind::NotConfigured)) => (LibraryHealth::NotConfigured, st.pause_reason.clone()),
-        (Some(p), Some(PauseKind::Missing)) => (LibraryHealth::Missing { path: p.display().to_string() }, st.pause_reason.clone()),
-        (_, Some(PauseKind::Bulk)) => {
-            let b = st.bulk.as_ref();
-            (LibraryHealth::BulkMissing { missing: b.map_or(0, |b| b.missing), total: b.map_or(0, |b| b.total) }, st.pause_reason.clone())
+impl Inner {
+    /// The status the UI shows: the scan's own Not synced list, then what Core refused to take from
+    /// the other device (those have no file on this PC, so their path is empty).
+    pub(super) fn status_of(&self, st: &State) -> LibraryStatus {
+        let path = st.cfg.path.as_ref().map(|p| p.display().to_string());
+        let (health, message) = match (&st.cfg.path, &st.pause) {
+            (None, _) | (_, Some(PauseKind::NotConfigured)) => (LibraryHealth::NotConfigured, st.pause_reason.clone()),
+            (Some(p), Some(PauseKind::Missing)) => (LibraryHealth::Missing { path: p.display().to_string() }, st.pause_reason.clone()),
+            (_, Some(PauseKind::Bulk)) => {
+                let b = st.bulk.as_ref();
+                (LibraryHealth::BulkMissing { missing: b.map_or(0, |b| b.missing), total: b.map_or(0, |b| b.total) }, st.pause_reason.clone())
+            }
+            _ => (LibraryHealth::Ready, None),
+        };
+        let mut not_synced = st.not_synced.clone();
+        not_synced.extend(self.refused_by_core());
+        LibraryStatus {
+            cloud_warning: st.cfg.path.as_deref().and_then(winfs::cloud_warning),
+            path,
+            health,
+            message,
+            not_synced,
+            cannot_mark: st.cannot_mark,
+            last_scan_at: st.last_scan_at,
+            last_error: st.last_error.clone(),
         }
-        _ => (LibraryHealth::Ready, None),
-    };
-    LibraryStatus {
-        cloud_warning: st.cfg.path.as_deref().and_then(winfs::cloud_warning),
-        path,
-        health,
-        message,
-        not_synced: st.not_synced.clone(),
-        last_scan_at: st.last_scan_at,
-        last_error: st.last_error.clone(),
+    }
+
+    /// Items Core holds as Refused (a shortcut or folder-setting file the other device sent, a file
+    /// over the size limit): listed so a refusal is never silent. A query failure is logged and the
+    /// scan's own list still shows.
+    fn refused_by_core(&self) -> Vec<NotSyncedFile> {
+        let rows = match self.core.refused_items(200) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("refused items not listed: {e}");
+                return Vec::new();
+            }
+        };
+        let peer = self.core.paired_device().ok().flatten().map(|d| d.name).unwrap_or_else(|| "the other device".to_string());
+        rows.into_iter()
+            .map(|it| {
+                let reason = if names::is_refused_record(&it.name, &it.ext) {
+                    format!("REFUSED - {peer} sent a shortcut or folder-setting file")
+                } else {
+                    format!("REFUSED - {peer} sent a file this PC will not take")
+                };
+                NotSyncedFile { path: String::new(), name: it.name, reason }
+            })
+            .collect()
     }
 }
 
@@ -235,7 +297,8 @@ fn leftover_message(st: &mut State) -> Option<String> {
 /// means the record was renamed elsewhere.
 pub(super) fn name_matches(record_name: &str, ext: &str, disk_name: &str) -> bool {
     let want = names::clean_stem(names::strip_ext(record_name, ext)).unwrap_or_default().to_lowercase();
-    let stem = Path::new(disk_name).file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
+    // The `ext_of` rule, so "Makefile", "archive.tar.gz" and "data.sqlite3" split like the core does.
+    let stem = names::strip_ext(disk_name, &names::ext_of(disk_name)).to_lowercase();
     // IMG_1 (2) -> IMG_1
     let base = match stem.rfind(" (") {
         Some(i) if stem.ends_with(')') && stem[i + 2..stem.len() - 1].chars().all(|c| c.is_ascii_digit()) && stem.len() > i + 3 => &stem[..i],
@@ -243,6 +306,11 @@ pub(super) fn name_matches(record_name: &str, ext: &str, disk_name: &str) -> boo
     };
     // A record name that could not be cleaned got a generated IMG_ name on disk: not a mismatch.
     want.is_empty() || stem == want || base == want
+}
+
+/// Is this file one of those recorded as already there before 0.2.0 (by path or NTFS identity)?
+fn is_legacy(legacy: &[LegacyFile], key: &str, ident: Option<FileIdentity>) -> bool {
+    legacy.iter().any(|e| e.path == key || matches!((ident, e.volume, &e.id), (Some(i), Some(v), Some(id)) if i.volume_serial == v && i.id_hex() == *id))
 }
 
 fn parse_folder(key: &str) -> Option<FolderId> {
@@ -305,7 +373,7 @@ impl Inner {
 
     /// Tell the UI when the status changed.
     pub(super) fn publish(&self, st: &mut State) {
-        let s = build_status(st);
+        let s = self.status_of(st);
         // The scan time moves on every pass: it is sent with the next real change, not alone.
         let same = st.published.as_ref().is_some_and(|p| LibraryStatus { last_scan_at: s.last_scan_at, ..p.clone() } == s);
         if !same {
@@ -353,6 +421,8 @@ impl Inner {
             self.set_pause(st, None, None);
             st.rewatch = true;
         }
+        // Files from the phone are marked as downloaded; a drive that cannot hold the mark gets one banner.
+        st.cannot_mark = !winfs::supports_named_streams(&root).unwrap_or(true);
 
         // 2. Directories. The map is read BEFORE the walk: an entry the placement adds after
         // this point has its directory on disk before it could be read here, never the reverse
@@ -424,10 +494,22 @@ impl Inner {
             }
             let ident = self.identity(st, f, &key, full);
             let idx = ident.and_then(|i| by_ident.get(&(i.volume_serial, i.file_id)).copied()).or_else(|| by_path.get(&key).copied());
+            // A held file whose name merely looks like a download ("movie.part" from the phone) is an ordinary
+            // synced file: it takes the normal path below, so its edits and remote renames still follow.
+            let held_download = idx.is_some() && f.skip == Some(IN_PROGRESS_REASON);
+            if let Some(why) = f.skip.filter(|_| !held_download) {
+                // Never imported, listed. A held item renamed to a refused name in Explorer is not missing and
+                // is left exactly as the user made it (never renamed back, never binned).
+                if let Some(i) = idx {
+                    matched[i] = true;
+                }
+                ns.push(not_synced(&f.path, &f.name, why));
+                continue;
+            }
             match idx {
                 Some(i) if !matched[i] => {
                     matched[i] = true;
-                    self.known(st, &held[i], f, ident, &index, &live, now, rep, errors);
+                    self.known(st, &held[i], f, ident, &index, &live, now, rep, errors, &mut ns);
                 }
                 // A second disk file claiming an already-matched item (a hard link): ignore.
                 Some(_) => {}
@@ -453,6 +535,7 @@ impl Inner {
             })
             .collect();
 
+        let mut legacy_changed = false;
         for (f, ident) in unmatched {
             if self.place.recently_arrived(&f.path) {
                 continue; // the placement just put it there; Core is about to record the path
@@ -464,18 +547,31 @@ impl Inner {
                 if let Ok((hash, _)) = tugboat_core::ops::hash_file(&f.path) {
                     if let Some(&i) = cands.iter().find(|&&i| held[i].hash == hash) {
                         missing.retain(|&m| m != i);
-                        self.moved(&held[i], f, ident, &index, rep, errors);
+                        self.moved(&held[i], f, ident, &index, rep, errors, &mut ns);
                         continue;
                     }
                 }
             }
             let key = norm(&f.path);
-            if st.rejected.get(&key) == Some(&(f.size, f.mtime)) {
-                ns.push(not_synced(&f.path, &f.name, "NOT A PHOTO OR VIDEO - content does not match its type"));
+            if let Some((size, mtime, why)) = st.rejected.get(&key) {
+                if *size == f.size && *mtime == f.mtime {
+                    ns.push(not_synced(&f.path, &f.name, why));
+                    continue;
+                }
+            }
+            // Files that were here before 0.2.0 synced every type stay out of sync (see LegacyFile).
+            if is_legacy(&st.cfg.legacy, &key, ident) {
+                ns.push(not_synced(&f.path, &f.name, LEGACY_REASON));
                 continue;
             }
             if st.pause.is_some() {
                 continue; // paused: nothing new is imported until the user decides
+            }
+            if !st.cfg.legacy_done && !st.legacy_closed && names::media_family_of_name(&f.name).is_none() {
+                st.cfg.legacy.push(LegacyFile { path: key.clone(), volume: ident.map(|i| i.volume_serial), id: ident.map(|i| i.id_hex()) });
+                legacy_changed = true;
+                ns.push(not_synced(&f.path, &f.name, LEGACY_REASON));
+                continue;
             }
             let Some(folder) = (match &f.dir {
                 None => Some(None),
@@ -497,11 +593,14 @@ impl Inner {
         st.mtimes.retain(|k, _| seen_paths.contains(k));
         st.rejected.retain(|k, _| seen_paths.contains(k));
         for f in &w.files {
-            if st.rejected.contains_key(&norm(&f.path)) && !ns.iter().any(|n| n.path == f.path.display().to_string()) {
-                ns.push(not_synced(&f.path, &f.name, "NOT A PHOTO OR VIDEO - content does not match its type"));
+            if let Some((_, _, why)) = st.rejected.get(&norm(&f.path)) {
+                if !ns.iter().any(|n| n.path == f.path.display().to_string()) {
+                    ns.push(not_synced(&f.path, &f.name, why));
+                }
             }
         }
         st.not_synced = ns;
+        self.settle_legacy(st, legacy_changed, errors);
         if rep.deferred > 0 {
             rep.retry_after = Some(self.opts.stable_for);
         }
@@ -546,6 +645,30 @@ impl Inner {
             _ => {
                 st.pending.insert(key, Seen { size: f.size, mtime: f.mtime, since: now });
                 false
+            }
+        }
+    }
+
+    /// The first complete pass under 0.2.0 closes the pre-0.2.0 list; later passes only drop entries whose
+    /// file is gone (a deleted file's name is free again and a new file of that name syncs).
+    fn settle_legacy(&self, st: &mut State, mut changed: bool, errors: &mut Vec<String>) {
+        // The change is made on a copy: the in-memory config takes it only when the file did (as `persist` does).
+        // After a failed save the next pass sees the same difference (`legacy_done` still false, the gone entries
+        // still listed) and tries again, instead of believing it is saved.
+        let mut next = st.cfg.clone();
+        if !next.legacy_done && st.pause.is_none() {
+            next.legacy_done = true;
+            st.legacy_closed = true; // decided now, saved or not: later passes classify nothing new as legacy
+            changed = true;
+        }
+        let before = next.legacy.len();
+        let live_ids: HashSet<(u64, String)> = st.ids.values().map(|(_, _, i)| (i.volume_serial, i.id_hex())).collect();
+        next.legacy.retain(|e| Path::new(&e.path).exists() || matches!((e.volume, &e.id), (Some(v), Some(id)) if live_ids.contains(&(v, id.clone()))));
+        if changed || next.legacy.len() != before {
+            match next.save(&self.data_dir) {
+                Ok(()) => st.cfg = next,
+                // Through `errors`: the pass overwrites `last_error` from them, and they also schedule the retry.
+                Err(e) => errors.push(format!("CANNOT SAVE LIBRARY CONFIG - {e}")),
             }
         }
     }
@@ -602,7 +725,7 @@ impl Inner {
                         claimed.insert(k.clone());
                         p.set(&k, DirEntry { name: d.name.clone(), volume, id });
                     } else {
-                        // New subfolder = new folder, Keep until its retention is set (PLAN).
+                        // New subfolder = new folder, Keep until its retention is set.
                         match self.core.create_folder(&d.name, Retention::Keep) {
                             Ok(fid) => {
                                 rep.folders_created += 1;
@@ -726,12 +849,13 @@ impl Inner {
         now: Instant,
         rep: &mut PassReport,
         errors: &mut Vec<String>,
+        ns: &mut Vec<NotSyncedFile>,
     ) {
         // Windows paths ignore case, so a case-only rename (IMG_1.jpg -> img_1.jpg) is the same
         // path to same_path: compare the file name exactly as well.
         let renamed = Path::new(&h.path).file_name().is_some_and(|n| n.to_string_lossy() != f.name.as_str());
         if !same_path(Path::new(&h.path), &f.path) || renamed {
-            self.moved(h, f, ident, index, rep, errors);
+            self.moved(h, f, ident, index, rep, errors, ns);
         } else {
             if let Some(i) = ident {
                 if h.volume_serial != Some(i.volume_serial) || h.file_id != Some(i.file_id) {
@@ -742,19 +866,31 @@ impl Inner {
             }
             // The disk agrees with what Core recorded, so a folder or name that differs from the
             // record was changed on the OTHER device: the file follows.
-            self.realign(h, f, index, live, rep, errors);
+            self.realign(h, f, index, live, rep, errors, ns);
         }
         // An edit: size differs from the record, or mtime moved since the last pass. Waits for
         // the same "copy finished" check as a new file, so a half-saved edit is not synced.
+        // The last handled mtime is remembered in Core too (`file_ref.mtime_ms`), so an edit made while the
+        // app was closed (same size, later mtime) is still seen at the next start.
         let key = norm(&f.path);
-        let last = st.mtimes.get(&key).copied();
+        let last = st.mtimes.get(&key).copied().or(h.mtime_ms);
         let changed = f.size != h.size || last.is_some_and(|m| m != f.mtime);
+        // An edit Core refused (too large, wrong type) is judged once per (size, mtime), like a
+        // new file: listed, not retried, so a refused file is never read again until it changes.
+        let judged = st.rejected.get(&key).is_some_and(|(size, mtime, _)| *size == f.size && *mtime == f.mtime);
+        if changed && judged {
+            return;
+        }
         if changed {
             if self.stable(st, f, now) {
                 match self.core.local_content_changed(h.item, f.path.clone()) {
                     Ok(()) => {
                         rep.edited += 1;
                         st.mtimes.insert(key, f.mtime);
+                        self.stamp_mtime(h.item, f.mtime);
+                    }
+                    Err(e @ (CoreError::NotMedia(_) | CoreError::Refused(_))) => {
+                        st.rejected.insert(key, (f.size, f.mtime, refusal_text(&e)));
                     }
                     Err(e) => errors.push(format!("EDIT NOT SYNCED - {}: {e}", f.name)),
                 }
@@ -763,11 +899,31 @@ impl Inner {
             }
         } else {
             st.mtimes.insert(key, f.mtime);
+            if h.mtime_ms != Some(f.mtime) {
+                self.stamp_mtime(h.item, f.mtime);
+            }
+        }
+    }
+
+    /// Remember the mtime just handled. A failure is logged: the cost is one extra look at the file later.
+    fn stamp_mtime(&self, item: ItemId, mtime: i64) {
+        if let Err(e) = self.core.set_file_mtime(item, mtime) {
+            tracing::warn!("mtime of {item:?} not remembered: {e}");
         }
     }
 
     /// The record's folder or name changed on the other device: move the file on disk to match.
-    fn realign(&self, h: &HeldFile, f: &DiskFile, index: &HashMap<String, FolderId>, live: &HashMap<FolderId, (FolderKind, String)>, rep: &mut PassReport, errors: &mut Vec<String>) {
+    #[allow(clippy::too_many_arguments)]
+    fn realign(
+        &self,
+        h: &HeldFile,
+        f: &DiskFile,
+        index: &HashMap<String, FolderId>,
+        live: &HashMap<FolderId, (FolderKind, String)>,
+        rep: &mut PassReport,
+        errors: &mut Vec<String>,
+        ns: &mut Vec<NotSyncedFile>,
+    ) {
         // A deleted or unknown folder shows its items under Unsorted (Core's effective folder).
         let want = if live.contains_key(&h.folder) { h.folder } else { UNSORTED_ID };
         let Some((kind, folder_name)) = live.get(&want).cloned() else { return };
@@ -796,12 +952,16 @@ impl Inner {
                 Err(e) => errors.push(format!("FILE PATH UPDATE FAILED - {}: {e}", h.name)),
             },
             Ok(_) => {}
+            // The other device renamed it to a name this PC refuses: the file stays as it is, listed once per
+            // pass (never an error, so no retry storm).
+            Err(CoreError::Refused(why)) => ns.push(not_synced(&f.path, &f.name, &why)),
             Err(e) => errors.push(format!("FILE NOT MOVED - {}: {e}", h.name)),
         }
     }
 
     /// A held file now lives at `f.path`: folder and name follow where the user put it.
-    fn moved(&self, h: &HeldFile, f: &DiskFile, ident: Option<FileIdentity>, index: &HashMap<String, FolderId>, rep: &mut PassReport, errors: &mut Vec<String>) {
+    #[allow(clippy::too_many_arguments)]
+    fn moved(&self, h: &HeldFile, f: &DiskFile, ident: Option<FileIdentity>, index: &HashMap<String, FolderId>, rep: &mut PassReport, errors: &mut Vec<String>, ns: &mut Vec<NotSyncedFile>) {
         let folder = match &f.dir {
             None => INBOX_ID,
             Some(d) => match index.get(&d.to_lowercase()) {
@@ -817,12 +977,29 @@ impl Inner {
         let old_name = Path::new(&h.path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let name = if old_name == f.name {
             h.name.clone()
+        } else if h.ext.is_empty() {
+            // No extension by the core's `ext_of` rule: the whole new name is the name ("Dr. Smith
+            // letter 2" must not be cut at its last dot).
+            f.name.clone()
+        } else if names::ext_of(&f.name) == h.ext {
+            names::join_ext(names::strip_ext(&f.name, &h.ext), &h.ext)
         } else {
+            // The user changed the extension: the record keeps its own type.
             let stem = Path::new(&f.name).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-            format!("{stem}.{}", h.ext)
+            names::join_ext(&stem, &h.ext)
         };
         match self.core.local_file_moved(h.item, f.path.clone(), folder, &name) {
             Ok(()) => rep.moved += 1,
+            // The record refuses the new name: the file stays as the user left it, listed once per
+            // pass (never an error, so no retry storm). Nothing was recorded, so it is not undone.
+            Err(CoreError::Refused(why)) => {
+                ns.push(not_synced(&f.path, &f.name, &why));
+                return;
+            }
+            Err(CoreError::NotMedia(_)) => {
+                ns.push(not_synced(&f.path, &f.name, RENAME_REASON));
+                return;
+            }
             Err(e) => {
                 errors.push(format!("MOVE NOT SYNCED - {}: {e}", f.name));
                 return;
@@ -833,6 +1010,45 @@ impl Inner {
                 errors.push(format!("FILE IDENTITY FAILED - {}: {e}", f.name));
             }
         }
+    }
+
+    /// Take one file into Core: a Shell thumbnail for photos and videos only, the record, and the mtime
+    /// to remember. The ONE place both a scan and a drag-and-drop copy add a file, so they obey the same rules.
+    pub(super) fn add_file(&self, path: &Path, name: &str, folder: Option<FolderId>, mtime: i64, ident: Option<FileIdentity>) -> Result<ItemId, CoreError> {
+        let tmp_dir = self.data_dir.join("tmp");
+        let thumb = if names::media_family_of_name(name).is_some() {
+            std::fs::create_dir_all(&tmp_dir).ok().and_then(|()| {
+                let out = tmp_dir.join(format!("{}.jpg", uuid::Uuid::now_v7()));
+                match crate::thumbs::make_thumbnail(path, &out) {
+                    Ok(()) => Some(out),
+                    Err(e) => {
+                        // Best effort: no Shell thumbnail (e.g. a codec is missing) means no thumbnail.
+                        tracing::debug!("no thumbnail for {}: {e}", path.display());
+                        None
+                    }
+                }
+            })
+        } else {
+            None
+        };
+        let new = NewLocalFile {
+            src: path.to_path_buf(),
+            name: name.to_string(),
+            folder,
+            captured_at: mtime.min(unix_ms()),
+            geo: None,
+            thumb: thumb.clone(),
+            how: AddKind::Added,
+            ntfs: ident.map(|i| (i.volume_serial, i.file_id)),
+        };
+        let r = self.core.add_local_file(new);
+        if let Some(t) = thumb {
+            let _ = std::fs::remove_file(t);
+        }
+        if let Ok(id) = &r {
+            self.stamp_mtime(*id, mtime);
+        }
+        r
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -846,41 +1062,16 @@ impl Inner {
         rep: &mut PassReport,
         errors: &mut Vec<String>,
     ) {
-        let tmp_dir = self.data_dir.join("tmp");
-        let thumb = std::fs::create_dir_all(&tmp_dir).ok().and_then(|()| {
-            let out = tmp_dir.join(format!("{}.jpg", uuid::Uuid::now_v7()));
-            match crate::thumbs::make_thumbnail(&f.path, &out) {
-                Ok(()) => Some(out),
-                Err(e) => {
-                    // Best effort: no Shell thumbnail (e.g. a codec is missing) means no thumbnail.
-                    tracing::debug!("no thumbnail for {}: {e}", f.path.display());
-                    None
-                }
-            }
-        });
-        let new = NewLocalFile {
-            src: f.path.clone(),
-            name: f.name.clone(),
-            folder,
-            captured_at: f.mtime.min(unix_ms()),
-            geo: None,
-            thumb: thumb.clone(),
-            how: AddKind::Added,
-            ntfs: ident.map(|i| (i.volume_serial, i.file_id)),
-        };
-        let r = self.core.add_local_file(new);
-        if let Some(t) = thumb {
-            let _ = std::fs::remove_file(t);
-        }
-        match r {
+        match self.add_file(&f.path, &f.name, folder, f.mtime, ident) {
             Ok(_) => {
                 rep.imported += 1;
                 st.mtimes.insert(norm(&f.path), f.mtime);
             }
-            Err(CoreError::NotMedia(why)) => {
+            Err(e @ (CoreError::NotMedia(_) | CoreError::Refused(_))) => {
                 // Judged once per (size, mtime): listed, never retried until the file changes.
-                st.rejected.insert(norm(&f.path), (f.size, f.mtime));
-                ns.push(not_synced(&f.path, &f.name, &format!("NOT A PHOTO OR VIDEO - {why}")));
+                let why = refusal_text(&e);
+                st.rejected.insert(norm(&f.path), (f.size, f.mtime, why.clone()));
+                ns.push(not_synced(&f.path, &f.name, &why));
             }
             Err(e) => errors.push(format!("NOT SYNCED YET - {}: {e}", f.name)),
         }
@@ -963,6 +1154,49 @@ impl Inner {
         }
     }
 
+    // ----- drag and drop -----
+
+    /// May a drop copy anything now? Ok = the library folder; Err = the one-line refusal. A missing or
+    /// paused library takes nothing (the scan would not look at it anyway).
+    pub(crate) fn drop_gate(&self) -> Result<PathBuf, String> {
+        let st = lock(&self.st);
+        let Some(root) = st.cfg.path.clone() else { return Err("LIBRARY NOT CHOSEN - nothing copied".into()) };
+        let marker = config::read_marker(&root);
+        if !root.is_dir() || marker.is_none() || marker != st.cfg.id || st.pause == Some(PauseKind::Missing) {
+            return Err("LIBRARY NOT FOUND - nothing copied".into());
+        }
+        match st.pause {
+            Some(PauseKind::NotConfigured) => Err("LIBRARY NOT CHOSEN - nothing copied".into()),
+            Some(_) => Err("PAUSED - nothing copied".into()),
+            None => Ok(root),
+        }
+    }
+
+    /// Put a finished copy (`tmp`, in `.tugboat`) into the target folder's directory under a free name
+    /// and take it into Core. Holds the scan lock the whole time, so a scan can neither import the
+    /// placed file a second time nor see it before Core knows it. On any failure the placed copy is
+    /// removed again (never an orphan the next scan would adopt as the user's own). Returns the name
+    /// the file has in the library.
+    pub(crate) fn place_dropped(&self, tmp: &Path, name: &str, target: &DropTarget, mtime: i64) -> Result<String, CoreError> {
+        let mut st = lock(&self.st);
+        let dir = self.place.dir_for_folder(target.id, target.kind, &target.name)?;
+        let placed = super::placement::place_new(tmp, &dir, name, None).map_err(|e| CoreError::io(tmp, e))?;
+        self.place.mark_arrived(&placed);
+        let ident = winfs::identity_of(&placed).ok();
+        let final_name = placed.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| name.to_string());
+        let folder = (target.kind != FolderKind::Inbox).then_some(target.id);
+        match self.add_file(&placed, &final_name, folder, mtime, ident) {
+            Ok(_) => {
+                st.mtimes.insert(norm(&placed), mtime);
+                Ok(final_name)
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&placed);
+                Err(e)
+            }
+        }
+    }
+
     // ----- user actions -----
 
     pub(super) fn resolve_missing(&self, bin: bool) -> Result<(), CmdError> {
@@ -1025,6 +1259,17 @@ impl Inner {
                 let rel = Path::new(&h.path).strip_prefix(&old).map(Path::to_path_buf).unwrap_or_else(|_| PathBuf::from(Path::new(&h.path).file_name().unwrap_or_default()));
                 self.core.local_file_moved(h.item, path.join(rel), h.folder, &h.name)?;
                 moved.push(h);
+            }
+        }
+        // The pre-0.2.0 list follows the library to its new place (identities belong to the old copy).
+        if let Some(old) = st.cfg.path.clone().filter(|o| !same_path(o, path)) {
+            let prefix = format!("{}\\", norm(&old).trim_end_matches('\\'));
+            for e in st.cfg.legacy.iter_mut() {
+                if let Some(rel) = e.path.strip_prefix(&prefix) {
+                    e.path = norm(&path.join(rel));
+                    e.volume = None;
+                    e.id = None;
+                }
             }
         }
         // Directory ids belong to the old copy: relearn them by name (as choose does).
@@ -1142,7 +1387,8 @@ impl Inner {
                         let why = if e.kind() == std::io::ErrorKind::AlreadyExists { "already exists in the new folder".to_string() } else { e.to_string() };
                         return Err(CmdError::new("io", format!("MOVE FAILED - {}: {why}", h.name)));
                     }
-                    let r = std::fs::copy(&h.path, &dest).and_then(|n| if n == h.size { Ok(()) } else { Err(std::io::Error::other("copy is shorter than the original")) });
+                    // A received file's Mark-of-the-Web must come along (a FAT/exFAT folder drops it without an error).
+                    let r = self.place.copy_marked(Path::new(&h.path), &dest).and_then(|n| if n == h.size { Ok(()) } else { Err(std::io::Error::other("copy is shorter than the original")) });
                     match r {
                         Ok(()) => items.push((h, dest, true)),
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound && !Path::new(&h.path).exists() => {
@@ -1238,7 +1484,7 @@ impl Inner {
             e.id = None;
         }
         self.place.replace_dirs(dirs.clone());
-        st.cfg = config::LibraryConfig { path: Some(path.to_path_buf()), id: Some(id), dirs };
+        st.cfg = config::LibraryConfig { path: Some(path.to_path_buf()), id: Some(id), dirs, legacy_done: true, legacy: Vec::new() };
         st.cfg.save(&self.data_dir)?;
         Ok(())
     }

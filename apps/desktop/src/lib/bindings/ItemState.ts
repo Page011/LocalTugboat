@@ -3,4 +3,4 @@
 /**
  * Derived expiry/Bin state of an item (computed by `expiry::item_state`, never stored).
  */
-export type ItemState = { "t": "deleted", binned_at: number, } | { "t": "expired", binned_at: number, } | { "t": "kept" } | { "t": "folder_keep" } | { "t": "waiting" } | { "t": "live", expires_at: number, };
+export type ItemState = { "t": "deleted", binned_at: number, } | { "t": "expired", binned_at: number, } | { "t": "kept" } | { "t": "folder_keep" } | { "t": "live", expires_at: number, };

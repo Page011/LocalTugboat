@@ -1,6 +1,6 @@
-//! Adversarial verification tests (added by the M1 verifier). Each test names one scenario
-//! that breaks a PLAN.md rule today; the comment above it quotes the rule. They are meant to
-//! FAIL until the bug is fixed. Network tests bind 127.0.0.1 only (common harness).
+//! Adversarial tests: each one names a scenario that could break a rule of the Bin, expiry or
+//! sync behaviour; the comment above it states the rule. Network tests bind 127.0.0.1 only
+//! (common harness).
 
 mod common;
 
@@ -11,7 +11,7 @@ use tugboat_core::{
 };
 
 /// A device that "is or was paired" with a phone that has confirmed `hash`: the expiry clock
-/// then runs for items with that hash (PLAN Folders and expiry). No network needed.
+/// then runs for items with that hash No network needed.
 fn confirm_by_paired_phone(d: &Dev, hash: tugboat_core::BlobHash) {
     let phone = DeviceId([0xBB; 32]);
     d.core.debug_conn(|c| {
@@ -34,7 +34,7 @@ fn confirm_by_paired_phone(d: &Dev, hash: tugboat_core::BlobHash) {
     });
 }
 
-// PLAN Folders and expiry: "Expired and deleted items sit in the Bin for 7 days (setting), then
+// Rule: "Expired and deleted items sit in the Bin for 7 days (setting), then
 // that device deletes its copy of the file." and "A kept (pinned) item never expires."
 // Removing Keep from an item kept for 10 days must put it in the Bin for the full Bin days.
 // Today: binned_at = max(due, receipt seen_at), both 10 days in the past, so the very first
@@ -64,7 +64,7 @@ async fn unkeep_of_an_old_item_purges_at_once_instead_of_binning() {
     assert!(d.bin().iter().any(|v| v.id == id), "the item is listed in the Bin so it can be restored");
 }
 
-// PLAN Folders and expiry: "Changing a folder's retention applies to every item in it. If that
+// Rule: "Changing a folder's retention applies to every item in it. If that
 // would expire items at once, the app asks first: 'This moves 132 items to the Bin.'" plus the
 // 7-day Bin rule above. A Keep folder with 30-day-old items changed to 24 h: the preview says
 // the items move to the Bin, but today the facade's sweep purges them immediately (no Bin time).
@@ -100,8 +100,7 @@ async fn shortening_folder_retention_purges_old_items_without_bin_time() {
     assert!(d.bin().iter().any(|v| v.id == id), "restorable from the Bin");
 }
 
-// PLAN Silent failures: "Photo never reached PC, then expired" is caught by "Nothing expires
-// without a receipt"; PLAN Folders and expiry: "If only the other device still has the file,
+// Rule: "If only the other device still has the file,
 // it is fetched from there." A momentary "not found" from the PC (file renamed in Explorer
 // before the watcher updated file_ref, library drive briefly offline) marks the phone's item
 // Lost FOREVER: no retry on later connects, the phone never sends a receipt, and the PC shows

@@ -17,7 +17,7 @@ import androidx.compose.ui.unit.Dp
 val LogoInkLight = Color(0xFF1A2733)
 val LogoInkDark = Color(0xFFFFFFFF)
 
-/** Logo shape: 904 x 362 source px (drawable ic_tugboat_logo, the owner's artwork traced to vectors). */
+/** Logo shape: 904 x 362 source px (drawable ic_tugboat_logo, the artwork traced to vectors). */
 const val LOGO_RATIO = 904f / 362f
 
 /** The logo ink for a surface colour: dark surface -> white, light surface -> navy. Pure, so the test can pin it. */
@@ -26,8 +26,8 @@ fun logoInkFor(surface: Color): Color = if (surface.luminance() < 0.5f) LogoInkD
 /**
  * The Tugboat logo for empty states and the first-run screen, [width] wide (height follows the artwork's
  * 904:362 shape). Decorative: the words beside it carry the meaning, so it has no content description.
- * The leftmost porthole is cut open by the hull's bottom edge ON PURPOSE (the owner's signature detail):
- * the vector is the owner's artwork unchanged.
+ * The leftmost porthole is cut open by the hull's bottom edge ON PURPOSE: keep it, and keep the vector
+ * identical to the artwork.
  */
 @Composable
 fun TugboatArt(width: Dp, modifier: Modifier = Modifier) {

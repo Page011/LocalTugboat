@@ -1,7 +1,7 @@
-//! Place routing (used by the phone at capture, M4; implemented and tested now). Owner: logic.
+//! Place routing (used by the phone at capture).
 //! Pure: no DB, no clock.
 //!
-//! PLAN Places:
+//! Rules:
 //! P1 A place = name, centre, radius (default 150 m), target folder.
 //! P2 A fix is usable if it is under 2 minutes old and accurate to 100 m or better.
 //! P3 Overlapping places: the smallest radius wins. Tie (equal radius): lowest PlaceId bytes,
@@ -110,7 +110,7 @@ mod tests {
         true
     }
 
-    // L22: haversine 1 degree of latitude = 111 195 m +- 1.
+    // Haversine 1 degree of latitude = 111 195 m +- 1.
     #[test]
     fn haversine_one_degree() {
         let d = distance_m(0.0, 0.0, 1.0, 0.0);
@@ -143,7 +143,7 @@ mod tests {
         assert_eq!(route(std::slice::from_ref(&pl), fix(1.01, 0.0), &all_live), Route::Default, "outside every place -> Default");
     }
 
-    // L22: stale fix, 101 m accuracy, no places, outside all, deleted target skipped.
+    // Stale fix, 101 m accuracy, no places, outside all, deleted target skipped.
     #[test]
     fn unusable_fix_goes_to_unsorted_only_when_places_exist() {
         let pl = place(1, -30.0, 151.0, 150.0, WORK);

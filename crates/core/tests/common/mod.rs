@@ -6,8 +6,11 @@
 
 use std::{
     net::SocketAddr,
-    path::PathBuf,
-    sync::{Arc, Mutex},
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 
@@ -16,7 +19,7 @@ use tugboat_core::{
     facade::{device_id_from_secret, NetworkConfig},
     ops::{AddKind, NewLocalFile},
     sync::digest,
-    store, AppStorage, Core, CoreConfig, DeviceId, ItemId, ItemQuery, ItemRecord, ItemView, LocalFileState, Role, TestClock,
+    store, AppStorage, BlobHash, Core, CoreConfig, DeviceId, FileTarget, ItemId, ItemQuery, ItemRecord, ItemView, LocalFileState, Placement, Role, TestClock,
 };
 
 /// 2026-09-21: an arbitrary fixed start (same as the logic tests).
@@ -72,6 +75,28 @@ impl Dev {
 
     /// Open (or reopen) a device in `dir`.
     pub fn open_in(dir: tempfile::TempDir, role: Role, name: &str, clock: &TestClock, secret: [u8; 32]) -> Dev {
+        Dev::open_in_with(dir, role, name, clock, secret, |s| Arc::new(s) as Arc<dyn Placement>)
+    }
+
+    /// A phone whose free space the test controls (the storage guard tests): returns the device,
+    /// the free bytes it reports and a switch that makes `available_space()` fail.
+    pub fn phone_with_space(name: &str, clock: &TestClock, free: u64) -> (Dev, Arc<AtomicU64>, Arc<AtomicBool>) {
+        let (free, fail) = (Arc::new(AtomicU64::new(free)), Arc::new(AtomicBool::new(false)));
+        let (f2, k2) = (free.clone(), fail.clone());
+        let dir = tempfile::tempdir().expect("temp dir");
+        let dev = Dev::open_in_with(dir, Role::Phone, name, clock, random_secret(), move |s| Arc::new(SpacePlacement { inner: s, free: f2, fail: k2 }));
+        (dev, free, fail)
+    }
+
+    /// Open (or reopen) a device in `dir` with a wrapped storage.
+    pub fn open_in_with(
+        dir: tempfile::TempDir,
+        role: Role,
+        name: &str,
+        clock: &TestClock,
+        secret: [u8; 32],
+        wrap: impl FnOnce(AppStorage) -> Arc<dyn Placement>,
+    ) -> Dev {
         let id = device_id_from_secret(&secret);
         let cfg = CoreConfig {
             data_dir: dir.path().join("data"),
@@ -81,7 +106,8 @@ impl Dev {
             app_version: "test-1".into(),
         };
         let storage = AppStorage::new(dir.path().join("storage")).expect("storage");
-        let (core, mut rx) = Core::open(cfg, Arc::new(clock.clone()), Arc::new(storage)).expect("open core");
+        let (core, mut rx) = Core::open(cfg, Arc::new(clock.clone()), wrap(storage)).expect("open core");
+        core.debug_record_blob_requests();
         let events = Arc::new(Mutex::new(Vec::new()));
         let log = events.clone();
         tokio::spawn(async move {
@@ -345,5 +371,42 @@ impl Rig {
     pub async fn shutdown(&self) {
         self.phone.stop().await;
         self.pc.stop().await;
+    }
+}
+
+/// `AppStorage` with a free-space reading the test sets (and can make fail): the phone storage guard.
+pub struct SpacePlacement {
+    pub inner: AppStorage,
+    pub free: Arc<AtomicU64>,
+    pub fail: Arc<AtomicBool>,
+}
+
+impl Placement for SpacePlacement {
+    fn part_path(&self, hash: &BlobHash) -> tugboat_core::Result<PathBuf> {
+        self.inner.part_path(hash)
+    }
+    fn commit(&self, part: &Path, t: &FileTarget) -> tugboat_core::Result<PathBuf> {
+        self.inner.commit(part, t)
+    }
+    fn adopt(&self, src: &Path, t: &FileTarget) -> tugboat_core::Result<PathBuf> {
+        self.inner.adopt(src, t)
+    }
+    fn relocate(&self, t: &FileTarget) -> tugboat_core::Result<PathBuf> {
+        self.inner.relocate(t)
+    }
+    fn to_bin(&self, t: &FileTarget) -> tugboat_core::Result<PathBuf> {
+        self.inner.to_bin(t)
+    }
+    fn from_bin(&self, t: &FileTarget) -> tugboat_core::Result<PathBuf> {
+        self.inner.from_bin(t)
+    }
+    fn purge(&self, t: &FileTarget) -> tugboat_core::Result<()> {
+        self.inner.purge(t)
+    }
+    fn available_space(&self) -> tugboat_core::Result<u64> {
+        if self.fail.load(Ordering::SeqCst) {
+            return Err(tugboat_core::CoreError::Io { path: "storage".into(), msg: "free space unknown (test)".into() });
+        }
+        Ok(self.free.load(Ordering::SeqCst))
     }
 }

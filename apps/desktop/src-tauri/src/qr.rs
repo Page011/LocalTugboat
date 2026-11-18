@@ -25,7 +25,7 @@ mod tests {
     use super::*;
 
     fn payload() -> String {
-        format!("localtugboat://pair?v=1&k={}&a=192.168.1.20:47300&s={}&e=1790000120000&n=NIGEL-PC", "ab".repeat(32), "cd".repeat(16))
+        format!("localtugboat://pair?v=1&k={}&a=192.168.1.20:47300&s={}&e=1790000120000&n=OFFICE-PC", "ab".repeat(32), "cd".repeat(16))
     }
 
     #[test]
@@ -35,7 +35,7 @@ mod tests {
         assert!(s.contains("#000000") && s.contains("#ffffff"));
         // The same text always gives the same picture.
         assert_eq!(s, svg(&payload()).unwrap());
-        assert_ne!(s, svg(&payload().replace("NIGEL", "OTHER")).unwrap());
+        assert_ne!(s, svg(&payload().replace("OFFICE", "OTHER")).unwrap());
     }
 
     #[test]

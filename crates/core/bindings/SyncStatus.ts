@@ -3,17 +3,22 @@ import type { SyncState } from "./SyncState";
 
 export type SyncStatus = { state: SyncState, peer_name: string | null, 
 /**
- * PLAN silent-failure row "Sync stopped": shown as "last synced" on both apps.
+ * Shown as "last synced" on both apps, so a stopped sync is visible.
  */
 last_synced_at: bigint | null, 
 /**
- * Items in state Waiting (not confirmed by the other device).
+ * Items held here (not in the Bin) that the paired device has not confirmed holding yet
+ * ("PC not found, 3 waiting"). 0 while unpaired. Expiry never waits for them (0.2.0).
  */
 waiting: number, 
 /**
- * Downloads queued.
+ * Items that wait on the other device: Pending here (queued downloads).
  */
 downloading: number, 
+/**
+ * Phone: the storage guard (`Settings.storage_guard_bytes`) is holding downloads back.
+ */
+storage_low: boolean, 
 /**
  * One short line for Refused/Paused ("Update Tugboat on the PC").
  */

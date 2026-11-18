@@ -67,7 +67,9 @@ class Core(private val app: Application) {
             // Runs on a Rust runtime thread: record and return, never call back into the core.
             when (event) {
                 is FfiEvent.Sync -> _status.value = event.status
-                is FfiEvent.Error -> reportError("${event.kind}: ${event.message}")
+                // The storage guard already has its own red banner (status.storageLow, with the count): a second amber one
+                // with the raw "storage_low:" text only repeats it and outlives it. It stays in the log.
+                is FfiEvent.Error -> if (event.kind == STORAGE_LOW_KIND) KLog.log(app, "core: ${event.kind}: ${event.message}") else reportError("${event.kind}: ${event.message}")
                 else -> {}
             }
             _events.tryEmit(event)
@@ -196,5 +198,8 @@ class Core(private val app: Application) {
     companion object {
         const val BURST_MS = 30_000L
         const val PAUSE_MS = 120_000L
+
+        /** FfiEvent.Error kind the core uses when the storage guard turns on (the banner shows it already). */
+        const val STORAGE_LOW_KIND = "storage_low"
     }
 }

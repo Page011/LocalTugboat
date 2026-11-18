@@ -148,6 +148,15 @@ fun CameraScreen(vm: SnapViewModel, ui: UiState, banners: List<UiLogic.BannerUi>
 
     LightSystemIcons()
 
+    // Rotating the phone recreates the activity (no configChanges), which unbinds CameraX and ends the recording.
+    // So the orientation is locked for exactly as long as a recording runs, and released the moment it ends or the screen leaves.
+    val activity = androidx.activity.compose.LocalActivity.current
+    val isRecording = recording != null
+    DisposableEffect(isRecording, activity) {
+        if (isRecording) activity?.requestedOrientation = UiLogic.recordingOrientation(true)
+        onDispose { if (isRecording) activity?.requestedOrientation = UiLogic.recordingOrientation(false) }
+    }
+
     // Location only while this screen is visible (while-in-use permission, never background).
     LifecycleResumeEffect(tracker) {
         tracker.start()?.let { KLog.log(ctx, "location not started: $it") }
@@ -327,6 +336,9 @@ fun CameraScreen(vm: SnapViewModel, ui: UiState, banners: List<UiLogic.BannerUi>
                 is VideoRecordEvent.Status -> recordMs.longValue = ev.recordingStats.recordedDurationNanos / 1_000_000
                 is VideoRecordEvent.Finalize -> {
                     recording = null
+                    // Released here, not only when the effect above disposes: that waits for a recomposition, which
+                    // does not come while the app is stopped (and never, if the process is killed meanwhile).
+                    activity?.requestedOrientation = UiLogic.recordingOrientation(false)
                     if (ev.hasError()) {
                         // The file is still handed over when it has content: the core checks it, a recording is never thrown away here.
                         ctx.core.reportError("video: error ${ev.error} ${ev.cause?.message.orEmpty()}")

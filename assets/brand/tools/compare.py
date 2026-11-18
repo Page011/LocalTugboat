@@ -35,11 +35,11 @@ ov = np.full(A.shape + (3,), 255, np.uint8)
 ov[A & Bm] = (190, 190, 190)
 ov[A & ~Bm] = (230, 30, 30)
 ov[~A & Bm] = (30, 90, 230)
-# approved-change zone box
+# porthole zone box
 im = Image.fromarray(ov).crop((X0, Y0, X1, Y1))
 dd = ImageDraw.Draw(im)
 dd.rectangle([455 - X0, 700 - Y0, 540 - X0, 795 - Y0], outline=(0, 160, 0))
-dd.text((10, 8), "grey = both, red = original only, blue = SVG only, green box = approved porthole change", fill=(0, 0, 0))
+dd.text((10, 8), "grey = both, red = original only, blue = SVG only, green box = porthole zone", fill=(0, 0, 0))
 im = im.resize((w * 2, h * 2), Image.NEAREST)
 im.save(R + r"\compare-diff-overlay.png")
 print("saved")

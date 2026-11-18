@@ -1,8 +1,8 @@
 //! Data model shared by every core module and (as JSON) by the wire protocol and the UIs.
-//! Owner: logic builder. Types here are the contract; add fields only by updating
-//! notes/core-design.md first.
+//! Types here are the contract: a new field changes the wire format and the generated UI
+//! types.
 //!
-//! Field groups (PLAN Sync model): each synced record is merged per field group, each group
+//! Field groups: each synced record is merged per field group, each group
 //! carrying its own `Version = (lamport, device)`. The higher version wins; versions compare
 //! by lamport first, then by device key bytes (total order, so both devices pick the same
 //! winner).
@@ -170,6 +170,8 @@ pub enum Retention {
 pub enum MediaKind {
     Image,
     Video,
+    /// Any other file (0.2.0: any file type syncs). No thumbnail, no photo/video content check.
+    File,
 }
 
 /// Local-only: what this device physically holds for an item. Never synced.
@@ -188,7 +190,8 @@ pub enum LocalFileState {
     /// Wanted, but the peer answered "not found". Soft: asked again on every connect and every few
     /// minutes, because the answer is often momentary (renamed in Explorer, drive briefly away).
     Lost,
-    /// The received file failed the type check (extension/magic); deleted, never stored.
+    /// The received file failed the type check (extension/magic) or is an always-refused name;
+    /// deleted or never downloaded, never stored.
     Refused,
 }
 
@@ -213,7 +216,8 @@ pub struct Content {
     pub hash: BlobHash,
     pub size: u64,
     pub kind: MediaKind,
-    /// Lowercase extension without the dot, from the allowlist (`names`).
+    /// Lowercase extension without the dot (`names::is_safe_ext`); may be empty (a file with no
+    /// extension). Photos and videos carry one of the media extensions, every other kind never does.
     pub ext: String,
     pub thumb: Option<Thumb>,
 }
@@ -336,13 +340,13 @@ pub struct DeviceRow {
     pub addresses: Vec<String>,
 }
 
-/// Local settings (`setting` table). PLAN question 9: business rules are settings, not constants.
+/// Local settings (`setting` table). Business rules are settings, not constants.
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub struct Settings {
     /// Days an item stays in the Bin before this device deletes its copy. Default 7.
     pub bin_days: u32,
-    /// Phone: stop downloading below this many free bytes. Default 2 GiB (M4).
+    /// Phone: stop downloading below this many free bytes. Default 2 GiB.
     #[cfg_attr(feature = "ts", ts(type = "number"))]
     pub storage_guard_bytes: u64,
     /// PC rescan: pause when more than this many files are missing. Default 20.
@@ -387,9 +391,6 @@ pub enum ItemState {
     Kept,
     /// In a folder whose retention is Keep (or an unknown/deleted folder). Label "Keep".
     FolderKeep,
-    /// Would expire, but the other device has not confirmed holding the file.
-    /// Label "Waiting for PC" / "Waiting for phone".
-    Waiting,
     /// Label "Expires in 5h".
     Live { expires_at: i64 },
 }
@@ -411,8 +412,11 @@ pub struct ItemView {
     pub local: LocalFileState,
     /// Local path of the held file (library or Bin), when held.
     pub path: Option<String>,
-    /// Local path of the thumbnail, when held.
+    /// Local path of the thumbnail, when held. Always None for a File.
     pub thumb_path: Option<String>,
+    /// In the Bin because it EXPIRED, and the paired device never confirmed holding this file:
+    /// the item may now exist on this device only (shown as "NOT ON PC" / "NOT ON PHONE").
+    pub never_reached_peer: bool,
 }
 
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
@@ -515,7 +519,7 @@ mod tests {
         Version { lamport: l, device: DeviceId([b; 32]) }
     }
 
-    // L1: version order = lamport, then device bytes; GENESIS is the lowest.
+    // Version order = lamport, then device bytes; GENESIS is the lowest.
     #[test]
     fn version_order() {
         assert!(dv(2, 0x01) > dv(1, 0xFF), "lamport first");

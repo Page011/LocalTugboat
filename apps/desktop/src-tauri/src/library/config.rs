@@ -29,6 +29,19 @@ pub struct DirEntry {
     pub id: Option<String>,
 }
 
+/// A file that was already in the library when 0.2.0 started syncing every file type. It is listed
+/// "FROM BEFORE 0.2.0 - not synced" instead of being imported: an import would start its expiry
+/// clock and the file would leave the user's folder a day later. Matched by path or NTFS identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LegacyFile {
+    /// `placement::norm` of the path.
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LibraryConfig {
     /// Library root. None = not chosen yet.
@@ -40,6 +53,13 @@ pub struct LibraryConfig {
     /// Folder id (uuid text) -> directory.
     #[serde(default)]
     pub dirs: BTreeMap<String, DirEntry>,
+    /// True once the first scan of this library under 0.2.0 has recorded `legacy`. A library made
+    /// by 0.2.0 (empty at the start) is born done; a 0.1.x `library.json` has no such key.
+    #[serde(default)]
+    pub legacy_done: bool,
+    /// Non-photo files that were in the library before 0.2.0 (see `LegacyFile`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub legacy: Vec<LegacyFile>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -103,7 +123,7 @@ mod tests {
     #[test]
     fn save_then_load_roundtrips_and_leaves_no_temp_file() {
         let d = tempfile::tempdir().unwrap();
-        let mut c = LibraryConfig { path: Some(PathBuf::from(r"D:\Local Tugboat")), id: Some("abc".into()), dirs: BTreeMap::new() };
+        let mut c = LibraryConfig { path: Some(PathBuf::from(r"D:\Local Tugboat")), id: Some("abc".into()), dirs: BTreeMap::new(), ..Default::default() };
         c.dirs.insert("f1".into(), DirEntry { name: "Work".into(), volume: Some(7), id: Some("00".repeat(16)) });
         c.save(d.path()).unwrap();
         assert_eq!(LibraryConfig::load(d.path()).unwrap(), c);

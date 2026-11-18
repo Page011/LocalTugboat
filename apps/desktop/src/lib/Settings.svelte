@@ -4,7 +4,8 @@
   import { api } from "./api";
   import { act, app, chooseLibrary, fail, rescanLibrary } from "./app.svelte";
   import Dialog from "./Dialog.svelte";
-  import { ago, parseBinDays } from "./format";
+  import { ago, lastSeenText, parseBinDays } from "./format";
+  import { lastWins } from "./generation";
 
   let autostart = $state<boolean | null>(null);
   let binText = $state("");
@@ -30,6 +31,22 @@
     autostart = await api.autostart().catch(() => on);
   }
 
+  // One save at a time, the LAST submitted value wins: a second submit while a save runs is queued, never skipped
+  // as "unchanged" against the old saved value.
+  let binSaveFailed = false;
+  const submitBin = lastWins<number>(
+    () => app.settings?.bin_days ?? null,
+    async (days) => {
+      binSaveFailed = true;
+      if (!app.settings) return false;
+      const next = { ...app.settings, bin_days: days };
+      if (!(await act(() => api.saveSettings(next)))) return false;
+      app.settings = next;
+      binSaveFailed = false;
+      return true;
+    },
+  );
+
   async function saveBin() {
     const text = binText;
     const r = parseBinDays(text);
@@ -39,17 +56,11 @@
       return;
     }
     binError = null;
-    if (!app.settings || r.days === app.settings.bin_days) {
-      binDirty = false;
-      return;
-    }
     // Stay dirty while the save runs and if it fails: the effect above must not put the old saved value back
-    // over the typed text. After a success, release only when nothing was typed meanwhile.
-    const next = { ...app.settings, bin_days: r.days };
-    if (await act(() => api.saveSettings(next))) {
-      app.settings = next;
-      if (binText === text) binDirty = false;
-    }
+    // over the typed text. After the run, release only when it worked and nothing was typed meanwhile.
+    await submitBin(r.days);
+    // (Settings never loaded: nothing could be saved; release, so the field follows the value once it loads.)
+    if (binText === text && (!binSaveFailed || !app.settings || r.days === app.settings.bin_days)) binDirty = false;
   }
 
   async function unpair() {
@@ -99,7 +110,7 @@
       <h2>Phone</h2>
       {#if app.paired}
         <p><strong>{app.paired.name}</strong></p>
-        <p class="muted">Paired {ago(app.paired.paired_at, app.now)}. Last seen {ago(app.paired.last_seen_at, app.now)}.</p>
+        <p class="muted">Paired {ago(app.paired.paired_at, app.now)}. {lastSeenText(app.paired, app.sync, app.now)}.</p>
         <div><button class="btn danger" onclick={() => (confirmUnpair = true)}><Unlink size={16} aria-hidden="true" /> Unpair</button></div>
       {:else}
         <p class="muted">No phone paired.</p>

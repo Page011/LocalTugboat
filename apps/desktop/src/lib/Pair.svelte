@@ -1,7 +1,7 @@
 <script lang="ts">
   import { Check, CircleAlert, QrCode, Smartphone } from "@lucide/svelte";
   import { app, beginPairing, cancelPairing, confirmPairing, dismissPairing } from "./app.svelte";
-  import { ago } from "./format";
+  import { ago, lastSeenText } from "./format";
   import { groupCode } from "./pairing";
 
   const p = $derived(app.pairing);
@@ -56,7 +56,7 @@
       <Smartphone size={28} aria-hidden="true" />
       <div class="grow">
         <h2>{app.paired.name}</h2>
-        <p class="muted">Paired {ago(app.paired.paired_at, app.now)}. Last seen {ago(app.paired.last_seen_at, app.now)}.</p>
+        <p class="muted">Paired {ago(app.paired.paired_at, app.now)}. {lastSeenText(app.paired, app.sync, app.now)}.</p>
       </div>
       <button class="btn" onclick={beginPairing}><QrCode size={16} aria-hidden="true" /> Pair a different phone</button>
     </div>

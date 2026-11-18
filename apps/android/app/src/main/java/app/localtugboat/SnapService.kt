@@ -118,13 +118,22 @@ class SnapService : Service() {
         /** Set by [stop]: the next destroy is on purpose, so its quiet time is not a failure. */
         @Volatile private var stopWanted = false
 
-        /** Returns an error text if the system refused to start the service, else null. */
-        fun start(c: Context): String? = try {
+        /**
+         * Returns an error text if the system refused to start the service, else null.
+         *
+         * A refusal is always in the log. It becomes a banner only when no start has succeeded within
+         * [StartRefusal.GRACE_MS]: Android can refuse one start (a broadcast delivered after a force-stop, a worker with
+         * no foreground standing) while the next one, from the opened app, works. A banner for the first would stay on
+         * screen although the service is running.
+         */
+        fun start(c: Context, why: String = "?"): String? = try {
             c.applicationContext.startForegroundService(Intent(c.applicationContext, SnapService::class.java))
             null
         } catch (e: Exception) {
-            val m = "service start refused: ${e.javaClass.simpleName}: ${e.message}"
-            c.core.reportError(m)
+            val m = "service start refused ($why): ${e.javaClass.simpleName}: ${e.message}"
+            KLog.log(c, m)
+            val core = c.core
+            StartRefusal.watch(core.scope, StartRefusal.GRACE_MS, { core.serviceRunning }, { core.reportError(it) }, m)
             m
         }
 
@@ -135,4 +144,16 @@ class SnapService : Service() {
             c.applicationContext.stopService(Intent(c.applicationContext, SnapService::class.java))
         }
     }
+}
+
+/** The rule for a refused service start: tell the user only if the service is still not running after a grace period. */
+object StartRefusal {
+    const val GRACE_MS = 10_000L
+
+    /** After [graceMs], calls [report] with [text] unless [running] says a start has worked since. */
+    fun watch(scope: kotlinx.coroutines.CoroutineScope, graceMs: Long, running: () -> Boolean, report: (String) -> Unit, text: String): Job =
+        scope.launch {
+            delay(graceMs)
+            if (!running()) report(text)
+        }
 }

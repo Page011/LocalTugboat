@@ -14,6 +14,10 @@
 //!   in two small time-limited sets (files just put somewhere, files just taken away), which the
 //!   rescan reads before it imports "new" files or bins "missing" ones.
 //! - C6 relocate, to_bin, from_bin, purge are idempotent.
+//! - C7 (0.2.0) `commit` marks every file RECEIVED from the other device as downloaded
+//!   (Mark-of-the-Web, `winfs::write_zone_mark`) on the part BEFORE the hard link / rename, so
+//!   there is no moment the file is visible in the library unmarked, and fails closed when the
+//!   mark cannot be written. `adopt` (the user's own files) never adds a mark.
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -106,6 +110,27 @@ fn remove_if_exists(p: &Path) -> Result<()> {
     }
 }
 
+/// Extension of the copy `move_across` makes next to its destination. It sits in the VISIBLE library folder, so the
+/// scan treats it as in progress (never imported) and the start-up clean-up removes one a crash left.
+pub const MOVE_EXT: &str = "tugboat-move";
+const MOVE_PREFIX: &str = ".tugboat-";
+
+/// A fresh name for that copy: `.tugboat-<32 hex>.tugboat-move`. A file the user or the phone brought in
+/// ("Notes.tugboat-move") never has this shape, so it is never taken for a leftover.
+fn move_temp_name() -> String {
+    format!("{MOVE_PREFIX}{}.{MOVE_EXT}", uuid::Uuid::now_v7().simple())
+}
+
+/// Is this file name one of this app's own move copies (see `move_temp_name`)?
+pub fn is_move_temp(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower
+        .strip_prefix(MOVE_PREFIX)
+        .and_then(|rest| rest.strip_suffix(MOVE_EXT))
+        .and_then(|rest| rest.strip_suffix('.'))
+        .is_some_and(|id| id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
 /// Move a file; across drives (the Bin is under %LOCALAPPDATA%, the library may be anywhere)
 /// copy next to the destination, then rename, then delete the source. A failure at any step
 /// leaves the source in place (C4). `replace` = an existing `to` may be overwritten (the Bin
@@ -116,7 +141,7 @@ pub fn move_across(from: &Path, to: &Path, replace: bool) -> io::Result<()> {
     match rename(from, to) {
         Ok(()) => Ok(()),
         Err(e) if e.raw_os_error() == Some(ERROR_NOT_SAME_DEVICE) => {
-            let tmp = to.with_extension("tugboat-move");
+            let tmp = to.with_file_name(move_temp_name());
             if let Err(e) = std::fs::copy(from, &tmp) {
                 let _ = std::fs::remove_file(&tmp);
                 return Err(e);
@@ -133,7 +158,7 @@ pub fn move_across(from: &Path, to: &Path, replace: bool) -> io::Result<()> {
 
 /// Put `src` into `dir` under `name` without ever overwriting someone else's file. `own` is the
 /// item's own current file: it may be replaced. Returns the final path; `src` is consumed.
-fn place_new(src: &Path, dir: &Path, name: &str, own: Option<&Path>) -> io::Result<PathBuf> {
+pub(crate) fn place_new(src: &Path, dir: &Path, name: &str, own: Option<&Path>) -> io::Result<PathBuf> {
     for _ in 0..64 {
         let taken = |n: &str| {
             let p = dir.join(n);
@@ -154,10 +179,8 @@ fn place_new(src: &Path, dir: &Path, name: &str, own: Option<&Path>) -> io::Resu
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(_) => {
                 // No hard links on this volume (FAT/exFAT), or src is on another drive.
-                // Checked rename: the exists() test above is the guard.
-                if candidate.exists() {
-                    continue;
-                }
+                // A move that never replaces: a file created under `candidate` since the check
+                // (std::fs::rename would overwrite it on Windows) sends us to the next free name.
                 match move_across(src, &candidate, false) {
                     Ok(()) => return Ok(candidate),
                     // Appeared after the check above: the rename refused, pick the next name.
@@ -186,6 +209,12 @@ pub struct PcLibrary {
     /// Files adopted in place (the user's own file): purge must not delete them (the add may
     /// have failed after adopt, and the file is the user's).
     adopted: Mutex<HashMap<String, Instant>>,
+    /// Test seam: make the Mark-of-the-Web write fail (a drive that cannot hold it).
+    #[cfg(test)]
+    pub(crate) fail_marks: AtomicBool,
+    /// Test seam: `copy_marked` loses the mark, as a copy onto FAT/exFAT does.
+    #[cfg(test)]
+    pub(crate) strip_copy_marks: AtomicBool,
 }
 
 impl PcLibrary {
@@ -199,6 +228,10 @@ impl PcLibrary {
             arrived: Mutex::new(HashMap::new()),
             departed: Mutex::new(HashMap::new()),
             adopted: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            fail_marks: AtomicBool::new(false),
+            #[cfg(test)]
+            strip_copy_marks: AtomicBool::new(false),
         }
     }
 
@@ -224,6 +257,11 @@ impl PcLibrary {
 
     pub fn bin_dir(&self) -> &Path {
         &self.bin
+    }
+
+    /// The placement just put a file here, or Core is about to record one the placement put here.
+    pub(crate) fn mark_arrived(&self, p: &Path) {
+        Self::touch(&self.arrived, p);
     }
 
     pub fn dirs(&self) -> BTreeMap<String, DirEntry> {
@@ -283,6 +321,11 @@ impl PcLibrary {
         self.root().ok_or_else(|| CoreError::Invalid("LIBRARY NOT CHOSEN - choose a library folder first".into()))
     }
 
+    /// The hidden `.tugboat` folder (part files, drop copies), made when missing.
+    pub(crate) fn staging_dir(&self) -> Result<PathBuf> {
+        self.part_dir()
+    }
+
     fn part_dir(&self) -> Result<PathBuf> {
         let dir = self.need_root()?.join(HIDDEN_DIR);
         if !dir.exists() {
@@ -295,26 +338,31 @@ impl PcLibrary {
     }
 
     fn bin_path(&self, t: &FileTarget) -> Result<PathBuf> {
-        // The extension came from a synced record: only allowlisted ones become part of a path.
-        if names::ext_family(&t.ext).is_none() {
+        // The extension came from a synced record: only safe ones (never a refused type) become part of a path.
+        if !names::is_safe_ext(&t.ext) || names::is_refused_ext(&t.ext) {
             return Err(CoreError::Invalid(format!("extension '{}' is not allowed", t.ext)));
         }
-        Ok(self.bin.join(format!("{}.{}", t.item.0.hyphenated(), t.ext.to_ascii_lowercase())))
+        Ok(self.bin.join(names::join_ext(&t.item.0.hyphenated().to_string(), &t.ext.to_ascii_lowercase())))
     }
 
     /// The directory for `t`'s folder (created when missing). Inbox = the root. A folder that
     /// has no directory yet gets the next free name and the entry is remembered.
     fn dir_for(&self, t: &FileTarget) -> Result<PathBuf> {
+        self.dir_for_folder(t.folder, t.folder_kind, &t.folder_name)
+    }
+
+    /// Same, from the folder alone (a drag-and-drop copy has no item yet).
+    pub(crate) fn dir_for_folder(&self, folder: tugboat_core::FolderId, kind: FolderKind, folder_name: &str) -> Result<PathBuf> {
         let root = self.need_root()?;
-        if t.folder_kind == FolderKind::Inbox {
+        if kind == FolderKind::Inbox {
             return Ok(root);
         }
-        let key = t.folder.0.to_string();
+        let key = folder.0.to_string();
         let mut dirs = lock(&self.dirs);
         let name = match dirs.get(&key) {
             Some(e) => e.name.clone(),
             None => {
-                let base = names::clean_folder_name(&t.folder_name).unwrap_or_else(|_| "Folder".to_string());
+                let base = names::clean_folder_name(folder_name).unwrap_or_else(|_| "Folder".to_string());
                 // Claimed by another folder = taken. A directory that exists on disk but nobody
                 // claimed is the user's own of that name: this folder adopts it (the rescan
                 // would match it by name too).
@@ -342,7 +390,38 @@ impl PcLibrary {
     /// The on-disk name for `t` read from the bytes of `file` (extension and magic checked).
     fn disk_name(&self, t: &FileTarget, file: &Path) -> Result<String> {
         let head = read_head(file)?;
-        names::disk_file_name(&t.name, &t.ext, &head, t.captured_at).map(|(n, _)| n).map_err(|e| CoreError::NotMedia(e.to_string()))
+        names::disk_file_name(&t.name, &t.ext, &head, t.captured_at).map(|(n, _)| n).map_err(|e| match e {
+            // Visible, never retried in a loop: the file stays where it is and the caller lists it.
+            names::NameError::Refused(_) => CoreError::Refused(names::REFUSED_TEXT.to_string()),
+            other => CoreError::NotMedia(other.to_string()),
+        })
+    }
+
+    /// `std::fs::copy` that fails when the source has a Mark-of-the-Web and the copy did not get it: copying onto
+    /// FAT/exFAT drops the stream and reports success. The caller keeps its original (C4).
+    pub(crate) fn copy_marked(&self, from: &Path, to: &Path) -> io::Result<u64> {
+        let n = std::fs::copy(from, to)?;
+        #[cfg(test)]
+        if self.strip_copy_marks.load(Ordering::SeqCst) {
+            let _ = std::fs::remove_file(format!("{}:Zone.Identifier", to.display()));
+        }
+        match winfs::read_zone_mark(from) {
+            Some(mark) if winfs::read_zone_mark(to).as_deref() != Some(mark.as_str()) => {
+                Err(io::Error::other("NOT MARKED AS DOWNLOADED - the new drive cannot hold the mark"))
+            }
+            _ => Ok(n),
+        }
+    }
+
+    /// Mark `part` as downloaded (C7). Fails closed: Err = nothing may appear in the library.
+    pub(crate) fn mark_downloaded(&self, part: &Path) -> Result<()> {
+        #[cfg(test)]
+        if self.fail_marks.load(Ordering::SeqCst) {
+            return Err(CoreError::io(part, io::Error::other("test: marks are failing")));
+        }
+        winfs::write_zone_mark(part).map_err(|e| {
+            CoreError::io(part, io::Error::other(format!("NOT MARKED AS DOWNLOADED - this drive cannot hold the mark, so the file was not saved ({e})")))
+        })
     }
 }
 
@@ -353,8 +432,12 @@ impl Placement for PcLibrary {
 
     fn commit(&self, part: &Path, t: &FileTarget) -> Result<PathBuf> {
         self.not_switching()?;
+        // A record extension that is not safe fails here, before anything is placed (C4).
+        let bin = self.bin_path(t)?;
         let dir = self.dir_for(t)?;
         let name = self.disk_name(t, part)?;
+        // C7: the mark goes on the part first; the hard link / rename below carries the stream with the file.
+        self.mark_downloaded(part)?;
         let dest = place_new(part, &dir, &name, t.current.as_deref()).map_err(|e| CoreError::io(part, e))?;
         // Same item, new content that landed under another name or folder: its old file goes.
         if let Some(old) = &t.current {
@@ -374,7 +457,7 @@ impl Placement for PcLibrary {
         Self::touch(&self.arrived, &dest);
         // A stale Bin copy is this item's own: to_bin and purge replace or remove it later, so a
         // failure here must not undo a commit that worked.
-        if let Err(e) = self.bin_path(t).and_then(|p| remove_if_exists(&p)) {
+        if let Err(e) = remove_if_exists(&bin) {
             tracing::warn!("stale Bin copy not removed: {e}");
         }
         Ok(dest)
@@ -472,7 +555,12 @@ impl Placement for PcLibrary {
         let name = self.disk_name(t, &bin_path)?;
         // Stage through `.tugboat` so a cross-drive restore is copy + rename on the library drive.
         let stage = self.part_dir()?.join(format!("{}.restore", t.item.0.hyphenated()));
-        std::fs::copy(&bin_path, &stage).map_err(|e| CoreError::io(&bin_path, e))?;
+        // A marked file that would come out unmarked (a library on FAT/exFAT) stays in the Bin, like a download
+        // that cannot be marked stays out of the library.
+        if let Err(e) = self.copy_marked(&bin_path, &stage) {
+            let _ = std::fs::remove_file(&stage);
+            return Err(CoreError::io(&bin_path, e));
+        }
         match place_new(&stage, &dir, &name, None) {
             Ok(dest) => {
                 if let Err(e) = remove_if_exists(&bin_path) {
@@ -517,7 +605,7 @@ impl Placement for PcLibrary {
 fn stem_name(t: &FileTarget) -> String {
     let ext = t.ext.to_ascii_lowercase();
     match names::clean_stem(names::strip_ext(&t.name, &t.ext)) {
-        Ok(stem) => format!("{stem}.{ext}"),
-        Err(_) => format!("{}.{ext}", names::fallback_stem(t.captured_at)),
+        Ok(stem) => names::join_ext(&stem, &ext),
+        Err(_) => names::join_ext(&names::fallback_stem(t.captured_at), &ext),
     }
 }

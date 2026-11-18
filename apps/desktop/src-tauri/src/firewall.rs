@@ -820,10 +820,10 @@ mod tests {
 
     // ---------- scope tests ----------
 
-    /// A SID no account here has, in the shape of a local account (what the Codex rules name).
-    const OTHER_USER: &str = "S-1-5-21-255584919-3964267139-957157073-1006";
-    /// The user scope Windows reports for the Codex sandbox rules (account CodexSandboxOffline).
-    const CODEX_SDDL: &str = "O:LSD:(A;;CC;;;S-1-5-21-255584919-3964267139-957157073-1006)";
+    /// A SID no account here has, in the shape of a local account (the kind a sandbox account rule names).
+    const OTHER_USER: &str = "S-1-5-21-1000000001-1000000002-1000000003-1006";
+    /// The user scope Windows reports for a rule limited to one local sandbox account.
+    const OTHER_USER_SDDL: &str = "O:LSD:(A;;CC;;;S-1-5-21-1000000001-1000000002-1000000003-1006)";
 
     /// The SID text of the user running the tests (the token's user, not a group).
     fn my_sid() -> String {
@@ -851,10 +851,10 @@ mod tests {
         }
     }
 
-    /// The Codex inbound block rule as the firewall API reports it, with the given user scope.
-    fn codex_inbound(scope: UserScope) -> RuleInfo {
+    /// An inbound block rule limited to another local account, as the firewall API reports it, with the given user scope.
+    fn other_user_inbound(scope: UserScope) -> RuleInfo {
         RuleInfo {
-            name: "codex_sandbox_offline_block_inbound".into(),
+            name: "sandbox_offline_block_inbound".into(),
             enabled: true,
             inbound: true,
             allow: false,
@@ -879,28 +879,28 @@ mod tests {
 
     #[test]
     fn a_block_rule_scoped_to_another_user_does_not_apply() {
-        let s = with_allow(codex_inbound(UserScope::Sddl(CODEX_SDDL.into())));
+        let s = with_allow(other_user_inbound(UserScope::Sddl(OTHER_USER_SDDL.into())));
         assert_eq!(judge(&s, &token_applies), FirewallStatus::Ok);
     }
 
     #[test]
     fn the_same_block_rule_scoped_to_our_sid_blocks_and_is_named() {
         let sddl = format!("O:LSD:(A;;CC;;;{})", my_sid());
-        let s = with_allow(codex_inbound(UserScope::Sddl(sddl)));
+        let s = with_allow(other_user_inbound(UserScope::Sddl(sddl)));
         let v = judge(&s, &token_applies);
-        assert_eq!(v, FirewallStatus::BlockedByRule { rule: "codex_sandbox_offline_block_inbound".into(), note: None });
+        assert_eq!(v, FirewallStatus::BlockedByRule { rule: "sandbox_offline_block_inbound".into(), note: None });
         let msg = FirewallInfo::from_status(v).message.unwrap();
-        assert!(msg.contains("codex_sandbox_offline_block_inbound"), "{msg}");
+        assert!(msg.contains("sandbox_offline_block_inbound"), "{msg}");
     }
 
     #[test]
     fn an_alias_sid_the_user_belongs_to_makes_the_rule_apply() {
         // Everyone and Builtin Users hold for any normal user token; Anonymous never does.
         for alias in ["WD", "BU"] {
-            let s = with_allow(codex_inbound(UserScope::Sddl(format!("O:LSD:(A;;CC;;;{alias})"))));
+            let s = with_allow(other_user_inbound(UserScope::Sddl(format!("O:LSD:(A;;CC;;;{alias})"))));
             assert!(matches!(judge(&s, &token_applies), FirewallStatus::BlockedByRule { note: None, .. }), "{alias}");
         }
-        let s = with_allow(codex_inbound(UserScope::Sddl("O:LSD:(A;;CC;;;AN)".into())));
+        let s = with_allow(other_user_inbound(UserScope::Sddl("O:LSD:(A;;CC;;;AN)".into())));
         assert_eq!(judge(&s, &token_applies), FirewallStatus::Ok);
     }
 
@@ -908,11 +908,11 @@ mod tests {
     fn a_deny_entry_for_our_sid_stops_the_rule_applying() {
         // Deny first: the token matches both entries and the first one decides.
         let sddl = format!("O:LSD:(D;;CC;;;{})(A;;CC;;;WD)", my_sid());
-        let s = with_allow(codex_inbound(UserScope::Sddl(sddl)));
+        let s = with_allow(other_user_inbound(UserScope::Sddl(sddl)));
         assert_eq!(judge(&s, &token_applies), FirewallStatus::Ok);
         // A deny for someone else changes nothing.
         let sddl = format!("O:LSD:(D;;CC;;;{OTHER_USER})(A;;CC;;;WD)");
-        let s = with_allow(codex_inbound(UserScope::Sddl(sddl)));
+        let s = with_allow(other_user_inbound(UserScope::Sddl(sddl)));
         assert!(matches!(judge(&s, &token_applies), FirewallStatus::BlockedByRule { .. }));
     }
 
@@ -920,7 +920,7 @@ mod tests {
     fn entries_without_the_match_right_are_not_what_decides() {
         // A deny that carries another right does not stop the allow after it: the rule applies.
         for sddl in ["O:LSD:(D;;0x2;;;WD)(A;;CC;;;WD)", "O:LSD:(D;;GA;;;WD)(A;;CC;;;WD)", "O:LSD:(D;;RC;;;AU)(A;;CC;;;AU)"] {
-            let s = with_allow(codex_inbound(UserScope::Sddl(sddl.into())));
+            let s = with_allow(other_user_inbound(UserScope::Sddl(sddl.into())));
             assert!(matches!(judge(&s, &token_applies), FirewallStatus::BlockedByRule { note: None, .. }), "{sddl}");
         }
         // An allow that carries another right grants nothing: that allow rule is not ours.
@@ -930,28 +930,28 @@ mod tests {
 
     #[test]
     fn an_unparseable_user_scope_fails_closed_with_the_reason() {
-        let s = with_allow(codex_inbound(UserScope::Sddl("this is not sddl".into())));
+        let s = with_allow(other_user_inbound(UserScope::Sddl("this is not sddl".into())));
         match judge(&s, &token_applies) {
             FirewallStatus::BlockedByRule { rule, note: Some(why) } => {
-                assert_eq!(rule, "codex_sandbox_offline_block_inbound");
+                assert_eq!(rule, "sandbox_offline_block_inbound");
                 assert!(why.contains("user scope"), "{why}");
             }
             other => panic!("expected a reasoned block, got {other:?}"),
         }
         // A scope the API would not give us is treated the same way.
-        let s = with_allow(codex_inbound(UserScope::Unreadable("cannot read the rule's user scope (x)".into())));
+        let s = with_allow(other_user_inbound(UserScope::Unreadable("cannot read the rule's user scope (x)".into())));
         assert!(matches!(judge(&s, &token_applies), FirewallStatus::BlockedByRule { note: Some(_), .. }));
         // So is an access check that itself fails.
-        let s = with_allow(codex_inbound(UserScope::Sddl(CODEX_SDDL.into())));
+        let s = with_allow(other_user_inbound(UserScope::Sddl(OTHER_USER_SDDL.into())));
         assert!(matches!(judge(&s, &|_| Err("x".into())), FirewallStatus::BlockedByRule { note: Some(_), .. }));
         // And a failed check never counts an allow rule.
-        let mine = RuleInfo { user_scope: UserScope::Sddl(CODEX_SDDL.into()), ..rule(PROFILE_PRIVATE | PROFILE_PUBLIC) };
+        let mine = RuleInfo { user_scope: UserScope::Sddl(OTHER_USER_SDDL.into()), ..rule(PROFILE_PRIVATE | PROFILE_PUBLIC) };
         assert_eq!(judge(&snap(vec![mine], PROFILE_PRIVATE), &|_| Err("x".into())), FirewallStatus::RuleMissing);
     }
 
     #[test]
     fn an_allow_rule_scoped_to_another_user_is_not_our_allow() {
-        let mine = RuleInfo { user_scope: UserScope::Sddl(CODEX_SDDL.into()), ..rule(PROFILE_PRIVATE | PROFILE_PUBLIC) };
+        let mine = RuleInfo { user_scope: UserScope::Sddl(OTHER_USER_SDDL.into()), ..rule(PROFILE_PRIVATE | PROFILE_PUBLIC) };
         let s = snap(vec![mine], PROFILE_PRIVATE);
         assert_eq!(judge(&s, &token_applies), FirewallStatus::RuleMissing);
     }
@@ -959,25 +959,25 @@ mod tests {
     #[test]
     fn a_loopback_only_remote_scope_does_not_block_the_phone() {
         for remote in ["127.0.0.0/255.0.0.0,::/127", "127.0.0.0/8", "127.0.0.1", "::1"] {
-            let block = RuleInfo { remote_addresses: remote.into(), ..codex_inbound(UserScope::All) };
+            let block = RuleInfo { remote_addresses: remote.into(), ..other_user_inbound(UserScope::All) };
             assert_eq!(judge(&with_allow(block), &token_applies), FirewallStatus::Ok, "{remote}");
         }
         // The same block with a LAN subnet in it does.
-        let block = RuleInfo { remote_addresses: "127.0.0.0/8,192.168.0.0/255.255.0.0".into(), ..codex_inbound(UserScope::All) };
+        let block = RuleInfo { remote_addresses: "127.0.0.0/8,192.168.0.0/255.255.0.0".into(), ..other_user_inbound(UserScope::All) };
         assert!(matches!(judge(&with_allow(block), &token_applies), FirewallStatus::BlockedByRule { .. }));
     }
 
     #[test]
     fn a_rule_for_a_package_a_service_or_another_program_does_not_apply() {
         for odd in [
-            RuleInfo { package: "S-1-15-2-1-2-3-4-5-6-7".into(), ..codex_inbound(UserScope::All) },
-            RuleInfo { service: "Spooler".into(), ..codex_inbound(UserScope::All) },
-            RuleInfo { app: r"C:\other\app.exe".into(), ..codex_inbound(UserScope::All) },
+            RuleInfo { package: "S-1-15-2-1-2-3-4-5-6-7".into(), ..other_user_inbound(UserScope::All) },
+            RuleInfo { service: "Spooler".into(), ..other_user_inbound(UserScope::All) },
+            RuleInfo { app: r"C:\other\app.exe".into(), ..other_user_inbound(UserScope::All) },
         ] {
             assert_eq!(judge(&with_allow(odd.clone()), &token_applies), FirewallStatus::Ok, "{odd:?}");
         }
         // Block bound to our own program does apply.
-        let ours = RuleInfo { app: EXE.into(), ..codex_inbound(UserScope::All) };
+        let ours = RuleInfo { app: EXE.into(), ..other_user_inbound(UserScope::All) };
         assert!(matches!(judge(&with_allow(ours), &token_applies), FirewallStatus::BlockedByRule { .. }));
     }
 
@@ -985,20 +985,20 @@ mod tests {
     fn block_rules_on_other_profiles_or_interfaces_or_protocols_or_ports_do_not_apply() {
         for odd in [
             // Private is the active profile; the block is for Domain and Public only.
-            RuleInfo { profiles: PROFILE_DOMAIN | PROFILE_PUBLIC, ..codex_inbound(UserScope::All) },
-            RuleInfo { interface_types: "RemoteAccess".into(), ..codex_inbound(UserScope::All) },
-            RuleInfo { protocol: 6, ..codex_inbound(UserScope::All) },
-            RuleInfo { local_ports: "80,443,5000-5100".into(), ..codex_inbound(UserScope::All) },
-            RuleInfo { enabled: false, ..codex_inbound(UserScope::All) },
-            RuleInfo { inbound: false, ..codex_inbound(UserScope::All) },
+            RuleInfo { profiles: PROFILE_DOMAIN | PROFILE_PUBLIC, ..other_user_inbound(UserScope::All) },
+            RuleInfo { interface_types: "RemoteAccess".into(), ..other_user_inbound(UserScope::All) },
+            RuleInfo { protocol: 6, ..other_user_inbound(UserScope::All) },
+            RuleInfo { local_ports: "80,443,5000-5100".into(), ..other_user_inbound(UserScope::All) },
+            RuleInfo { enabled: false, ..other_user_inbound(UserScope::All) },
+            RuleInfo { inbound: false, ..other_user_inbound(UserScope::All) },
         ] {
             assert_eq!(judge(&with_allow(odd.clone()), &token_applies), FirewallStatus::Ok, "{odd:?}");
         }
         // Our port inside a listed range, or a UDP-only block, does apply.
         for hit in [
-            RuleInfo { local_ports: "47000-47999".into(), ..codex_inbound(UserScope::All) },
-            RuleInfo { protocol: PROTO_UDP, interface_types: "Lan,Wireless".into(), ..codex_inbound(UserScope::All) },
-            RuleInfo { profiles: PROFILE_PRIVATE, ..codex_inbound(UserScope::All) },
+            RuleInfo { local_ports: "47000-47999".into(), ..other_user_inbound(UserScope::All) },
+            RuleInfo { protocol: PROTO_UDP, interface_types: "Lan,Wireless".into(), ..other_user_inbound(UserScope::All) },
+            RuleInfo { profiles: PROFILE_PRIVATE, ..other_user_inbound(UserScope::All) },
         ] {
             assert!(matches!(judge(&with_allow(hit.clone()), &token_applies), FirewallStatus::BlockedByRule { .. }), "{hit:?}");
         }
@@ -1006,14 +1006,14 @@ mod tests {
 
     #[test]
     fn a_block_beats_an_allow_when_it_applies() {
-        let s = with_allow(codex_inbound(UserScope::All));
+        let s = with_allow(other_user_inbound(UserScope::All));
         assert!(matches!(judge(&s, &token_applies), FirewallStatus::BlockedByRule { .. }));
     }
 
     /// The real Win32 parser and access check on the exact string Windows reports.
     #[test]
-    fn the_real_codex_user_scope_is_read_and_does_not_apply() {
-        let scope = UserScope::Sddl(CODEX_SDDL.into());
+    fn the_real_user_scoped_rule_is_read_and_does_not_apply() {
+        let scope = UserScope::Sddl(OTHER_USER_SDDL.into());
         // The injected check receives the rule's text untouched.
         let seen = std::cell::RefCell::new(Vec::new());
         let fit = user_fit(&scope, &|s| {
@@ -1021,7 +1021,7 @@ mod tests {
             Ok(false)
         });
         assert_eq!(fit, Fit::No);
-        assert_eq!(*seen.borrow(), vec![CODEX_SDDL.to_string()]);
+        assert_eq!(*seen.borrow(), vec![OTHER_USER_SDDL.to_string()]);
         // The real check: a scope everybody is in applies, one nobody here is in does not.
         assert_eq!(user_fit(&scope, &token_applies), Fit::No);
         assert_eq!(user_fit(&UserScope::Sddl("O:LSD:(A;;CC;;;WD)".into()), &token_applies), Fit::Yes);

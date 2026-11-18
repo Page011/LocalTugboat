@@ -29,9 +29,13 @@ pub enum SnapError {
     /// A rule was broken (move into a deleted folder, restore of an item that is not in the Bin).
     #[error("{0}")]
     Invalid(String),
-    /// Not a supported photo or video (extension or magic bytes).
+    /// A photo/video extension whose content is not a photo or video (a renamed program).
     #[error("{0}")]
     NotMedia(String),
+    /// Refused on purpose, never synced: an always-refused name (shortcut and folder-setting
+    /// files) or a file over the size limit. The message is the one-line text to show.
+    #[error("{0}")]
+    Refused(String),
     /// Restore of a file neither device holds any more.
     #[error("{0}")]
     FileGone(String),
@@ -95,6 +99,7 @@ impl From<CoreError> for SnapError {
             CoreError::Name(_) => Self::InvalidName(m),
             CoreError::Invalid(_) => Self::Invalid(m),
             CoreError::NotMedia(_) => Self::NotMedia(m),
+            CoreError::Refused(_) => Self::Refused(m),
             CoreError::FileGone => Self::FileGone(m),
             CoreError::NotPaired => Self::NotPaired(m),
             CoreError::AlreadyPaired => Self::AlreadyPaired(m),
@@ -151,5 +156,6 @@ mod tests {
         assert!(matches!(n("hash_mismatch"), SnapError::Net(_)));
         assert!(SnapError::from(CoreError::NotPaired).to_string().contains("paired device"));
         assert!(matches!(SnapError::from(CoreError::NotMedia("x".into())), SnapError::NotMedia(_)));
+        assert!(matches!(SnapError::from(CoreError::Refused("REFUSED - x".into())), SnapError::Refused(m) if m == "REFUSED - x"));
     }
 }

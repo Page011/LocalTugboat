@@ -1,6 +1,5 @@
-//! The one error type of tugboat-core. Owner: logic builder. The sync builder uses the
-//! Net/Protocol/Version/Pairing variants; add a variant only after updating
-//! notes/core-design.md (both builders compile against this enum).
+//! The one error type of tugboat-core. The sync layer uses the Net/Protocol/Version/Pairing
+//! variants.
 //! Errors are surfaced (returned, and turned into `Event::Error` by the facade), never swallowed.
 
 use crate::names::NameError;
@@ -13,7 +12,7 @@ pub enum CoreError {
     Db(#[from] rusqlite::Error),
     #[error("file error on {path}: {msg}")]
     Io { path: String, msg: String },
-    /// PLAN: "An older app opening a newer database refuses with a clear message".
+    /// An older app opening a newer database refuses with a clear message.
     #[error("this database was written by a newer Tugboat (schema {found}, this app knows up to {supported}); update Tugboat")]
     NewerDatabase { found: u32, supported: u32 },
     #[error("database upgrade {from} -> {to} failed: {msg}")]
@@ -25,9 +24,14 @@ pub enum CoreError {
     /// Input that violates a rule (empty folder name, retention 0, move into a deleted folder).
     #[error("invalid: {0}")]
     Invalid(String),
-    /// A file that is not an allowed photo/video (extension or magic bytes).
+    /// A photo/video extension whose content is not a photo or video (a renamed program).
     #[error("not a supported photo or video: {0}")]
     NotMedia(String),
+    /// Refused on purpose, never synced: an always-refused name ("REFUSED - shortcut and
+    /// folder-setting files never sync") or a file over the size limit ("TOO LARGE - over 16 GB").
+    /// The text is the one-line message for the user.
+    #[error("{0}")]
+    Refused(String),
     /// Restore or fetch of a file neither device holds any more.
     #[error("file no longer on either device")]
     FileGone,
@@ -70,6 +74,7 @@ impl CoreError {
             CoreError::Name(_) => "name",
             CoreError::Invalid(_) => "invalid",
             CoreError::NotMedia(_) => "not_media",
+            CoreError::Refused(_) => "refused",
             CoreError::FileGone => "file_gone",
             CoreError::NotPaired => "not_paired",
             CoreError::AlreadyPaired => "already_paired",
@@ -97,6 +102,7 @@ mod tests {
             CoreError::Name(NameError::Empty),
             CoreError::Invalid("x".into()),
             CoreError::NotMedia("x".into()),
+            CoreError::Refused("x".into()),
             CoreError::FileGone,
             CoreError::NotPaired,
             CoreError::AlreadyPaired,

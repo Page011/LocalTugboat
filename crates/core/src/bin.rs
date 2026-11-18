@@ -1,12 +1,12 @@
-//! Bin and purge: makes the files this device holds match the derived state. Owner: logic.
+//! Bin and purge: makes the files this device holds match the derived state.
 //!
-//! PLAN: "Expired and deleted items sit in the Bin for 7 days (setting), then that device
-//! deletes its copy of the file. The small record stays forever as a tombstone."
+//! Expired and deleted items sit in the Bin for 7 days (setting), then that device
+//! deletes its copy of the file. The small record stays forever as a tombstone.
 //!
 //! `sweep` rules, per item, with state = expiry::item_state(..) and local = LocalFileState:
 //! | state      | local            | action                                              | activity |
 //! |------------|------------------|-----------------------------------------------------|----------|
-//! | in Bin     | Present          | placement.to_bin, local = Binned, file_ref = Bin path | Expired (state Expired) / Binned (Deleted by a peer version) / none (Deleted by self: logged at delete time) |
+//! | in Bin     | Present          | placement.to_bin, local = Binned, file_ref = Bin path | Expired (state Expired; the text adds "never reached the PC/phone" when the paired device never confirmed the file) / Binned (Deleted by a peer version) / none (Deleted by self: logged at delete time) |
 //! | in Bin, now >= purge_at | Binned (a Present file is binned first: bin_days >= 1) | placement.purge, local = Purged, file_ref deleted | Purged |
 //! | in Bin     | Pending          | local = Purged (never download Bin items)           | none |
 //! | not in Bin | Binned           | placement.from_bin, local = Present                 | Returned |
@@ -63,19 +63,27 @@ pub fn local_purge_at(lfs: LocalFileState, state_at: i64, now: i64, bin_days: u3
 }
 
 /// Derived state of an item given the folder table (preloaded by the caller for batches).
-pub fn derive_state_in(c: &Connection, folders: &HashMap<FolderId, FolderRecord>, rec: &ItemRecord, now: i64) -> Result<ItemState> {
-    let receipt = store::peer_receipt_seen_at(c, rec.content.val.hash)?;
-    Ok(expiry::item_state(
-        rec,
-        ExpiryCtx { folder: folders.get(&rec.location.val.folder), peer_receipt_seen_at: receipt, now_ms: now },
-    ))
+/// Pure in the record and the folder: no receipt lookup (items expire on time).
+pub fn derive_state_in(_c: &Connection, folders: &HashMap<FolderId, FolderRecord>, rec: &ItemRecord, now: i64) -> Result<ItemState> {
+    Ok(expiry::item_state(rec, ExpiryCtx { folder: folders.get(&rec.location.val.folder), now_ms: now }))
 }
 
-/// Derived state of one item (loads its folder and receipt).
+/// Derived state of one item (loads its folder).
 pub fn derive_state(c: &Connection, rec: &ItemRecord, now: i64) -> Result<ItemState> {
     let folder = store::get_folder(c, rec.location.val.folder)?;
-    let receipt = store::peer_receipt_seen_at(c, rec.content.val.hash)?;
-    Ok(expiry::item_state(rec, ExpiryCtx { folder: folder.as_ref(), peer_receipt_seen_at: receipt, now_ms: now }))
+    Ok(expiry::item_state(rec, ExpiryCtx { folder: folder.as_ref(), now_ms: now }))
+}
+
+/// Silent-failure rule for the dropped expiry hold: the role ("PC" / "phone") of the paired
+/// device when it has NOT confirmed holding the file with `hash`; None when there is no paired
+/// device or it has the file. An item that expires with `Some(..)` may now exist on this
+/// device only, so the Bin and the activity row say so.
+pub fn missing_at_peer(c: &Connection, hash: BlobHash) -> Result<Option<&'static str>> {
+    let Some(peer) = store::paired_peer(c)? else { return Ok(None) };
+    if store::peer_has_receipt(c, hash, peer.id)? {
+        return Ok(None);
+    }
+    Ok(Some(if peer.role == Role::Pc { "PC" } else { "phone" }))
 }
 
 /// What a placement needs to know about an item: effective folder (E2) and current path.
@@ -95,14 +103,16 @@ pub fn file_target(c: &Connection, rec: &ItemRecord) -> Result<FileTarget> {
     })
 }
 
-/// Keep `file_ref` in step with a new path. Bin files carry no NTFS identity.
+/// Keep `file_ref` in step with a new path. Bin files carry no NTFS identity. The modified time
+/// travels with the file (a move or copy keeps it), so a same-size edit is still noticed later.
 fn set_path(c: &Connection, item: ItemId, path: &std::path::Path, keep_ntfs: bool) -> Result<()> {
     let old = store::get_file_ref(c, item)?;
     let (volume_serial, file_id) = match (&old, keep_ntfs) {
         (Some(o), true) => (o.volume_serial, o.file_id),
         _ => (None, None),
     };
-    store::put_file_ref(c, &store::FileRef { item, path: path.to_string_lossy().into_owned(), volume_serial, file_id })
+    let mtime_ms = old.as_ref().and_then(|o| o.mtime_ms);
+    store::put_file_ref(c, &store::FileRef { item, path: path.to_string_lossy().into_owned(), volume_serial, file_id, mtime_ms })
 }
 
 struct Env<'a> {
@@ -158,7 +168,13 @@ fn sweep_one(c: &mut Connection, env: &Env<'_>, id: ItemId, quiet: bool, rep: &m
                 if !quiet {
                     match state {
                         ItemState::Expired { .. } => {
-                            activity::log(&tx, env.now, Some(env.self_id), Some(id), ActivityAction::Expired, &target.folder_name)?;
+                            // Never silent: an item that expires before the other device got it
+                            // may now exist only here.
+                            let detail = match missing_at_peer(&tx, rec.content.val.hash)? {
+                                Some(who) => format!("{} - never reached the {who}", target.folder_name),
+                                None => target.folder_name.clone(),
+                            };
+                            activity::log(&tx, env.now, Some(env.self_id), Some(id), ActivityAction::Expired, &detail)?;
                         }
                         ItemState::Deleted { .. } if deleted_by_peer => {
                             activity::log(&tx, env.now, Some(rec.deleted.v.device), Some(id), ActivityAction::Binned, "deleted on the other device")?;
@@ -250,8 +266,8 @@ pub fn sweep(c: &mut Connection, placement: &dyn Placement, self_id: DeviceId, n
 }
 
 /// Sweep only `ids` (the items a sync page touched), with the same rules and the same activity
-/// rows as `sweep`. Added by the sync builder: a full sweep per received page is O(library)
-/// and made a first sync of a big library quadratic.
+/// rows as `sweep`. A full sweep per received page is O(library) and made a first sync of a
+/// big library quadratic, so the sync path sweeps only the items a page touched.
 pub fn sweep_items(c: &mut Connection, placement: &dyn Placement, self_id: DeviceId, ids: &[ItemId], now: i64) -> Result<SweepReport> {
     let env = load_env(c, placement, self_id, now)?;
     let mut rep = SweepReport::default();
@@ -306,7 +322,8 @@ mod tests {
     use crate::ops;
     use crate::store::test_support::*;
 
-    // L14: expiry -> Bin -> purge at exactly 7 days (not 6.99), tombstone stays (L15).
+    // Expiry -> Bin -> purge at exactly 7 days (not 6.99), tombstone stays. Expiry is on
+    // time: the other device never confirmed this file, and nothing waits for it (0.2.0).
     #[test]
     fn expire_bin_purge_timeline_and_tombstone() {
         let mut r = Rig::new();
@@ -314,33 +331,35 @@ mod tests {
         assert_eq!(r.lfs(id), LocalFileState::Present);
         let held = r.path(id).unwrap();
         assert!(held.exists());
-        // No receipt yet: Waiting, nothing happens however late.
-        r.clock.advance(10 * DAY_MS);
+        // One ms before due: still live, nothing happens.
+        r.clock.set(T0 + 24 * HOUR_MS - 1);
         let rep = r.sweep();
         assert!(rep.to_bin.is_empty() && rep.purged.is_empty());
         assert_eq!(r.lfs(id), LocalFileState::Present);
-        // Receipt arrives late: binned at the receipt time (seen_at), not at due.
-        let seen = r.clock.now_ms();
-        r.confirm(id);
+        // At due, with NO receipt from the peer: binned at once.
+        let binned = T0 + 24 * HOUR_MS;
+        r.clock.set(binned);
         let rep = r.sweep();
         assert_eq!(rep.to_bin, vec![id]);
         assert_eq!(r.lfs(id), LocalFileState::Binned);
         let bin_path = r.path(id).unwrap();
         assert!(bin_path != held && bin_path.exists() && !held.exists(), "file moved to the Bin area");
         assert!(r.actions().contains(&ActivityAction::Expired));
-        // Not yet purged one ms before 7 days after seen_at (L13).
-        r.clock.set(seen + 7 * DAY_MS - 1);
+        let rec = store::get_item(&r.db.conn, id).unwrap().unwrap().0;
+        assert!(matches!(derive_state(&r.db.conn, &rec, binned).unwrap(), ItemState::Expired { binned_at } if binned_at == binned));
+        // Not yet purged one ms before 7 days after binning.
+        r.clock.set(binned + 7 * DAY_MS - 1);
         let rep = r.sweep();
         assert!(rep.purged.is_empty(), "6.99 days: still in the Bin");
         assert!(bin_path.exists());
-        assert_eq!(rep.next_due, Some(seen + 7 * DAY_MS), "the purge is the next time-driven change");
-        r.clock.set(seen + 7 * DAY_MS);
+        assert_eq!(rep.next_due, Some(binned + 7 * DAY_MS), "the purge is the next time-driven change");
+        r.clock.set(binned + 7 * DAY_MS);
         let rep = r.sweep();
         assert_eq!(rep.purged, vec![id]);
         assert_eq!(r.lfs(id), LocalFileState::Purged);
         assert!(!bin_path.exists() && r.path(id).is_none());
         assert!(r.actions().contains(&ActivityAction::Purged));
-        // L15: the record stays as a tombstone, unchanged by the purge.
+        // The record stays as a tombstone, unchanged by the purge.
         assert_eq!(store::count_items(&r.db.conn).unwrap(), 1);
         let (rec, _) = store::get_item(&r.db.conn, id).unwrap().unwrap();
         assert!(rec.deleted.val.is_none(), "expiry is derived, nothing was written to the record");
@@ -348,6 +367,87 @@ mod tests {
         // Sweeping again does nothing (idempotent).
         let rep = r.sweep();
         assert_eq!(rep, SweepReport::default());
+    }
+
+    // Silent-failure rule: an item that expires before the paired device confirmed it says so in the
+    // activity row, and missing_at_peer names the device. With a receipt the row stays plain.
+    #[test]
+    fn expiry_before_the_peer_got_the_file_is_never_silent() {
+        let mut r = Rig::new();
+        let lost = r.add("lost");
+        let safe = r.add("safe");
+        r.confirm(safe);
+        let rec = r.rec(lost);
+        assert_eq!(missing_at_peer(&r.db.conn, rec.content.val.hash).unwrap(), Some("phone"), "the rig's peer is a phone");
+        assert_eq!(missing_at_peer(&r.db.conn, r.rec(safe).content.val.hash).unwrap(), None);
+        r.clock.set(T0 + 24 * HOUR_MS);
+        r.sweep();
+        let rows = activity::list(&r.db.conn, None, 50).unwrap();
+        let expired: Vec<&ActivityEntry> = rows.iter().filter(|a| a.action == ActivityAction::Expired).collect();
+        assert_eq!(expired.len(), 2);
+        let lost_row = expired.iter().find(|a| a.item == Some(lost)).unwrap();
+        let safe_row = expired.iter().find(|a| a.item == Some(safe)).unwrap();
+        assert!(lost_row.detail.contains("never reached the phone"), "{}", lost_row.detail);
+        assert_eq!(safe_row.detail, "Inbox", "confirmed items keep the plain row");
+        // No paired device: nothing to say about a peer.
+        r.db.conn.execute("UPDATE device SET unpaired_at = 1 WHERE is_self = 0", []).unwrap();
+        assert_eq!(missing_at_peer(&r.db.conn, rec.content.val.hash).unwrap(), None);
+    }
+
+    // Upgrade flood: a 0.1.x database holds items that were "Waiting" past
+    // their due time (never paired, or paired with no receipt). The first 0.2.0 sweep bins all of
+    // them at once, none is purged, each gets one Expired row, and the purge comes exactly
+    // bin_days after that sweep (the local Bin clock). Restore works.
+    #[test]
+    fn upgrade_flood_bins_every_overdue_waiting_item_once_and_purges_a_week_later() {
+        use crate::db::{backup_path, Db, MIGRATIONS};
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let v1 = |paired: bool, items_dir: &std::path::Path| -> Vec<ItemId> {
+            // A real 0.1.x database: only the v1 schema, items inserted like 0.1.x did.
+            let db = Db::open_with(&data, &MIGRATIONS[..1]).unwrap();
+            store::ensure_self(&db.conn, p(), "me", Role::Pc).unwrap();
+            if paired {
+                let peer = DeviceRow { id: f(), name: "peer".into(), is_self: false, role: Role::Phone, paired_at: None, unpaired_at: None, last_seen_at: None, addresses: vec![] };
+                store::set_paired(&db.conn, &peer, T0).unwrap();
+            }
+            (1..=20u8)
+                .map(|n| {
+                    let it = item(n, p(), v(1, p()));
+                    store::insert_item(&db.conn, &it, LocalFileState::Present, T0).unwrap();
+                    let src = items_dir.join(format!("{}.jpg", it.id.0.hyphenated()));
+                    std::fs::write(&src, [0xFF, 0xD8, 0xFF, n]).unwrap();
+                    // The v1 file_ref table has no mtime_ms column yet: write it the way 0.1.x did.
+                    db.conn.execute("INSERT INTO file_ref (item_id, path) VALUES (?1, ?2)", rusqlite::params![it.id.0.as_bytes().as_slice(), src.to_string_lossy().into_owned()]).unwrap();
+                    it.id
+                })
+                .collect()
+        };
+        for paired in [false, true] {
+            let _ = std::fs::remove_dir_all(&data);
+            let pl = crate::placement::AppStorage::new(dir.path().join(format!("store-{paired}"))).unwrap();
+            let ids = v1(paired, &pl.root.join("items"));
+            // Upgrade: opening migrates v1 -> v2 and writes the .bak-1 copy.
+            let db = Db::open(&data).unwrap();
+            assert_eq!(db.user_version().unwrap(), 2);
+            assert!(backup_path(&data, 1).exists());
+            let mut conn = db.conn;
+            let late = T0 + 30 * DAY_MS;
+            let rep = sweep(&mut conn, &pl, p(), late).unwrap();
+            assert_eq!(rep.to_bin.len(), 20, "paired={paired}: every overdue item is binned at once");
+            assert!(rep.purged.is_empty(), "paired={paired}: none purged in the same sweep");
+            let expired_rows = activity::list(&conn, None, 100).unwrap().into_iter().filter(|a| a.action == ActivityAction::Expired).count();
+            assert_eq!(expired_rows, 20, "paired={paired}: one Expired row each");
+            assert_eq!(bin_page(&conn, None, 100, late).unwrap().len(), 20);
+            // Purge exactly bin_days after the upgrade sweep, not after the old due time.
+            assert!(sweep(&mut conn, &pl, p(), late + 7 * DAY_MS - 1).unwrap().purged.is_empty());
+            // Restore works for a binned one.
+            let ctx = crate::ops::Ctx { self_id: p(), now: late + 1, placement: &pl };
+            crate::ops::restore_item(&mut conn, &ctx, ids[0]).unwrap();
+            assert_eq!(store::get_item(&conn, ids[0]).unwrap().unwrap().1, LocalFileState::Present);
+            let purged = sweep(&mut conn, &pl, p(), late + 7 * DAY_MS).unwrap().purged;
+            assert_eq!(purged.len(), 19, "paired={paired}: the other 19 are purged exactly Bin days after the sweep");
+        }
     }
 
     #[test]
@@ -363,7 +463,7 @@ mod tests {
         assert_eq!(rep.next_due, Some(T0 + 24 * HOUR_MS + 7 * DAY_MS), "then the purge time");
     }
 
-    // L14: delete by self is logged once at delete time; sweep moves the file without a second row.
+    // Delete by self is logged once at delete time; sweep moves the file without a second row.
     #[test]
     fn user_delete_moves_file_without_duplicate_activity() {
         let mut r = Rig::new();
@@ -390,7 +490,7 @@ mod tests {
         assert!(r.actions().contains(&ActivityAction::Binned));
     }
 
-    // L14: Binned + not in Bin -> Returned (E8: pinned on the other device while apart).
+    // Binned + not in Bin -> Returned (pinned on the other device while apart).
     #[test]
     fn synced_keep_brings_an_expired_item_back() {
         let mut r = Rig::new();
@@ -409,7 +509,7 @@ mod tests {
         assert!(!r.sweep().returned.contains(&id));
     }
 
-    // L14: Pending in Bin -> Purged (never download); Purged + not in Bin -> Pending (want).
+    // Pending in Bin -> Purged (never download); Purged + not in Bin -> Pending (want).
     #[test]
     fn pending_in_bin_is_purged_and_purged_outside_bin_is_wanted() {
         let mut r = Rig::new();
@@ -421,7 +521,7 @@ mod tests {
         let live = item(8, f(), v(3, f()));
         store::insert_item(&r.db.conn, &live, LocalFileState::Pending, T0).unwrap();
         let rep = r.sweep();
-        assert_eq!(r.lfs(deleted.id), LocalFileState::Purged, "L9: never queued, never downloaded");
+        assert_eq!(r.lfs(deleted.id), LocalFileState::Purged, "never queued, never downloaded");
         assert_eq!(r.lfs(live.id), LocalFileState::Pending);
         assert!(rep.want.is_empty(), "want = transitions only");
         // Pin arrives on the purged one: it must be fetched again.
@@ -449,7 +549,7 @@ mod tests {
         assert!(!path.exists() && r.path(id).is_none(), "no stale file left behind");
     }
 
-    // L14: a placement error leaves the state unchanged and is reported; the next sweep retries.
+    // A placement error leaves the state unchanged and is reported; the next sweep retries.
     #[test]
     fn placement_error_leaves_state_and_is_retried() {
         let mut r = Rig::new();
@@ -494,7 +594,7 @@ mod tests {
         assert_eq!(r.lfs(a), LocalFileState::Binned, "not Purged while the file is still there");
     }
 
-    // L16: restore: deleted, expired, purged -> Pending, not in Bin -> Invalid.
+    // Restore: deleted, expired, purged -> Pending, not in Bin -> Invalid.
     #[test]
     fn restore_gives_fresh_retention_and_refetches_purged() {
         let mut r = Rig::new();
@@ -614,7 +714,7 @@ mod tests {
         assert!(activity::list(&r.db.conn, None, 100).unwrap().is_empty());
     }
 
-    // Blocker 1 (verifier): the Bin clock is local. A device that was away when an item expired
+    // The Bin clock is local. A device that was away when an item expired
     // gives the file the full Bin days from the moment it enters ITS Bin, not from the synced due time.
     #[test]
     fn late_sweep_bins_first_and_counts_bin_days_from_binning() {
@@ -640,7 +740,7 @@ mod tests {
         assert!(!listed(&r), "past the local purge time it is no longer listed");
     }
 
-    // Verifier claim: a delete made by a device with a wrong clock, or while this device was away,
+    // A delete made by a device with a wrong clock, or while this device was away,
     // must not shorten or stretch this device's Bin time (deleted_at is another clock's value).
     #[test]
     fn remote_delete_times_do_not_decide_the_bin_time() {
@@ -686,27 +786,20 @@ mod tests {
         assert_eq!(r.sweep().purged, vec![id]);
     }
 
-    // Verifier claim (needs Nigel's decision, so it is pinned here, not "fixed"): receipts are per
-    // file hash, forever. PLAN: "'Confirmed' means a receipt for that file's hash from a device
-    // this one is or was paired with." So a NEW item with the same bytes as a long-purged one (the
-    // user drops the same file in again) counts the old receipt and starts its expiry clock at once,
-    // even if the other device never got this new item. This test records that behaviour; if
-    // Nigel wants receipts to be per item generation, this test is the one to change.
+    // Receipts are per file hash, forever (a receipt for that file's hash from a device this
+    // one is or was paired with). A NEW item with the same bytes as a long-purged one therefore
+    // counts as already delivered for the "waiting" count and the "never reached" note. Expiry
+    // itself no longer reads receipts (0.2.0), so this only affects those two. Whether receipts
+    // should be per item generation is undecided; this test records today's behaviour.
     #[test]
-    fn an_old_receipt_confirms_a_new_item_with_the_same_bytes() {
+    fn an_old_receipt_still_counts_for_a_new_item_with_the_same_bytes() {
         let mut r = Rig::new();
         let old = r.add("a");
         r.confirm(old);
         r.run(|c, x| ops::delete_item(c, x, old)).unwrap();
         r.clock.advance(8 * DAY_MS);
         assert_eq!(r.sweep().purged, vec![old]);
-        // The same bytes come back as a new item, and the other device is away.
-        let mut again = r.rec(old);
-        again.id = ItemId(uuid::Uuid::from_u128(0xA11CE));
-        again.deleted = Versioned { v: again.deleted.v, val: None };
-        again.location.val.entered_at = r.clock.now_ms();
-        store::insert_item(&r.db.conn, &again, LocalFileState::Present, r.clock.now_ms()).unwrap();
-        let state = derive_state(&r.db.conn, &again, r.clock.now_ms()).unwrap();
-        assert!(matches!(state, ItemState::Live { .. }), "not Waiting: the old receipt for these bytes still counts, got {state:?}");
+        let again = r.rec(old);
+        assert_eq!(missing_at_peer(&r.db.conn, again.content.val.hash).unwrap(), None, "the old receipt for these bytes counts");
     }
 }

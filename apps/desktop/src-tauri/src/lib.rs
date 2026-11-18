@@ -8,6 +8,7 @@
 pub mod applog;
 pub mod backend;
 pub mod commands;
+pub mod drop;
 pub mod error;
 pub mod firewall;
 pub mod keys;
@@ -18,6 +19,7 @@ pub mod shell;
 pub mod thumbs;
 pub mod tray;
 pub mod winfs;
+pub mod zipdrop;
 
 #[cfg(test)]
 mod bindings;
@@ -120,6 +122,7 @@ pub fn run() {
             commands::library_locate,
             commands::library_resolve_missing,
             commands::library_rescan,
+            commands::drop_target_set,
             commands::library_open_folder,
             commands::firewall_status,
             commands::firewall_recheck,

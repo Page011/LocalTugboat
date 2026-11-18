@@ -1,5 +1,5 @@
 //! Network driver: endpoint start/stop, the accept and connect loops, and the per-connection
-//! run loop that feeds `engine::Session` and runs the blob fetch queue. Owner: sync builder.
+//! run loop that feeds `engine::Session` and runs the blob fetch queue.
 //!
 //! One control stream per connection (opened by the phone). A reader task turns frames into
 //! channel messages (frame reads are not cancel safe), so the single control task can select
@@ -51,7 +51,7 @@ use crate::{
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 /// One dial attempt (cached addresses, then mDNS).
 const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
-/// Downloads running at once (design S9).
+/// Downloads running at once.
 const MAX_PARALLEL_FETCH: usize = 2;
 /// Longest wait between two tries of one download.
 const MAX_FETCH_BACKOFF: Duration = Duration::from_secs(60);
@@ -406,6 +406,7 @@ fn unpair_local(core: &Core, peer: DeviceId) -> Result<bool> {
     });
     match &r {
         Ok(true) => {
+            core.inner.storage_low.store(false, std::sync::atomic::Ordering::SeqCst);
             core.emit(Event::Pairing(PairingEvent::Unpaired { peer }));
             core.emit(Event::ActivityAdded);
             core.emit_status();
@@ -469,6 +470,13 @@ pub(crate) async fn run_session(core: Core, conn: Arc<PeerConn>, dialer: bool) {
     let peer = DeviceId(conn.peer());
     let (end, refused) = drive(&core, &conn, dialer, cmd_rx).await;
     conn.close(close::NORMAL, "session ended");
+    // "Last seen" is the last contact: written when the session ends too, not only at the hello,
+    // so a long session does not leave the time at its start (Settings showed "never" / stale).
+    if matches!(core.with_ctx(|c, _| crate::store::is_paired(c, peer)), Ok(true)) {
+        if let Err(e) = core.with_ctx(|c, ctx| crate::store::touch_last_seen(c, peer, ctx.now)) {
+            core.emit_error(e.kind(), &format!("could not save the last seen time: {e}"));
+        }
+    }
     let current = {
         let mut a = lock(&core.inner.active);
         let mine = a.as_ref().is_some_and(|x| x.gen == gen);
@@ -490,6 +498,9 @@ pub(crate) async fn run_session(core: Core, conn: Arc<PeerConn>, dialer: bool) {
         End::Net(e) => core.emit_error(e.kind(), &e.to_string()),
     }
     if current {
+        // Nothing downloads without a session: the storage-low banner would outlive the user
+        // freeing the space. The next session's first pass sets it again if it still holds.
+        set_storage_low(&core, None);
         match refused {
             Some(text) => core.set_state(SyncState::Refused, Some(text)),
             None => core.set_state(SyncState::Offline, None),
@@ -693,7 +704,7 @@ async fn drive(core: &Core, conn: &Arc<PeerConn>, dialer: bool, mut cmd_rx: mpsc
                     Ok(None) => {}
                     Err(e) => return (End::Core(e), refused),
                 }
-                // A new receipt or restore can change what is downloadable and what is Waiting.
+                // A new receipt or restore can change what is downloadable and the waiting count.
                 schedule(core, conn, peer, &mut fetcher, &fetch_tx);
                 evaluate(core, &sess, &refused);
             }
@@ -738,7 +749,9 @@ async fn drive(core: &Core, conn: &Arc<PeerConn>, dialer: bool, mut cmd_rx: mpsc
                 return (if delivered { End::Clean } else { sent.err().map_or(End::Clean, End::Net) }, refused);
             }
             _ = ticker.tick() => {
-                if fetcher.has_backoff() || fetcher.lost_due() {
+                let guard_wait = std::time::Duration::from_millis(inner.guard_recheck_ms.load(std::sync::atomic::Ordering::SeqCst));
+                let guard_due = inner.storage_low.load(std::sync::atomic::Ordering::SeqCst) && fetcher.last_schedule.elapsed() >= guard_wait;
+                if fetcher.has_backoff() || fetcher.lost_due() || guard_due {
                     schedule(core, conn, peer, &mut fetcher, &fetch_tx);
                 }
                 if busy {
@@ -861,12 +874,24 @@ enum FetchOutcome {
     Dropped,
 }
 
-#[derive(Default)]
 struct Fetcher {
     in_flight: HashSet<ItemId>,
+    /// When `schedule` last ran: a queue blocked by the storage guard looks again after a while.
+    last_schedule: Instant,
     backoff: HashMap<ItemId, (u32, Instant)>,
     /// Lost items already asked for in this session -> earliest time to ask again.
     lost_tried: HashMap<ItemId, Instant>,
+}
+
+impl Default for Fetcher {
+    fn default() -> Self {
+        Fetcher {
+            in_flight: HashSet::new(),
+            last_schedule: Instant::now(),
+            backoff: HashMap::new(),
+            lost_tried: HashMap::new(),
+        }
+    }
 }
 
 impl Fetcher {
@@ -898,6 +923,42 @@ impl Fetcher {
     }
 }
 
+/// What the storage guard knows about the free space in one scheduling pass.
+enum Space {
+    /// The PC: no guard.
+    Unlimited,
+    /// Phone: bytes that may still be written before the guard is reached (free space, minus what
+    /// the running downloads still have to write, minus the guard); `below` = free < guard now.
+    Known { spare: u64, below: bool, free: u64, guard: u64 },
+    /// `available_space()` failed: never read as "enough".
+    Unknown(String),
+}
+
+/// The phone storage guard (0.2.0) for one `pick_downloads` pass: what it is allowed to look
+/// at, and what it reports back.
+struct GuardPass {
+    /// Only the phone has a guard; the PC picks without one.
+    phone: bool,
+    placement: Arc<dyn crate::placement::Placement>,
+    /// Set when the guard held an item back in this pass: why.
+    held_back: Option<String>,
+    /// Set when the pass stopped because every slot was taken: the scan did not reach the end, so
+    /// "nothing held back" says nothing about the items behind the last pick.
+    slots_full: bool,
+}
+
+impl GuardPass {
+    fn new(core: &Core) -> GuardPass {
+        GuardPass { phone: core.inner.cfg.role == Role::Phone, placement: core.inner.placement.clone(), held_back: None, slots_full: false }
+    }
+
+    /// No guard (tests that are not about the guard).
+    #[cfg(test)]
+    fn off(core: &Core) -> GuardPass {
+        GuardPass { phone: false, ..GuardPass::new(core) }
+    }
+}
+
 /// Rows read per page when looking for something to download.
 const PICK_PAGE: u32 = 500;
 
@@ -919,19 +980,21 @@ impl Drop for HashGuard {
 
 /// Choose up to `slots` items to download: Pending oldest first, then Lost (asked at most once per
 /// `LOST_RETRY`). It pages past every item it has to skip (in flight, in back-off, in the Bin, hash
-/// already being fetched), so a block of failing items never starves the ones behind it. The hash of
-/// each pick is claimed in `fetching` before this returns. On an error nothing stays claimed: no
-/// task would ever own those claims, so the items would be skipped until the app restarts.
+/// already being fetched, held back by the phone storage guard), so a block of failing items never
+/// starves the ones behind it. The hash of each pick is claimed in `fetching` before this returns.
+/// On an error nothing stays claimed: no task would ever own those claims, so the items would be
+/// skipped until the app restarts.
 fn pick_downloads(
     c: &Connection,
     f: &Fetcher,
-    fetching: &Mutex<HashSet<BlobHash>>,
+    fetching: &Mutex<HashMap<BlobHash, u64>>,
     slots: usize,
     now: i64,
     t: Instant,
+    gp: &mut GuardPass,
 ) -> Result<Vec<(ItemId, BlobHash, bool)>> {
     let mut out: Vec<(ItemId, BlobHash, bool)> = Vec::new();
-    match pick_into(c, f, fetching, slots, now, t, &mut out) {
+    match pick_into(c, f, fetching, slots, now, t, gp, &mut out) {
         Ok(()) => Ok(out),
         Err(e) => {
             let mut held = lock(fetching);
@@ -943,22 +1006,47 @@ fn pick_downloads(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn pick_into(
     c: &Connection,
     f: &Fetcher,
-    fetching: &Mutex<HashSet<BlobHash>>,
+    fetching: &Mutex<HashMap<BlobHash, u64>>,
     slots: usize,
     now: i64,
     t: Instant,
+    gp: &mut GuardPass,
     out: &mut Vec<(ItemId, BlobHash, bool)>,
 ) -> Result<()> {
+    // Phone storage guard: how much may still be written in this pass.
+    let mut space = Space::Unlimited;
+    let mut max_blob = u64::MAX;
+    if gp.phone {
+        let settings = crate::store::load_settings(c)?;
+        max_blob = settings.max_blob_bytes;
+        let guard = settings.storage_guard_bytes;
+        space = match gp.placement.available_space() {
+            Ok(free) => {
+                // Every live download task, whichever session started it: `fetching` is core-wide.
+                let still_coming: u64 =
+                    lock(fetching).iter().map(|(h, size)| size.saturating_sub(part_len(&*gp.placement, h))).fold(0u64, |a, b| a.saturating_add(b));
+                Space::Known { spare: free.saturating_sub(still_coming).saturating_sub(guard), below: free < guard, free, guard }
+            }
+            Err(e) => Space::Unknown(e.to_string()),
+        };
+    }
     'states: for state in [LocalFileState::Pending, LocalFileState::Lost] {
         let mut after = None;
-        loop {
+        // Items the storage guard holds back are not rare and not bounded like back-off or Bin
+        // skips: with the phone low on space every row is held. Past one page of them the scan
+        // of this state stops (0.2.0's window), so a big backlog is not walked on every pass
+        // under the DB lock.
+        let mut guard_skips: u32 = 0;
+        'pages: loop {
             let page = crate::store::items_in_state_after(c, &[state], after, PICK_PAGE)?;
             for (captured_at, id) in &page {
                 after = Some((*captured_at, *id));
                 if out.len() >= slots {
+                    gp.slots_full = true;
                     break 'states;
                 }
                 let id = *id;
@@ -976,10 +1064,58 @@ fn pick_into(
                 if expiry::in_bin(bin::derive_state(c, &rec, now)?) {
                     continue;
                 }
+                // A hash a task already holds is skipped before the guard looks at it, so a
+                // duplicate never turns the storage-low flag on.
+                if lock(fetching).contains_key(&hash) {
+                    continue;
+                }
+                // A record over max_blob_bytes is never stored: fetch_item refuses it once (TOO
+                // LARGE), so the space guard must not hold it back for ever behind a PHONE STORAGE
+                // LOW banner.
+                let size = rec.content.val.size;
+                let mut need_now = 0u64;
+                match &mut space {
+                    Space::Unlimited => {}
+                    _ if size > max_blob => {}
+                    Space::Unknown(e) => {
+                        gp.held_back.get_or_insert_with(|| format!("cannot read the free space: {e}"));
+                        guard_skips += 1;
+                        if guard_skips >= PICK_PAGE {
+                            break 'pages;
+                        }
+                        continue;
+                    }
+                    Space::Known { below: true, free, guard, .. } => {
+                        gp.held_back.get_or_insert_with(|| format!("{} MB free, the guard is {} MB", *free / (1024 * 1024), *guard / (1024 * 1024)));
+                        guard_skips += 1;
+                        if guard_skips >= PICK_PAGE {
+                            break 'pages;
+                        }
+                        continue;
+                    }
+                    Space::Known { spare, guard, .. } => {
+                        let need = size.saturating_sub(part_len(&*gp.placement, &hash));
+                        if need > *spare {
+                            gp.held_back.get_or_insert_with(|| format!("a {} MB file does not fit above the {} MB guard", need / (1024 * 1024), *guard / (1024 * 1024)));
+                            guard_skips += 1;
+                            if guard_skips >= PICK_PAGE {
+                                break 'pages;
+                            }
+                            continue;
+                        }
+                        need_now = need;
+                    }
+                }
                 // Two items with the same file share one part file: one download at a time per
                 // hash, across sessions (a task outlives its session). The last check, the claim.
-                if !lock(fetching).insert(hash) {
-                    continue;
+                match lock(fetching).entry(hash) {
+                    std::collections::hash_map::Entry::Occupied(_) => continue,
+                    std::collections::hash_map::Entry::Vacant(v) => {
+                        v.insert(size);
+                    }
+                }
+                if let Space::Known { spare, .. } = &mut space {
+                    *spare -= need_now;
                 }
                 out.push((id, hash, lfs == LocalFileState::Lost));
             }
@@ -992,16 +1128,27 @@ fn pick_into(
 }
 
 /// Start downloads for Pending items, oldest first, up to `MAX_PARALLEL_FETCH`.
+///
+/// Phone storage guard (0.2.0): `Settings.storage_guard_bytes` is enforced here, on the phone
+/// only. Nothing is downloaded while the free space is below the guard, and one item is skipped
+/// when `free - bytes still to come of the downloads running - this item's remaining bytes` would
+/// drop below the guard (a 3 GB video never eats the margin). A part file that already exists
+/// counts as used, so a resumed download only needs the rest. When `available_space()` fails the
+/// queue is blocked too and the error is shown: an unknown amount of space is never "enough".
+/// A blocked queue is never silent: `SyncStatus.storage_low` is set, one activity row is written
+/// when the guard turns on, and the queue looks again after `guard_recheck_ms` (30 s) and on kick.
 fn schedule(core: &Core, conn: &Arc<PeerConn>, peer: DeviceId, f: &mut Fetcher, done_tx: &mpsc::UnboundedSender<FetchDone>) {
     if lock(&core.inner.paused).is_some() || f.in_flight.len() >= MAX_PARALLEL_FETCH || !conn.is_open() {
         return;
     }
     let now = core.now();
     let t = Instant::now();
+    f.last_schedule = t;
     let slots = MAX_PARALLEL_FETCH - f.in_flight.len();
+    let mut gp = GuardPass::new(core);
     let picked = {
         let db = lock(&core.inner.db);
-        pick_downloads(&db.conn, f, &core.inner.fetching, slots, now, t)
+        pick_downloads(&db.conn, f, &core.inner.fetching, slots, now, t, &mut gp)
     };
     let picked = match picked {
         Ok(c) => c,
@@ -1010,6 +1157,11 @@ fn schedule(core: &Core, conn: &Arc<PeerConn>, peer: DeviceId, f: &mut Fetcher, 
             return;
         }
     };
+    // A pass that filled its slots may not have reached a held item: it can turn the flag on but
+    // never off, so the flag does not flap while small items are picked ahead of a big one.
+    if gp.phone && (gp.held_back.is_some() || !gp.slots_full) {
+        set_storage_low(core, gp.held_back.take());
+    }
     for (id, hash, was_lost) in picked {
         f.in_flight.insert(id);
         // Remember when each picked Lost item was asked, so it is not asked in a loop.
@@ -1026,6 +1178,11 @@ fn schedule(core: &Core, conn: &Arc<PeerConn>, peer: DeviceId, f: &mut Fetcher, 
     }
 }
 
+/// Bytes of the in-progress part file of `hash` (0 when there is none).
+fn part_len(placement: &dyn crate::placement::Placement, hash: &BlobHash) -> u64 {
+    placement.part_path(hash).ok().and_then(|p| std::fs::metadata(p).ok()).map(|m| m.len()).unwrap_or(0)
+}
+
 /// The record a download task works on, or None (Dropped) when the item is no longer Pending or
 /// Lost, or its content is no longer the hash the scheduler claimed. The claim covers `claimed`
 /// only: downloading another hash would write a `.part` no claim protects. Dropping frees the
@@ -1036,6 +1193,26 @@ fn load_for_fetch(core: &Core, id: ItemId, claimed: BlobHash) -> Result<Option<(
         (Ok(Some((rec, LocalFileState::Pending | LocalFileState::Lost))), Ok(s)) if rec.content.val.hash == claimed => Ok(Some((rec, s))),
         (Ok(_), Ok(_)) => Ok(None),
         (Err(e), _) | (_, Err(e)) => Err(e),
+    }
+}
+
+/// Turn the storage-guard flag on or off. On the OFF -> ON edge: one activity row and one error
+/// event (never one per 30 s pass); every change refreshes the status the UIs show.
+fn set_storage_low(core: &Core, why: Option<String>) {
+    use std::sync::atomic::Ordering::SeqCst;
+    let low = why.is_some();
+    let was = core.inner.storage_low.swap(low, SeqCst);
+    if low && !was {
+        let text = "PHONE STORAGE LOW - downloads wait";
+        let detail = format!("{text} ({})", why.unwrap_or_default());
+        match core.with_ctx(|c, ctx| crate::activity::log(c, ctx.now, None, None, ActivityAction::SyncError, &detail)) {
+            Ok(_) => core.emit(Event::ActivityAdded),
+            Err(e) => core.emit_error(e.kind(), &format!("could not log the storage guard: {e}")),
+        }
+        core.emit_error("storage_low", text);
+    }
+    if low != was {
+        core.emit_status();
     }
 }
 
@@ -1054,7 +1231,18 @@ async fn fetch_item(core: &Core, conn: &Arc<PeerConn>, peer: DeviceId, id: ItemI
     };
     let content = rec.content.val.clone();
 
-    if let Some(t) = &content.thumb {
+    // Refused records transfer nothing: not the thumbnail, not the file, no part file. The record
+    // itself was accepted (digests stay equal); this device just never holds the file.
+    if names::is_refused_record(&rec.name.val, &content.ext) {
+        return refuse(core, id, content.hash, "refused", names::REFUSED_TEXT.to_string());
+    }
+    if content.size > settings.max_blob_bytes {
+        // Declared too large by the record: one final refusal, not a retry loop.
+        return refuse(core, id, content.hash, "refused", ops::too_large_text(settings.max_blob_bytes));
+    }
+
+    // Thumbnails belong to photos and videos only; a File's thumbnail field is never fetched.
+    if let Some(t) = content.thumb.as_ref().filter(|_| content.kind != MediaKind::File) {
         let dest = core.thumb_path(t.hash);
         if !dest.exists() {
             if let Err(msg) = fetch_thumb(conn, t, &dest).await {
@@ -1092,14 +1280,15 @@ async fn fetch_item(core: &Core, conn: &Arc<PeerConn>, peer: DeviceId, id: ItemI
         Ok(h) => h,
         Err(e) => return FetchOutcome::Retry { kind: e.kind().into(), message: e.to_string(), connection_lost: false },
     };
-    if let Err(e) = names::check_media(&content.ext, &head) {
+    // verify_received never re-derives kind or extension from the bytes: a photo must match its
+    // bytes, a File must not carry a photo extension, a refused extension never passes.
+    if let Err(e) = names::verify_received(content.kind, &content.ext, &head) {
         let _ = tokio::fs::remove_file(&part).await;
-        let reason = e.to_string();
-        return match core.with_ctx(|c, ctx| ops::blob_refused(c, ctx, id, content.hash, &reason)) {
-            Ok(false) => FetchOutcome::Dropped,
-            Ok(true) => FetchOutcome::Final { kind: "not_media".into(), message: format!("REFUSED a file from the other device: {reason}") },
-            Err(e) => FetchOutcome::Retry { kind: e.kind().into(), message: e.to_string(), connection_lost: false },
+        let (kind, text) = match e {
+            names::NameError::Refused(_) => ("refused", names::REFUSED_TEXT.to_string()),
+            other => ("not_media", format!("REFUSED a file from the other device: {other}")),
         };
+        return refuse(core, id, content.hash, kind, text);
     }
 
     let placed = core.with_ctx(|c, ctx| {
@@ -1121,6 +1310,22 @@ async fn fetch_item(core: &Core, conn: &Arc<PeerConn>, peer: DeviceId, id: ItemI
             let _ = tokio::fs::remove_file(&part).await;
             FetchOutcome::Dropped
         }
+        // The placement refused the name this device would give the file (an always-refused final
+        // name, for example `desktop` + `ini`): final and visible, never an endless retry.
+        Err(CoreError::Refused(text)) => {
+            let _ = tokio::fs::remove_file(&part).await;
+            refuse(core, id, content.hash, "refused", text)
+        }
+        Err(e) => FetchOutcome::Retry { kind: e.kind().into(), message: e.to_string(), connection_lost: false },
+    }
+}
+
+/// Record the refusal (local state Refused, one activity row, the file never stored) and report it
+/// once. `Dropped` when the item changed or was handled elsewhere meanwhile.
+fn refuse(core: &Core, id: ItemId, hash: BlobHash, kind: &str, text: String) -> FetchOutcome {
+    match core.with_ctx(|c, ctx| ops::blob_refused(c, ctx, id, hash, &text)) {
+        Ok(false) => FetchOutcome::Dropped,
+        Ok(true) => FetchOutcome::Final { kind: kind.into(), message: text },
         Err(e) => FetchOutcome::Retry { kind: e.kind().into(), message: e.to_string(), connection_lost: false },
     }
 }
@@ -1162,6 +1367,9 @@ struct CoreBlobSource {
 
 impl BlobSource for CoreBlobSource {
     fn open(&self, hash: &str) -> Option<PathBuf> {
+        if self.core.inner.record_blob_requests.load(std::sync::atomic::Ordering::SeqCst) {
+            lock(&self.core.inner.blob_requests).push(hash.to_string());
+        }
         let raw: [u8; 32] = hex::decode(hash).ok()?.try_into().ok()?;
         let hash = BlobHash(raw);
         let from_items = {
@@ -1205,10 +1413,10 @@ mod tests {
     }
 
     fn pick(core: &Core, f: &Fetcher, slots: usize) -> Vec<(ItemId, BlobHash, bool)> {
-        core.debug_conn(|c| pick_downloads(c, f, &core.inner.fetching, slots, T0, Instant::now()).unwrap())
+        core.debug_conn(|c| pick_downloads(c, f, &core.inner.fetching, slots, T0, Instant::now(), &mut GuardPass::off(core)).unwrap())
     }
 
-    // Review finding 7: the oldest 500 Pending items all in back-off must not hide item 501.
+    // The oldest 500 Pending items all in back-off must not hide item 501.
     #[tokio::test]
     async fn pending_items_behind_a_block_of_backed_off_ones_are_picked() {
         let dir = tempfile::tempdir().unwrap();
@@ -1242,7 +1450,7 @@ mod tests {
         assert!(got.iter().all(|g| g.2), "Lost picks are marked so they are not asked in a loop");
     }
 
-    // Round 2, R13: a Lost item asked for earlier keeps its retry deadline. When it turns Pending
+    // A Lost item asked for earlier keeps its retry deadline. When it turns Pending
     // (restored from the Bin, new content) the deadline must not hold its download back.
     #[tokio::test]
     async fn a_pending_item_with_a_stale_lost_deadline_is_picked_at_once() {
@@ -1256,7 +1464,7 @@ mod tests {
         assert!(got.iter().all(|g| !g.2), "Pending picks are not marked Lost");
     }
 
-    // Round 2, R14: the task works on the hash the scheduler claimed. The pick hands out the claimed
+    // The task works on the hash the scheduler claimed. The pick hands out the claimed
     // hash; a record whose content changed (or that is no longer Pending/Lost) between the pick and
     // the load is dropped (the claim is freed, the item is picked again under its new hash), never
     // downloaded under the old claim.
@@ -1270,7 +1478,7 @@ mod tests {
         assert_eq!(picked.len(), 1);
         let (pid, claimed, _) = picked[0];
         assert_eq!((pid, claimed), items[0], "the pick hands out the hash it claimed");
-        assert!(lock(&core.inner.fetching).contains(&claimed));
+        assert!(lock(&core.inner.fetching).contains_key(&claimed));
         assert!(load_for_fetch(&core, id, claimed).unwrap().is_some(), "the claimed hash loads");
 
         // The content changes after the pick: the old claim no longer matches.
@@ -1288,7 +1496,7 @@ mod tests {
         assert!(load_for_fetch(&core, id, fresh).unwrap().is_none(), "a present item is dropped");
     }
 
-    // Review finding 11: a hash still held by a download task (of an earlier session) is not
+    // A hash still held by a download task (of an earlier session) is not
     // picked again; when that task ends the hash is free and the scheduler is woken.
     #[tokio::test]
     async fn a_hash_held_by_a_running_download_is_skipped_until_it_ends() {
@@ -1296,19 +1504,19 @@ mod tests {
         let core = open_core(dir.path());
         let items = add_items(&core, 2, LocalFileState::Pending);
         let (held_id, held_hash) = items[0];
-        lock(&core.inner.fetching).insert(held_hash);
+        lock(&core.inner.fetching).insert(held_hash, 100);
         let guard = HashGuard { core: core.clone(), hash: held_hash };
         let f = Fetcher::default();
         let got = pick(&core, &f, 2);
         assert_eq!(got.iter().map(|g| g.0).collect::<Vec<_>>(), vec![items[1].0], "the held item is skipped, the other is picked");
         drop(guard);
-        assert!(!lock(&core.inner.fetching).contains(&held_hash), "freed when the task ends");
+        assert!(!lock(&core.inner.fetching).contains_key(&held_hash), "freed when the task ends");
         tokio::time::timeout(Duration::from_millis(200), core.inner.kick.notified()).await.expect("the scheduler was woken");
         let got = pick(&core, &f, 2);
         assert!(got.iter().any(|g| g.0 == held_id), "now it is picked");
     }
 
-    // Review finding 11 (verifier): an error in the middle of a pick must not leave the hashes it
+    // An error in the middle of a pick must not leave the hashes it
     // already claimed held for good, with no task to free them.
     #[tokio::test]
     async fn an_error_mid_pick_frees_the_hashes_it_claimed() {
@@ -1322,12 +1530,170 @@ mod tests {
             c.execute_batch("PRAGMA ignore_check_constraints = OFF").unwrap();
         });
         let f = Fetcher::default();
-        let r = core.debug_conn(|c| pick_downloads(c, &f, &core.inner.fetching, 3, T0, Instant::now()));
+        let r = core.debug_conn(|c| pick_downloads(c, &f, &core.inner.fetching, 3, T0, Instant::now(), &mut GuardPass::off(&core)));
         assert!(r.is_err(), "the unreadable item fails the pick");
         assert!(lock(&core.inner.fetching).is_empty(), "nothing stays claimed after the error");
     }
 
-    // Review finding 9: the unpair-notice task belongs to the network instance. Stopping the network
+    /// A placement that reports a fixed amount of free space; everything else is the real one.
+    struct LowSpace {
+        inner: AppStorage,
+        free: u64,
+    }
+
+    impl crate::placement::Placement for LowSpace {
+        fn part_path(&self, hash: &BlobHash) -> Result<std::path::PathBuf> {
+            self.inner.part_path(hash)
+        }
+        fn commit(&self, part: &std::path::Path, t: &crate::placement::FileTarget) -> Result<std::path::PathBuf> {
+            self.inner.commit(part, t)
+        }
+        fn adopt(&self, src: &std::path::Path, t: &crate::placement::FileTarget) -> Result<std::path::PathBuf> {
+            self.inner.adopt(src, t)
+        }
+        fn relocate(&self, t: &crate::placement::FileTarget) -> Result<std::path::PathBuf> {
+            self.inner.relocate(t)
+        }
+        fn to_bin(&self, t: &crate::placement::FileTarget) -> Result<std::path::PathBuf> {
+            self.inner.to_bin(t)
+        }
+        fn from_bin(&self, t: &crate::placement::FileTarget) -> Result<std::path::PathBuf> {
+            self.inner.from_bin(t)
+        }
+        fn purge(&self, t: &crate::placement::FileTarget) -> Result<()> {
+            self.inner.purge(t)
+        }
+        fn available_space(&self) -> Result<u64> {
+            Ok(self.free)
+        }
+    }
+
+    /// A phone-side guard pass that sees `free` bytes (the default guard is 2 GB).
+    fn low_space_pass(dir: &std::path::Path, free: u64) -> GuardPass {
+        let inner = AppStorage::new(dir.join("storage")).unwrap();
+        GuardPass { phone: true, placement: Arc::new(LowSpace { inner, free }), held_back: None, slots_full: false }
+    }
+
+    fn pick_with(core: &Core, f: &Fetcher, slots: usize, gp: &mut GuardPass) -> Vec<(ItemId, BlobHash, bool)> {
+        core.debug_conn(|c| pick_downloads(c, f, &core.inner.fetching, slots, T0, Instant::now(), gp).unwrap())
+    }
+
+    // Items the guard holds back are not walked past for ever. With the phone below its guard
+    // every row is held, so the scan of a state stops after one page instead of reading the whole backlog on every scheduling pass. Nothing is
+    // picked, nothing is claimed, and the reason is reported (storage_low and the recheck use it).
+    #[tokio::test]
+    async fn guard_held_items_end_the_scan_after_one_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = open_core(dir.path());
+        let items = add_items(&core, 600, LocalFileState::Pending);
+        // max_blob_bytes = 100, every item is 100 bytes: none is oversize, so the guard holds all.
+        core.debug_conn(|c| {
+            store::save_settings(c, &crate::model::Settings { max_blob_bytes: 100, ..crate::model::Settings::default() }).unwrap();
+        });
+        let set_size = |id: ItemId, size: u64| {
+            core.debug_conn(|c| {
+                let (mut rec, _) = store::get_item(c, id).unwrap().unwrap();
+                rec.content.val.size = size;
+                store::update_item(c, &rec).unwrap();
+            });
+        };
+        // The last item is over max_blob_bytes: the guard never holds it back, so it would be picked
+        // if the scan walked the whole backlog. It sits beyond the window, so it is not reached.
+        set_size(items[599].0, 101);
+        let mut gp = low_space_pass(dir.path(), 0);
+        let got = pick_with(&core, &Fetcher::default(), 2, &mut gp);
+        assert!(got.is_empty(), "below the guard nothing in the window is picked");
+        assert!(gp.held_back.is_some(), "the hold is reported");
+        assert!(lock(&core.inner.fetching).is_empty(), "a held item claims nothing");
+        // Control: an oversize item inside the window bypasses the guard (fetch_item refuses it once).
+        set_size(items[3].0, 101);
+        let mut gp = low_space_pass(dir.path(), 0);
+        let got = pick_with(&core, &Fetcher::default(), 2, &mut gp);
+        assert_eq!(got.iter().map(|g| g.0).collect::<Vec<_>>(), vec![items[3].0]);
+    }
+
+    // The claim comes after the guard and the hash check, in that order. A guard-held item leaves no
+    // hash in `fetching` (a leaked claim would keep it from downloading until the app restarts); a
+    // hash a running task holds is skipped before the guard, so it never turns storage_low on; and
+    // a pick spends the spare it needed, so a second item that no longer fits is held back.
+    #[tokio::test]
+    async fn guard_and_claim_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = open_core(dir.path());
+        let guard = crate::model::Settings::default().storage_guard_bytes;
+        let items = add_items(&core, 2, LocalFileState::Pending);
+
+        // (a) Below the guard: nothing picked, nothing claimed, the hold is reported.
+        let mut gp = low_space_pass(dir.path(), 0);
+        assert!(pick_with(&core, &Fetcher::default(), 2, &mut gp).is_empty());
+        assert!(gp.held_back.is_some());
+        assert!(lock(&core.inner.fetching).is_empty(), "a guard-held item claims nothing");
+
+        // (b) Room for exactly one item (100 bytes each) above the guard: one pick, the other is
+        // held back, and only the picked hash is claimed.
+        let mut gp = low_space_pass(dir.path(), guard + 150);
+        let got = pick_with(&core, &Fetcher::default(), 2, &mut gp);
+        assert_eq!(got.iter().map(|g| g.0).collect::<Vec<_>>(), vec![items[0].0], "the spare is spent by the first pick");
+        assert!(gp.held_back.is_some(), "the second item does not fit");
+        assert_eq!(lock(&core.inner.fetching).len(), 1);
+        lock(&core.inner.fetching).clear();
+
+        // (c) The first item's hash is already held by a running task: it is skipped before the
+        // guard, the second fits (the running task's 100 bytes are counted, so room for 250), and the guard
+        // reports nothing.
+        lock(&core.inner.fetching).insert(items[0].1, 100);
+        let mut gp = low_space_pass(dir.path(), guard + 250);
+        let got = pick_with(&core, &Fetcher::default(), 2, &mut gp);
+        assert_eq!(got.iter().map(|g| g.0).collect::<Vec<_>>(), vec![items[1].0]);
+        assert!(gp.held_back.is_none(), "a duplicate held by a task never turns storage_low on");
+    }
+
+    // A pass that fills its slots stops before the items behind the last pick, so it cannot say
+    // whether one of them is held: it reports that, and `schedule` then leaves the flag alone.
+    #[tokio::test]
+    async fn a_pass_that_fills_its_slots_says_it_did_not_see_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = open_core(dir.path());
+        let guard = crate::model::Settings::default().storage_guard_bytes;
+        let items = add_items(&core, 2, LocalFileState::Pending);
+        // Room for the first item only: with one slot the pass picks it and never reaches the second.
+        let mut gp = low_space_pass(dir.path(), guard + 150);
+        let got = pick_with(&core, &Fetcher::default(), 1, &mut gp);
+        assert_eq!(got.iter().map(|g| g.0).collect::<Vec<_>>(), vec![items[0].0]);
+        assert!(gp.slots_full && gp.held_back.is_none());
+        lock(&core.inner.fetching).clear();
+        // With a slot to spare the scan reaches the second item and reports the hold.
+        let mut gp = low_space_pass(dir.path(), guard + 150);
+        pick_with(&core, &Fetcher::default(), 2, &mut gp);
+        assert!(!gp.slots_full && gp.held_back.is_some());
+    }
+
+    // A download task outlives its session. Right after a reconnect the new session's `Fetcher` is
+    // empty, so the guard must read what the old task still has to write from the core-wide claim,
+    // not from the fetcher: else it over-estimates the free space by that task's remaining bytes.
+    #[tokio::test]
+    async fn guard_counts_the_bytes_an_earlier_sessions_task_still_has_to_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = open_core(dir.path());
+        let guard = crate::model::Settings::default().storage_guard_bytes;
+        let items = add_items(&core, 2, LocalFileState::Pending);
+        // An old task holds item 0's hash and has 100 bytes to go; the new session's fetcher knows
+        // nothing about it. Room above the guard: 150, so item 1 (100 bytes) fits only if the old
+        // task's 100 are ignored.
+        lock(&core.inner.fetching).insert(items[0].1, 100);
+        let mut gp = low_space_pass(dir.path(), guard + 150);
+        let got = pick_with(&core, &Fetcher::default(), 2, &mut gp);
+        assert!(got.is_empty(), "the old task's remaining bytes use the space: {got:?}");
+        assert!(gp.held_back.is_some(), "the hold is reported");
+        // Once that task has written 60 bytes of its part file, only 40 are still to come.
+        let part = core.inner.placement.part_path(&items[0].1).unwrap();
+        std::fs::write(&part, [0u8; 60]).unwrap();
+        let mut gp = low_space_pass(dir.path(), guard + 150);
+        let got = pick_with(&core, &Fetcher::default(), 2, &mut gp);
+        assert_eq!(got.iter().map(|g| g.0).collect::<Vec<_>>(), vec![items[1].0], "bytes already written no longer count");
+    }
+
+    // The unpair-notice task belongs to the network instance. Stopping the network
     // ends it at once, so a restarted network can start its own (a task that outlived the stop kept
     // the shut-down node, and its running flag kept the new task from ever starting).
     #[tokio::test]
@@ -1360,7 +1726,7 @@ mod tests {
         assert!(!core.inner.notice_running.load(SeqCst), "stopping the network ended the task and freed the flag");
     }
 
-    // Review finding 6: only a fully acknowledged frame counts as delivered.
+    // Only a fully acknowledged frame counts as delivered.
     #[test]
     fn only_an_acknowledged_frame_is_delivered() {
         assert!(confirmed(StreamEnd::Acked).is_ok());

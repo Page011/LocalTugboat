@@ -47,14 +47,12 @@ object LogExport {
 
 /** Share and "Save to phone gallery" for one item. */
 object ItemExport {
-    /** Share sheet for the held file. Throws IOException with a readable message when the file is not on this phone. */
+    /**
+     * Share sheet for the held file. The URI carries the item's real name, so the receiving app does not see
+     * `<uuid>.ext`. Throws IOException with a readable message when the file is not on this phone.
+     */
     fun shareIntent(c: Context, item: ItemInfo): Intent {
-        val path = item.path ?: throw IOException("File is not on this phone yet")
-        val uri = try {
-            FileProvider.getUriForFile(c, authority(c), File(path))
-        } catch (e: IllegalArgumentException) {
-            throw IOException("This file cannot be shared from the Bin. Restore it first")
-        }
+        val uri = ItemFileProvider.uriFor(c, item)
         return Intent.createChooser(
             Intent(Intent.ACTION_SEND).setType(mimeOf(item)).putExtra(Intent.EXTRA_STREAM, uri).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION),
             "Share",
@@ -66,6 +64,7 @@ object ItemExport {
      * The copy leaves Tugboat's control: it never expires. Blocking. Throws IOException.
      */
     fun saveToGallery(c: Context, item: ItemInfo): Uri {
+        if (item.kind == uniffi.tugboat_ffi.MediaKind.FILE) throw IOException("Only photos and videos go to the phone gallery")
         val src = File(item.path ?: throw IOException("File is not on this phone yet"))
         val video = item.kind == uniffi.tugboat_ffi.MediaKind.VIDEO
         val collection = if (video) MediaStore.Video.Media.EXTERNAL_CONTENT_URI else MediaStore.Images.Media.EXTERNAL_CONTENT_URI
@@ -90,15 +89,5 @@ object ItemExport {
         }
     }
 
-    private fun mimeOf(item: ItemInfo): String = when (item.ext.lowercase()) {
-        "jpg", "jpeg" -> "image/jpeg"
-        "png" -> "image/png"
-        "gif" -> "image/gif"
-        "webp" -> "image/webp"
-        "heic", "heif" -> "image/heic"
-        "mp4", "m4v" -> "video/mp4"
-        "mov" -> "video/quicktime"
-        "3gp" -> "video/3gpp"
-        else -> if (item.kind == uniffi.tugboat_ffi.MediaKind.VIDEO) "video/*" else "image/*"
-    }
+    private fun mimeOf(item: ItemInfo): String = FileRules.mime(item.ext, item.kind, PlatformMime.ofExt)
 }

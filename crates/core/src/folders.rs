@@ -1,18 +1,18 @@
-//! Folder records and the default folders. Owner: logic builder.
+//! Folder records and the default folders.
 //!
 //! Rules:
 //! F1 Default folders have fixed ids (model::INBOX_ID, KEEP_ID, UNSORTED_ID) and GENESIS
 //!    versions, so both devices create identical records and never duplicate them:
 //!    Inbox (kind inbox, 24 h = 86_400 s), Keep (kind keep, Keep), Unsorted (kind unsorted, Keep).
 //! F2 Default folders cannot be deleted; their kind never changes. Inbox and Unsorted
-//!    retention can be changed (M4 UI); renaming is allowed (names are display only).
-//! F3 A folder created in Explorer starts as Keep (PLAN). A folder created in the app takes
+//!    retention can be changed; renaming is allowed (names are display only).
+//! F3 A folder created in Explorer starts as Keep. A folder created in the app takes
 //!    the retention the user chose (default Keep).
 //! F4 Folder names: `names::clean_folder_name`; two folders may share a name (disk names
-//!    get " (2)", PLAN Storage), so uniqueness is not enforced in the record.
+//!    get " (2)"), so uniqueness is not enforced in the record.
 //! F5 Deleting a folder: deleted = Some(now) on the folder, and each item in it that is not
-//!    already in the Bin is deleted in the same transaction (PLAN: "deleted subfolder = its
-//!    items to the Bin"). Items moved into it later by the other device are treated as
+//!    already in the Bin is deleted in the same transaction (a deleted subfolder sends its
+//!    items to the Bin). Items moved into it later by the other device are treated as
 //!    Unsorted (expiry E2) until moved.
 
 use std::collections::HashMap;
@@ -82,16 +82,20 @@ fn sort_key(f: &FolderRecord) -> (u8, String) {
     (rank, f.name.val.to_lowercase())
 }
 
-/// Live folders with item counts (not in the Bin), Inbox first, then Keep, Unsorted, then
+/// Live folders with item counts (not in the Bin; `hide_refused` leaves out files this device refused:
+/// the PC lists them under Not synced instead), Inbox first, then Keep, Unsorted, then
 /// user folders by name (case-insensitive).
-pub fn folder_views(c: &Connection, now: i64) -> Result<Vec<FolderView>> {
+pub fn folder_views(c: &Connection, now: i64, hide_refused: bool) -> Result<Vec<FolderView>> {
     let folders = store::all_folders(c)?;
     let map: HashMap<FolderId, FolderRecord> = folders.iter().map(|f| (f.id, f.clone())).collect();
     let mut counts: HashMap<FolderId, u32> = HashMap::new();
     // Items effectively deleted are in the Bin whatever the rest says: only items that are not
     // deleted, or that carry a pin (which may outrank an older delete), can be outside it.
     for id in store::item_ids_where(c, "deleted_at IS NULL OR pinned = 1")? {
-        let Some((rec, _)) = store::get_item(c, id)? else { continue };
+        let Some((rec, lfs)) = store::get_item(c, id)? else { continue };
+        if hide_refused && lfs == LocalFileState::Refused {
+            continue;
+        }
         let state = bin::derive_state_in(c, &map, &rec, now)?;
         if !expiry::in_bin(state) {
             // E2: an item in a deleted or unknown folder shows under Unsorted.
@@ -106,12 +110,12 @@ pub fn folder_views(c: &Connection, now: i64) -> Result<Vec<FolderView>> {
     live.sort_by_key(|f| sort_key(f));
     Ok(live
         .into_iter()
-        .map(|f| FolderView { id: f.id, kind: f.kind, name: f.name.val.clone(), retention: f.retention.val, count: counts.get(&f.id).copied().unwrap_or(0) })
+        .map(|f| FolderView { id: f.id, kind: f.kind, name: crate::names::display_name(&f.name.val, ""), retention: f.retention.val, count: counts.get(&f.id).copied().unwrap_or(0) })
         .collect())
 }
 
 /// Number of items that `set_retention(folder, new)` would move to the Bin at `now`
-/// (M4 confirmation "This moves 132 items to the Bin").
+/// (the confirmation reads "This moves 132 items to the Bin").
 pub fn retention_preview(c: &Connection, folder: FolderId, new: Retention, now: i64) -> Result<u32> {
     let map: HashMap<FolderId, FolderRecord> = store::all_folders(c)?.into_iter().map(|f| (f.id, f)).collect();
     let Some(current) = map.get(&folder).cloned() else { return Ok(0) };
@@ -142,7 +146,7 @@ mod tests {
     use crate::placement::AppStorage;
     use crate::store::test_support::*;
 
-    // L21: default folders identical on two fresh dbs; idempotent.
+    // Default folders identical on two fresh dbs; idempotent.
     #[test]
     fn defaults_identical_on_two_fresh_dbs_and_idempotent() {
         let a = Db::open_in_memory().unwrap();
@@ -183,7 +187,7 @@ mod tests {
         assert_eq!(effective_folder(&db.conn, id).unwrap().id, UNSORTED_ID);
     }
 
-    // L21: views: order, counts exclude Bin items, items of a deleted folder show under Unsorted.
+    // Views: order, counts exclude Bin items, items of a deleted folder show under Unsorted.
     #[test]
     fn views_order_and_counts() {
         let mut db = db_with_peer(p(), f());
@@ -202,25 +206,25 @@ mod tests {
         let mut it2 = store::get_item(&db.conn, ItemId(uuid::Uuid::from_u128(0x1002))).unwrap().unwrap().0;
         it2.deleted = Versioned { v: v(5, p()), val: Some(T0) };
         store::update_item(&db.conn, &it2).unwrap();
-        let views = folder_views(&db.conn, T0).unwrap();
+        let views = folder_views(&db.conn, T0, false).unwrap();
         let names: Vec<&str> = views.iter().map(|v| v.name.as_str()).collect();
         assert_eq!(names, vec!["Inbox", "Keep", "Unsorted", "Apple", "zebra"]);
         let count = |n: &str| views.iter().find(|v| v.name == n).unwrap().count;
         assert_eq!((count("Inbox"), count("Apple"), count("zebra"), count("Keep")), (1, 1, 1, 0));
         // Deleting Apple deletes its item too; the folder disappears from the views.
         ops::delete_folder(&mut db.conn, &Ctx { now: T0 + 1, ..ctx }, a).unwrap();
-        let views = folder_views(&db.conn, T0 + 1).unwrap();
+        let views = folder_views(&db.conn, T0 + 1, false).unwrap();
         assert!(views.iter().all(|v| v.name != "Apple"));
         assert_eq!(views.iter().map(|v| v.count).sum::<u32>(), 2, "Inbox 1 + zebra 1");
         // An item that arrives pointing at a deleted folder is shown under Unsorted.
         let mut stray = item(9, f(), v(2, f()));
         stray.location.val.folder = a;
         store::insert_item(&db.conn, &stray, LocalFileState::Pending, T0).unwrap();
-        let views = folder_views(&db.conn, T0 + 1).unwrap();
+        let views = folder_views(&db.conn, T0 + 1, false).unwrap();
         assert_eq!(views.iter().find(|v| v.id == UNSORTED_ID).unwrap().count, 1);
     }
 
-    // L21: preview counts what a retention change would bin; the change itself re-derives all items.
+    // Preview counts what a retention change would bin; the change itself re-derives all items.
     #[test]
     fn retention_preview_and_change_rederive_all_items() {
         let mut db = db_with_peer(p(), f());

@@ -57,6 +57,8 @@ pub enum FolderKind {
 pub enum MediaKind {
     Image,
     Video,
+    /// Any other file (0.2.0): shown as a file tile, opened by the phone's default app.
+    File,
 }
 
 #[uniffi::remote(Enum)]
@@ -118,6 +120,7 @@ pub struct SyncStatus {
     pub last_synced_at: Option<i64>,
     pub waiting: u32,
     pub downloading: u32,
+    pub storage_low: bool,
     pub message: Option<String>,
 }
 
@@ -170,8 +173,6 @@ pub enum ItemStateInfo {
     Kept,
     /// In a folder that never expires: "Keep".
     FolderKeep,
-    /// Would expire but the PC has not confirmed holding the file: "Waiting for PC".
-    Waiting,
     /// "Expires in 5h": `expires_at_ms` minus now.
     Live { expires_at_ms: i64 },
 }
@@ -191,8 +192,10 @@ pub struct ItemInfo {
     pub local: LocalFileState,
     /// Absolute path of the held file (also for items in the Bin), when held.
     pub path: Option<String>,
-    /// Absolute path of the JPEG thumbnail, when held.
+    /// Absolute path of the JPEG thumbnail, when held (never for a File).
     pub thumb_path: Option<String>,
+    /// In the Bin because it EXPIRED and the PC never confirmed holding it: shown as "NOT ON PC".
+    pub never_reached_peer: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, uniffi::Record)]
@@ -266,8 +269,13 @@ pub struct NewFile {
     /// A file the app owns (camera output in cacheDir, or the copy made by the share target).
     /// Core COPIES it into app storage; the caller deletes the source afterwards.
     pub src_path: String,
-    /// Display name, e.g. "IMG_20261117_140233.jpg". Its extension and the file's magic
-    /// bytes must agree and be a photo or video type, else `SnapError.NotMedia`.
+    /// Display name, e.g. "IMG_20261117_140233.jpg" or "report.pdf". ANY file type is accepted.
+    /// A photo/video extension (jpg, mp4 ...) must match the file's magic bytes, else
+    /// `SnapError.NotMedia`; every other extension, or none, is a plain file. A name that is
+    /// always refused (.lnk .url .scf .library-ms .searchConnector-ms, desktop.ini, autorun.inf)
+    /// fails with `SnapError.Refused`, and so does a file over `Settings.max_blob_bytes`.
+    /// Core never changes the extension: a photo with no extension in its name stays a plain
+    /// file, so the app gives photos and videos their sniffed extension (as it already does).
     pub name: String,
     /// None = Inbox.
     pub folder_id: Option<String>,
@@ -340,7 +348,6 @@ fn state_info(s: ItemState) -> ItemStateInfo {
         ItemState::Expired { binned_at } => ItemStateInfo::Expired { binned_at_ms: binned_at },
         ItemState::Kept => ItemStateInfo::Kept,
         ItemState::FolderKeep => ItemStateInfo::FolderKeep,
-        ItemState::Waiting => ItemStateInfo::Waiting,
         ItemState::Live { expires_at } => ItemStateInfo::Live { expires_at_ms: expires_at },
     }
 }
@@ -359,6 +366,7 @@ fn item_info(v: ItemView) -> ItemInfo {
         local: v.local,
         path: v.path,
         thumb_path: v.thumb_path,
+        never_reached_peer: v.never_reached_peer,
     }
 }
 
@@ -405,6 +413,28 @@ pub fn generate_secret_key() -> Result<Vec<u8>, SnapError> {
     let mut k = [0u8; 32];
     getrandom::fill(&mut k).map_err(|e| SnapError::Io(format!("NO RANDOM NUMBERS - {e}")))?;
     Ok(k.to_vec())
+}
+
+/// The extension core would give a file called `name`: lowercase, 1..=16 of a-z 0-9 - _, or ""
+/// (no extension). Same rule as the PC; use it instead of re-implementing it in Kotlin.
+#[uniffi::export]
+pub fn names_ext_of(name: String) -> String {
+    tugboat_core::names::ext_of(&name)
+}
+
+/// True for the names that never sync, in either direction: .lnk .url .scf .library-ms
+/// .searchConnector-ms, desktop.ini, autorun.inf (case-insensitive, trailing dots and spaces and
+/// NTFS stream suffixes ignored). Core refuses them too (`SnapError.Refused`); the app uses this to
+/// say so before copying a shared file.
+#[uniffi::export]
+pub fn names_is_refused(name: String) -> bool {
+    tugboat_core::names::is_refused_name(&name)
+}
+
+/// The one-line text for a refused name: "REFUSED - shortcut and folder-setting files never sync".
+#[uniffi::export]
+pub fn names_refused_text() -> String {
+    tugboat_core::names::REFUSED_TEXT.to_string()
 }
 
 /// Check a scanned QR text or deep link before pairing: is it a Tugboat pairing code,
@@ -642,8 +672,9 @@ impl PhoneCore {
 
     /// Take a captured or imported file into Tugboat. Returns the new item id. The record
     /// is written and the sync is triggered before this returns; the file reaches the PC in the
-    /// background. Typed errors: `NotMedia` (not a supported photo/video), `Io` (source missing
-    /// or unreadable, disk full), `Invalid` (target folder deleted), `Paused`.
+    /// background. Typed errors: `NotMedia` (a photo/video extension whose bytes are not one), `Refused`
+    /// (an always-refused name, or over the size limit), `Io` (source missing or unreadable, disk
+    /// full), `Invalid` (target folder deleted), `Paused`.
     pub fn add_file(&self, file: NewFile) -> Result<String, SnapError> {
         let f = NewLocalFile {
             src: PathBuf::from(&file.src_path),
@@ -804,9 +835,9 @@ mod tests {
         // A well-formed code naming a public address is refused: the phone never dials it.
         let public = format!("localtugboat://pair?v=1&k={}&a=8.8.8.8:47300&s={}&e=1&n=PC", "ab".repeat(32), "cd".repeat(16));
         assert!(matches!(inspect_pairing_payload(public), Err(SnapError::PairBadPayload(_))));
-        let ok = format!("localtugboat://pair?v=1&k={}&a=192.168.1.5:47300,10.0.0.2:47300&s={}&e=1790000000000&n=NIGEL%2DPC", "ab".repeat(32), "cd".repeat(16));
+        let ok = format!("localtugboat://pair?v=1&k={}&a=192.168.1.5:47300,10.0.0.2:47300&s={}&e=1790000000000&n=OFFICE%2DPC", "ab".repeat(32), "cd".repeat(16));
         let p = inspect_pairing_payload(ok).unwrap();
-        assert_eq!(p.pc_name, "NIGEL-PC");
+        assert_eq!(p.pc_name, "OFFICE-PC");
         assert_eq!(p.addresses, vec!["192.168.1.5:47300", "10.0.0.2:47300"]);
         assert_eq!(p.expires_at_ms, 1_790_000_000_000);
     }

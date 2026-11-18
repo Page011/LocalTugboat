@@ -1,11 +1,11 @@
 //! The Core facade: the one API both apps call (desktop via Tauri commands, phone via the
-//! UniFFI crate in M3). Owner: sync builder. Thin: validates input, calls ops/bin/store,
+//! UniFFI crate). Thin: validates input, calls ops/bin/store,
 //! emits events, pokes the sync session. No rule lives here.
 //!
 //! Threading: `Core` is cheap to clone (Arc). The SQLite connection sits behind a Mutex;
 //! every method holds it only for its own call and never across an await. (ops::add_local_file
 //! copies the file while it holds the lock: a very large video stalls sync for the length of
-//! the copy; see the sync builder's open issues.)
+//! the copy.)
 //! Errors are returned AND (for background work: sweep, sync, fetch) sent as Event::Error.
 
 use std::{
@@ -28,6 +28,7 @@ use crate::{
     events::{Event, SyncState, SyncStatus},
     expiry, folders,
     model::*,
+    names,
     ops::{self, Ctx, NewLocalFile},
     placement::Placement,
     places::{self, Fix, Route},
@@ -44,7 +45,7 @@ pub struct CoreConfig {
     /// This device's public key (the app loads the secret from Credential Manager /
     /// Keystore and passes the derived public key here; the secret goes to `start_network`).
     pub self_id: DeviceId,
-    /// "NIGEL-PC" / phone model. Shown to the other device.
+    /// "OFFICE-PC" / phone model. Shown to the other device.
     pub device_name: String,
     pub app_version: String,
 }
@@ -91,6 +92,8 @@ pub(crate) struct Inner {
     pub active: Mutex<Option<net::Active>>,
     pub pairing: Mutex<Option<pair::PairState>>,
     pub proto: AtomicU32,
+    /// Pairing protocol number the phone speaks (tests play an older phone).
+    pub pair_proto: AtomicU32,
     pub retry_base_ms: AtomicU64,
     /// Test hook: extra delay before the PC saves a confirmed pairing (0 in the apps).
     pub pair_save_delay_ms: AtomicU64,
@@ -100,9 +103,20 @@ pub(crate) struct Inner {
     /// Phone: a task is delivering an unpair notice to a replaced PC while the connect loop
     /// serves the new one.
     pub notice_running: std::sync::atomic::AtomicBool,
+    /// Phone: the storage guard is holding at least one download back (SyncStatus.storage_low).
+    pub storage_low: std::sync::atomic::AtomicBool,
+    /// How long a blocked download queue waits before it looks at the free space again (ms).
+    pub guard_recheck_ms: AtomicU64,
+    /// Tests only: record the hash of each blob request (`debug_record_blob_requests`). Off in the
+    /// apps, so the list below never grows there.
+    pub record_blob_requests: std::sync::atomic::AtomicBool,
+    /// Hash (hex) of every blob or thumbnail request this device answered or refused while
+    /// recording (tests assert "zero", or that one hash was never asked for).
+    pub blob_requests: Mutex<Vec<String>>,
     /// Content hashes with a download task alive (any session). Two tasks must never write the
-    /// same part file, and a task outlives the session that started it.
-    pub fetching: Mutex<std::collections::HashSet<BlobHash>>,
+    /// same part file, and a task outlives the session that started it. The value is the declared
+    /// size of that download: the phone storage guard counts what it still has to write.
+    pub fetching: Mutex<std::collections::HashMap<BlobHash, u64>>,
 }
 
 #[derive(Clone)]
@@ -143,12 +157,17 @@ impl Core {
                 active: Mutex::new(None),
                 pairing: Mutex::new(None),
                 proto: AtomicU32::new(wire::PROTO),
+                pair_proto: AtomicU32::new(tugboat_net::pairing::PAIR_PROTO),
                 retry_base_ms: AtomicU64::new(2000),
                 pair_save_delay_ms: AtomicU64::new(0),
                 generation: AtomicU64::new(0),
                 resumed_bytes: AtomicU64::new(0),
                 notice_running: std::sync::atomic::AtomicBool::new(false),
-                fetching: Mutex::new(std::collections::HashSet::new()),
+                storage_low: std::sync::atomic::AtomicBool::new(false),
+                guard_recheck_ms: AtomicU64::new(30_000),
+                record_blob_requests: std::sync::atomic::AtomicBool::new(false),
+                blob_requests: Mutex::new(Vec::new()),
+                fetching: Mutex::new(std::collections::HashMap::new()),
             }),
         };
         core.sweep_and_emit()?;
@@ -219,10 +238,73 @@ impl Core {
         self.inner.proto.store(proto, Ordering::SeqCst);
     }
 
+    /// Test hook: speak another PAIRING protocol number when this device is the phone.
+    #[doc(hidden)]
+    pub fn debug_set_pair_proto(&self, proto: u32) {
+        self.inner.pair_proto.store(proto, Ordering::SeqCst);
+    }
+
     /// Test hook: blob retry back-off base (default 2000 ms).
     #[doc(hidden)]
     pub fn debug_set_retry_base_ms(&self, ms: u64) {
         self.inner.retry_base_ms.store(ms.max(1), Ordering::SeqCst);
+    }
+
+    /// Test and QA hook: write an item RECORD straight into the database (and the change log, so
+    /// it syncs) without any file behind it, with the name, extension, kind, thumbnail and local
+    /// state given: the way a hostile or newer peer's record would arrive. `fake_phone
+    /// send-refused` uses it to put a refused name on the PC's Not synced list.
+    #[doc(hidden)]
+    pub fn debug_add_record(&self, name: &str, ext: &str, kind: MediaKind, thumb: Option<Thumb>, local: LocalFileState) -> Result<ItemId> {
+        let id = self.with_ctx(|c, ctx| {
+            let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let v = store::next_version(&tx, ctx.self_id)?;
+            let id = ItemId::new(ctx.now);
+            let rec = ItemRecord {
+                id,
+                captured_at: ctx.now,
+                origin: ctx.self_id,
+                geo: None,
+                name: Versioned { v, val: name.to_string() },
+                content: Versioned { v, val: Content { hash: BlobHash(*blake3::hash(name.as_bytes()).as_bytes()), size: name.len() as u64, kind, ext: ext.to_string(), thumb } },
+                location: Versioned { v, val: Location { folder: INBOX_ID, entered_at: ctx.now } },
+                pinned: Versioned { v, val: false },
+                deleted: Versioned { v, val: None },
+            };
+            store::insert_item(&tx, &rec, local, ctx.now)?;
+            store::log_change(&tx, &EntityKey::Item { id }, group::ALL, v.lamport)?;
+            tx.commit()?;
+            Ok(id)
+        })?;
+        self.wrote(&[id], false, false);
+        Ok(id)
+    }
+
+    /// Test hook: how long a download queue blocked by the storage guard waits before it checks
+    /// the free space again (default 30 000 ms).
+    #[doc(hidden)]
+    pub fn debug_set_guard_recheck_ms(&self, ms: u64) {
+        self.inner.guard_recheck_ms.store(ms.max(1), Ordering::SeqCst);
+    }
+
+    /// Test hook: start recording the blob requests the peer makes (off by default: the list is
+    /// unbounded).
+    #[doc(hidden)]
+    pub fn debug_record_blob_requests(&self) {
+        self.inner.record_blob_requests.store(true, Ordering::SeqCst);
+    }
+
+    /// Test hook: how many blob or thumbnail requests the peer has made of this device since
+    /// recording started (a refused record must cost zero).
+    #[doc(hidden)]
+    pub fn debug_blob_requests(&self) -> usize {
+        lock(&self.inner.blob_requests).len()
+    }
+
+    /// Test hook: has the peer asked this device for the blob or thumbnail with this hash?
+    #[doc(hidden)]
+    pub fn debug_blob_requested(&self, hash: BlobHash) -> bool {
+        lock(&self.inner.blob_requests).contains(&hex::encode(hash.0))
     }
 
     /// Test hook: make the PC slow to save a confirmed pairing (a busy disk or CPU).
@@ -268,7 +350,8 @@ impl Core {
         } else {
             (st.state.unwrap_or(SyncState::Offline), st.message.clone())
         };
-        SyncStatus { state, peer_name: peer.map(|p| p.name), last_synced_at: st.last_synced_at, waiting, downloading, message }
+        let storage_low = self.inner.storage_low.load(Ordering::SeqCst);
+        SyncStatus { state, peer_name: peer.map(|p| p.name), last_synced_at: st.last_synced_at, waiting, downloading, storage_low, message }
     }
 
     /// Set the connection-derived state, then emit Event::Sync when the status changed.
@@ -304,7 +387,7 @@ impl Core {
     pub fn folders(&self) -> Result<Vec<FolderView>> {
         let now = self.now();
         let db = lock(&self.inner.db);
-        folders::folder_views(&db.conn, now)
+        folders::folder_views(&db.conn, now, self.inner.cfg.role == Role::Pc)
     }
 
     pub fn items(&self, q: &ItemQuery) -> Result<Page<ItemView>> {
@@ -347,7 +430,8 @@ impl Core {
                 let got = page.len();
                 for (rec, lfs) in page {
                     after = Some(rec.id);
-                    if !wanted(&rec) {
+                    // The PC lists a file it refused under Not synced, not as a tile; the phone keeps its tile.
+                    if !wanted(&rec) || (lfs == LocalFileState::Refused && self.inner.cfg.role == Role::Pc) {
                         continue;
                     }
                     let state = bin::derive_state_in(c, &fmap, &rec, now)?;
@@ -387,10 +471,21 @@ impl Core {
             LocalFileState::Present | LocalFileState::Binned => store::get_file_ref(c, rec.id).ok().flatten().map(|r| r.path),
             _ => None,
         };
-        let thumb_path = rec.content.val.thumb.as_ref().map(|t| self.thumb_path(t.hash)).filter(|p| p.exists()).map(|p| p.to_string_lossy().into_owned());
+        // A File never shows a thumbnail, whatever its record carries.
+        let thumb_path = rec
+            .content
+            .val
+            .thumb
+            .as_ref()
+            .filter(|_| rec.content.val.kind != MediaKind::File)
+            .map(|t| self.thumb_path(t.hash))
+            .filter(|p| p.exists())
+            .map(|p| p.to_string_lossy().into_owned());
+        // Expired before the paired device ever confirmed the file: the Bin says so (silent-failure rule).
+        let never_reached_peer = matches!(state, ItemState::Expired { .. }) && bin::missing_at_peer(c, rec.content.val.hash).ok().flatten().is_some();
         ItemView {
             id: rec.id,
-            name: rec.name.val.clone(),
+            name: crate::names::display_name(&rec.name.val, &rec.content.val.ext),
             folder,
             kind: rec.content.val.kind,
             size: rec.content.val.size,
@@ -402,7 +497,37 @@ impl Core {
             local: lfs,
             path,
             thumb_path,
+            never_reached_peer,
         }
+    }
+
+    /// Items this device will not hold because the file is refused (an always-refused name from
+    /// the other device, a wrong type, too large): local state Refused, not in the Bin, newest
+    /// first. The PC lists them in its Not synced list, the phone as REFUSED tiles.
+    pub fn refused_items(&self, limit: u32) -> Result<Vec<ItemView>> {
+        let now = self.now();
+        let db = lock(&self.inner.db);
+        let c = &db.conn;
+        let fmap: HashMap<FolderId, FolderRecord> = store::all_folders(c)?.into_iter().map(|f| (f.id, f)).collect();
+        let mut rows: Vec<ItemView> = Vec::new();
+        let mut recs: Vec<(ItemRecord, LocalFileState)> = Vec::new();
+        for id in store::item_ids_where(c, "local_file_state = 'refused'")? {
+            if let Some(x) = store::get_item(c, id)? {
+                recs.push(x);
+            }
+        }
+        recs.sort_by(|a, b| b.0.captured_at.cmp(&a.0.captured_at).then_with(|| b.0.id.cmp(&a.0.id)));
+        for (rec, lfs) in recs {
+            let state = bin::derive_state_in(c, &fmap, &rec, now)?;
+            if expiry::in_bin(state) {
+                continue;
+            }
+            rows.push(self.item_view(c, &fmap, &rec, lfs, state));
+            if rows.len() >= limit.clamp(1, 500) as usize {
+                break;
+            }
+        }
+        Ok(rows)
     }
 
     /// Activity, newest first. `before` = last id of the previous page.
@@ -421,14 +546,14 @@ impl Core {
         store::paired_peer(&db.conn)
     }
 
-    /// M4 confirmation count ("This moves 132 items to the Bin").
+    /// Confirmation count ("This moves 132 items to the Bin").
     pub fn retention_preview(&self, folder: FolderId, new: Retention) -> Result<u32> {
         let now = self.now();
         let db = lock(&self.inner.db);
         folders::retention_preview(&db.conn, folder, new, now)
     }
 
-    /// Phone capture routing (places::route over live places). M4 UI; tested in M1.
+    /// Phone capture routing (places::route over live places).
     pub fn route_capture(&self, fix: Option<Fix>) -> Result<Route> {
         let db = lock(&self.inner.db);
         let c = &db.conn;
@@ -460,6 +585,10 @@ impl Core {
             return Err(CoreError::Paused(p));
         }
         // The thumbnail is hashed and copied here; ops::add_local_file takes the finished Thumb.
+        // Only photos and videos get a thumbnail: a thumbnail offered for any other file is dropped.
+        if names::media_family_of_name(&f.name).is_none() {
+            f.thumb = None;
+        }
         // Thumbnails are content-addressed and shared between items, so a failed add leaves its
         // thumbnail in place: another import may already point at the same file (no thumbnail GC
         // exists, the cost is one small file).
@@ -580,7 +709,7 @@ impl Core {
         Ok(())
     }
 
-    // ----- PC library glue (M2; desktop watcher calls these) -----
+    // ----- PC library glue (the desktop watcher calls these) -----
 
     /// Watcher: an existing item's file content changed (ops::content_changed).
     pub fn local_content_changed(&self, id: ItemId, path: PathBuf) -> Result<()> {
@@ -597,6 +726,12 @@ impl Core {
             // The file is already at its new place: point the record at it first, so the
             // placement's relocate during move/rename finds it there (C6).
             let old = store::get_file_ref(c, id)?;
+            // A name the record refuses is found out before the path is written: otherwise the
+            // path stays changed, the refused rename reads as done and the next pass puts the
+            // user's file back under its old name.
+            if rec.name.val != name {
+                ops::check_rename(c, id, name)?;
+            }
             store::put_file_ref(
                 c,
                 &store::FileRef {
@@ -604,6 +739,7 @@ impl Core {
                     path: new_path.to_string_lossy().into_owned(),
                     volume_serial: old.as_ref().and_then(|o| o.volume_serial),
                     file_id: old.as_ref().and_then(|o| o.file_id),
+                    mtime_ms: old.as_ref().and_then(|o| o.mtime_ms),
                 },
             )?;
             if rec.location.val.folder != folder {
@@ -717,6 +853,13 @@ impl Core {
     pub fn held_files(&self) -> Result<Vec<store::HeldFile>> {
         let db = lock(&self.inner.db);
         store::held_files(&db.conn)
+    }
+
+    /// Desktop: remember the modified time (unix ms) of the file an item holds, as the watcher
+    /// saw it at the item's current path. Errors when the item holds no file.
+    pub fn set_file_mtime(&self, id: ItemId, mtime_ms: i64) -> Result<()> {
+        let db = lock(&self.inner.db);
+        store::set_file_mtime(&db.conn, id, mtime_ms)
     }
 
     /// Desktop: remember the NTFS identity of an item's file (set after a scan recognised it).
@@ -856,19 +999,25 @@ impl Core {
     }
 }
 
-/// Items that would expire but wait for the other device's receipt ("Waiting for PC").
-/// The SQL only narrows to items with no qualifying peer receipt (the rare, small set);
-/// `derive_state` still decides, so the expiry rules stay in one place.
+/// Items held here (not in the Bin) that the paired device has not confirmed holding: no receipt
+/// from the CURRENTLY paired device for the item's current hash ("PC not found, 3 waiting").
+/// 0 while unpaired. The SQL narrows to the rare set without a receipt; `derive_state` still
+/// decides who is in the Bin, so the expiry rules stay in one place. Expiry itself never waits
+/// for these items (0.2.0).
 fn waiting_count(c: &Connection, now: i64) -> Result<u32> {
+    let Some(peer) = store::paired_peer(c)? else { return Ok(0) };
     let fmap: HashMap<FolderId, FolderRecord> = store::all_folders(c)?.into_iter().map(|f| (f.id, f)).collect();
     let candidates = store::item_ids_where(
         c,
-        "deleted_at IS NULL AND pinned = 0 AND NOT EXISTS (SELECT 1 FROM receipt r JOIN device d ON d.id = r.device_id          WHERE r.blob_hash = item.blob_hash AND d.is_self = 0 AND d.paired_at IS NOT NULL)",
+        &format!(
+            "local_file_state = 'present' AND deleted_at IS NULL AND NOT EXISTS (SELECT 1 FROM receipt r WHERE r.blob_hash = item.blob_hash AND r.device_id = x'{}')",
+            hex::encode(peer.id.0)
+        ),
     )?;
     let mut n = 0;
     for id in candidates {
         let Some((rec, _)) = store::get_item(c, id)? else { continue };
-        if matches!(bin::derive_state_in(c, &fmap, &rec, now)?, ItemState::Waiting) {
+        if !expiry::in_bin(bin::derive_state_in(c, &fmap, &rec, now)?) {
             n += 1;
         }
     }

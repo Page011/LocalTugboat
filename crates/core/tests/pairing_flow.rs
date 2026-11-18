@@ -1,4 +1,4 @@
-//! Pairing, unpairing, refusals and the fake-phone tool, over loopback. Design ids S11, S12,
+//! Pairing, unpairing, refusals and the fake-phone tool, over loopback. Scenarios S11, S12,
 //! S14, S15, S21.
 
 mod common;
@@ -35,7 +35,7 @@ fn pairing_code_of(e: &CoreError) -> String {
 #[tokio::test(flavor = "multi_thread")]
 async fn s11_version_mismatch_is_refused_visibly_on_both_devices() {
     let r = Rig::unconnected();
-    r.phone.core.debug_set_proto(2);
+    r.phone.core.debug_set_proto(3);
     let from_phone_before_pairing = r.phone.add("secret.jpg", 1, 1_000);
     pair(&r.pc, &r.phone).await;
     r.phone.wait_state(SyncState::Refused).await;
@@ -447,9 +447,23 @@ async fn s21_fake_phone_pairs_sends_and_lists() {
     assert!(text.contains("SENT 3 items"), "{text}");
     until("3 items Present on the PC", 20, || pc.items().iter().filter(|v| v.local == LocalFileState::Present).count() == 3).await;
 
-    let (ok, text) = run_fake(vec!["list".into(), "--data".into(), data_arg]).await;
+    // Any file type, and a refused-name record, for QA of the PC's galleries and Not synced list.
+    let docx = data.path().join("Plan.docx");
+    std::fs::write(&docx, b"PK\x03\x04 pretend docx").unwrap();
+    let (ok, text) = run_fake(vec!["send-file".into(), docx.display().to_string(), "--data".into(), data_arg.clone()]).await;
     assert!(ok, "{text}");
-    assert!(text.contains("3 items"), "{text}");
+    assert!(text.contains("SENT 1 file"), "{text}");
+    until("the docx is a File item on the PC", 20, || pc.items().iter().any(|v| v.name == "Plan.docx" && v.kind == tugboat_core::MediaKind::File && v.local == LocalFileState::Present)).await;
+    let (ok, text) = run_fake(vec!["send-refused".into(), "evil.lnk".into(), "--data".into(), data_arg.clone()]).await;
+    assert!(ok, "{text}");
+    until("the refused record is listed on the PC", 20, || pc.core.refused_items(50).unwrap().iter().any(|v| v.name == "evil.lnk")).await;
+
+    let (ok, text) = run_fake(vec!["list".into(), "--data".into(), data_arg.clone()]).await;
+    assert!(ok, "{text}");
+    assert!(text.contains("5 items") || text.contains("4 items"), "3 photos + the docx (+ the refused record on the phone): {text}");
+    // --proto 1 plays a 0.1.x phone: the tool reports the refusal text.
+    let (ok, text) = run_fake(vec!["list".into(), "--proto".into(), "1".into(), "--data".into(), data_arg]).await;
+    assert!(!ok && text.contains("Update Tugboat on the phone"), "{text}");
     pc.stop().await;
 }
 

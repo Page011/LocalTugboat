@@ -10,14 +10,21 @@
 //!                           The Android emulator reaches the host's loopback at 10.0.2.2, so
 //!                           use --advertise 10.0.2.2:47300
 //!     --auto-confirm        accept the pairing code without asking (test only)
-//!     --push-dir <dir>      every new photo/video file that appears in <dir> is pushed to the phone
+//!     --push-dir <dir>      every new file that appears in <dir> is pushed to the phone: photos, videos
+//!                           and ANY other type (docx, zip, a file with no extension). An always-refused
+//!                           name (x.lnk, desktop.ini) is turned away and printed as push_error.
+//!     --send-refused <name> once paired and connected, write a record with that always-refused name and
+//!                           no file behind it (the way a hostile or newer peer would), so the phone
+//!                           must show it as REFUSED and never ask for its bytes
+//!     --proto <n>           speak sync protocol n in the handshake (2 is current; 1 plays a 0.1.x PC:
+//!                           both devices must then show "Update Tugboat on the PC")
 //!     --new-pairing         allow pairing a new phone although one is paired (replaces it)
 //! Without --auto-confirm, type `y` or `n` and Enter after a code is printed.
 //!
 //! Output: one JSON object per line on stdout, key "event":
 //!   started, payload (the QR text), pairing_code, pairing_completed, pairing_cancelled, sync,
 //!   received (a phone file arrived and verified: id, name, size, path, blake3, thumb_path),
-//!   pushed, push_error, error.
+//!   refused_item (a phone record this side will never hold: id, name), pushed, push_error, error.
 //! Run until killed (kill it by its PID).
 
 use std::{
@@ -45,6 +52,8 @@ struct Opts {
     auto_confirm: bool,
     push_dir: Option<PathBuf>,
     new_pairing: bool,
+    proto: Option<u32>,
+    send_refused: Option<String>,
 }
 
 fn main() {
@@ -94,10 +103,12 @@ fn parse_opts() -> Result<Opts, String> {
     let push_dir = take_flag(&mut args, "--push-dir")?.map(PathBuf::from);
     let auto_confirm = take_switch(&mut args, "--auto-confirm");
     let new_pairing = take_switch(&mut args, "--new-pairing");
+    let proto = take_flag(&mut args, "--proto")?.map(|p| p.parse().map_err(|_| format!("bad --proto {p:?}"))).transpose()?;
+    let send_refused = take_flag(&mut args, "--send-refused")?;
     if let Some(extra) = args.first() {
         return Err(format!("unknown argument {extra:?}; see the header of fake_pc.rs"));
     }
-    Ok(Opts { data, port, advertise, auto_confirm, push_dir, new_pairing })
+    Ok(Opts { data, port, advertise, auto_confirm, push_dir, new_pairing, proto, send_refused })
 }
 
 /// The test key: 32 raw bytes, created on first use.
@@ -134,6 +145,9 @@ async fn run() -> Result<(), String> {
     let cfg = CoreConfig { data_dir: opts.data.clone(), role: Role::Pc, self_id: id, device_name: "Fake PC".into(), app_version: "fake-pc".into() };
     let storage = AppStorage::new(opts.data.join("storage")).map_err(|e| e.to_string())?;
     let (core, mut rx) = Core::open(cfg, Arc::new(SystemClock), Arc::new(storage)).map_err(|e| e.to_string())?;
+    if let Some(n) = opts.proto {
+        core.debug_set_proto(n);
+    }
     let bind: SocketAddr = format!("127.0.0.1:{}", opts.port).parse().map_err(|e| format!("bad port: {e}"))?;
     core.start_network(NetworkConfig { bind, mdns: false, secret_key: key }).await.map_err(|e| e.to_string())?;
     emit(json!({"event": "started", "id": id.to_string(), "bind": bind.to_string(), "data": opts.data}));
@@ -159,6 +173,7 @@ async fn run() -> Result<(), String> {
     }
 
     let mut reported: HashSet<ItemId> = HashSet::new();
+    let mut refused_sent = opts.send_refused.is_none();
     let mut seen_files: HashMap<PathBuf, (u64, u32)> = HashMap::new();
     let mut handled_files: HashSet<PathBuf> = HashSet::new();
     let mut ticker = tokio::time::interval(Duration::from_millis(500));
@@ -183,6 +198,14 @@ async fn run() -> Result<(), String> {
                     report("tick", core.tick().map(|_| ()));
                 }
                 report_received(&core, id, &mut reported);
+                if !refused_sent && matches!(core.status().state, tugboat_core::events::SyncState::Synced) {
+                    refused_sent = true;
+                    let name = opts.send_refused.clone().unwrap_or_default();
+                    match core.debug_add_record(&name, &tugboat_core::names::ext_of(&name), tugboat_core::MediaKind::File, None, LocalFileState::Refused) {
+                        Ok(rid) => emit(json!({"event": "refused_record_sent", "id": rid.0.to_string(), "name": name})),
+                        Err(e) => emit(json!({"event": "error", "kind": e.kind(), "message": format!("send-refused: {e}")})),
+                    }
+                }
                 if let Some(dir) = &opts.push_dir {
                     push_new_files(&core, dir, &mut seen_files, &mut handled_files);
                 }
@@ -253,6 +276,18 @@ fn report_received(core: &Core, me: tugboat_core::DeviceId, reported: &mut HashS
             (true, Some(id)) => after = Some(id),
             _ => break,
         }
+    }
+    // Refused records are never listed by `items` on the PC (they are never held), so they come
+    // from their own query.
+    match core.refused_items(500) {
+        Ok(rows) => {
+            for v in rows {
+                if v.origin != me && reported.insert(v.id) {
+                    emit(json!({"event": "refused_item", "id": v.id.0.to_string(), "name": v.name}));
+                }
+            }
+        }
+        Err(e) => emit(json!({"event": "error", "kind": e.kind(), "message": e.to_string()})),
     }
 }
 

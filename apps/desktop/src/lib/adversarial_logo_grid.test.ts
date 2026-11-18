@@ -1,4 +1,5 @@
-// Adversarial checks of the dark-gallery fix (verifier, 2026-11-18).
+// Adversarial checks of the gallery grid layout: the columns must fit the visible width (the scroller width minus its
+// vertical scrollbar) at every width.
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { GRID, gridLayout, innerWidth, tileWidth } from "./virtual";

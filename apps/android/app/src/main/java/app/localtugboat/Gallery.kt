@@ -126,7 +126,7 @@ fun GalleryScreen(vm: SnapViewModel, ui: UiState, banners: List<UiLogic.BannerUi
                     horizontalArrangement = Arrangement.spacedBy(4.dp), verticalArrangement = Arrangement.spacedBy(4.dp),
                 ) {
                     itemsIndexed(model.rows, key = { _, it -> it.id }) { _, item ->
-                        ItemCell(item, UiLogic.cell(item, nowMs, binDays, false)) { vm.nav.go(Route.Viewer(route.folderId, false, item.id)) }
+                        ItemCell(item, UiLogic.cell(item, nowMs, binDays, false, ui.status?.storageLow == true)) { vm.nav.go(Route.Viewer(route.folderId, false, item.id)) }
                     }
                 }
             }
@@ -161,9 +161,9 @@ private fun Badge(icon: Int) {
 private fun ItemCell(item: ItemInfo, cell: UiLogic.CellUi, onClick: () -> Unit) {
     Box(
         Modifier.aspectRatio(1f).clip(RoundedCornerShape(8.dp)).clickable(role = Role.Button, onClick = onClick)
-            .described("${if (cell.video) "Video" else "Photo"}, ${cell.label}"),
+            .described("${UiLogic.kindWord(item.kind)}, ${if (cell.file) FileRules.displayName(item.name, item.ext) + ", " else ""}${cell.label}"),
     ) {
-        ThumbImage(item.thumbPath, null, Modifier.fillMaxSize())
+        if (cell.file) FileFace(item, Modifier.fillMaxSize()) else ThumbImage(item.thumbPath, null, Modifier.fillMaxSize())
         Row(Modifier.align(Alignment.TopStart).padding(4.dp), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
             if (cell.video) Badge(R.drawable.ic_videocam)
             if (cell.kept) Badge(R.drawable.ic_star_fill1)
@@ -200,15 +200,21 @@ fun BinScreen(vm: SnapViewModel, ui: UiState) {
                 val bottom = with(LocalDensity.current) { WindowInsets.navigationBars.getBottom(this).toDp() }
                 LazyColumn(state = listState, contentPadding = PaddingValues(bottom = bottom)) {
                     items(model.rows, key = { it.id }) { item ->
-                        val cell = UiLogic.cell(item, nowMs, binDays, true)
+                        val cell = UiLogic.cell(item, nowMs, binDays, true, ui.status?.storageLow == true)
                         Row(
                             Modifier.fillMaxWidth().defaultMinSize(minHeight = 72.dp).clickable(role = Role.Button) { vm.nav.go(Route.Viewer(null, true, item.id)) }.padding(horizontal = 16.dp, vertical = 6.dp),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
-                            ThumbImage(item.thumbPath, null, Modifier.size(56.dp).clip(RoundedCornerShape(8.dp)))
+                            if (cell.file) {
+                                Box(Modifier.size(56.dp).clip(RoundedCornerShape(8.dp)).background(MaterialTheme.colorScheme.surfaceVariant), contentAlignment = Alignment.Center) {
+                                    Ico(fileIcon(item.ext), null, tint = MaterialTheme.colorScheme.onSurfaceVariant, size = 28)
+                                }
+                            } else {
+                                ThumbImage(item.thumbPath, null, Modifier.size(56.dp).clip(RoundedCornerShape(8.dp)))
+                            }
                             Spacer(Modifier.width(12.dp))
                             Column(Modifier.weight(1f)) {
-                                Text(item.name, style = MaterialTheme.typography.bodyLarge, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                Text(if (cell.file) FileRules.displayName(item.name, item.ext) else item.name, style = MaterialTheme.typography.bodyLarge, maxLines = 1, overflow = TextOverflow.Ellipsis)
                                 Text(cell.label, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                             }
                             TextButton(onClick = { scope.launchRestore(vm, model, item.id) }, modifier = Modifier.defaultMinSize(minHeight = Touch)) {

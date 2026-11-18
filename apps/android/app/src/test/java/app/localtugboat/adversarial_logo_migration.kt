@@ -9,7 +9,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 
-/** Adversarial checks of the 0.1.0 -> 0.1.1 rename (verifier, 2026-11-18). Each test states the safe outcome. */
+/** Checks of the 0.1.0 -> 0.1.1 rename. Each test states the safe outcome. */
 class AdversarialLogoMigrationTest {
     private lateinit var root: File
     private lateinit var files: File
@@ -59,7 +59,7 @@ class AdversarialLogoMigrationTest {
             if (File(files, "tugboat.db").exists()) return // this OS allowed the rename: nothing to prove here
             assertEquals("OLD-DB", db.readText())
             assertEquals(1, r.failed.size)
-            // Silent-failure rule: the report must make run() leave a note for the activity history.
+            // The report must make run() leave a note for the activity history.
             assertTrue("a failed rename leaves no activity note (changedAnything is false)", r.changedAnything)
         }
     }
@@ -77,9 +77,9 @@ class AdversarialLogoMigrationTest {
 
     /**
      * Crash after the renames: the next start must still be able to say what moved. The record is now written BEFORE the
-     * files move (runRecorded), so a process killed at any point leaves it. (The verifier's first version called
-     * runIn twice and asked changedAnything; that is the same call sequence as "a second run changes nothing", so the
-     * property is asserted on the durable record instead.)
+     * files move (runRecorded), so a process killed at any point leaves it. Calling runIn twice and asking
+     * changedAnything would only show that a second run changes nothing, so the property is asserted on the durable
+     * record instead.
      */
     @Test fun a_crash_after_the_renames_still_leaves_a_record_on_the_next_start() {
         put(files, "snapferry.db", "OLD-DB")

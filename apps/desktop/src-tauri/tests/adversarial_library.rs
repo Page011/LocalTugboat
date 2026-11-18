@@ -1,6 +1,6 @@
-//! Adversarial tests for the PC library (verifier stage). Each test states a rule from PLAN.md or
-//! from the module's own doc comments and tries to break it with a real temp folder and a real
-//! Core. A failing test here is a finding, not a broken test.
+//! Adversarial tests for the PC library. Each test states a rule of the library (or of the
+//! module's own doc comments) and tries to break it with a real temp folder and a real Core. A
+//! failing test means the rule does not hold.
 
 use std::{
     path::{Path, PathBuf},
@@ -93,8 +93,8 @@ fn copy_tree(from: &Path, to: &Path) {
     }
 }
 
-/// PLAN: "Library root or its identity marker missing (... folder moved or renamed): sync
-/// pauses ... [Locate]". A library moved to another drive in Explorer is a copy + delete, so
+/// When the library root or its identity marker is missing (folder moved or renamed), sync
+/// pauses until the user picks Locate. A library moved to another drive in Explorer is a copy + delete, so
 /// every file has a new NTFS id. After Locate the same items must be found again, not imported
 /// a second time (the phone would get every photo twice and the old records would be held
 /// forever at paths that do not exist).
@@ -171,7 +171,7 @@ fn choose_refuses_a_folder_inside_the_current_library_even_when_spelled_with_dot
     assert!(res.is_err(), "a library nested in the current one was accepted: {:?}", r.lib.root());
 }
 
-/// PLAN: "Library root ... missing (USB drive unplugged ...)". If that drive is gone for good,
+/// When the library root is missing (a USB drive unplugged), sync pauses. If that drive is gone for good,
 /// choosing a new empty library is the only way out (Locate needs the old marker). choose()
 /// copies every held file first and fails on the first one it cannot read, so it can never
 /// succeed: the app stays paused forever.
@@ -188,7 +188,7 @@ fn a_new_library_can_be_chosen_after_the_old_drive_is_gone_for_good() {
     assert!(res.is_ok(), "no way out of a dead library drive: {res:?}");
 }
 
-/// PLAN: "rename = rename". A case-only rename in Explorer (IMG_1.jpg -> img_1.jpg) is a rename.
+/// A rename in Explorer is a rename. A case-only rename in Explorer (IMG_1.jpg -> img_1.jpg) is a rename.
 #[test]
 fn a_case_only_rename_in_explorer_renames_the_item() {
     let mut r = Rig::loose();
@@ -200,8 +200,8 @@ fn a_case_only_rename_in_explorer_renames_the_item() {
     assert_eq!(names, ["img_1.jpg"]);
 }
 
-/// PLAN: "delete = Bin" and "Restoring from the Bin ... If only the other device still has the
-/// file, it is fetched from there". A file deleted in Explorer must be listed in the Bin so it
+/// A delete in Explorer goes to the Bin, and restoring from the Bin fetches the file from the other
+/// device when only that device still has it. A file deleted in Explorer must be listed in the Bin so it
 /// can be restored; the Bin screen otherwise says "Bin is empty." while an item was deleted.
 #[test]
 fn a_file_deleted_in_explorer_is_listed_in_the_bin() {

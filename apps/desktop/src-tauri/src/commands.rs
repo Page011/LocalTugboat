@@ -186,6 +186,15 @@ pub fn library_rescan(window: WebviewWindow, be: Be) -> CmdResult<()> {
     Ok(())
 }
 
+/// The gallery says which folder it is showing (null = All = Inbox): a folder id, never a path. What a
+/// dropped file does is decided by the window's native drop event alone (see drop.rs).
+#[tauri::command(async)]
+pub fn drop_target_set(window: WebviewWindow, be: Be, folder: Option<FolderId>) -> CmdResult<()> {
+    allow(&window)?;
+    be.drop_target_set(folder);
+    Ok(())
+}
+
 /// Open the library folder in Explorer.
 #[tauri::command(async)]
 pub fn library_open_folder(window: WebviewWindow, app: AppHandle, be: Be) -> CmdResult<()> {
@@ -257,6 +266,32 @@ mod tests {
         for c in &chunks {
             let name = c.split("fn ").nth(1).and_then(|r| r.split('(').next()).unwrap();
             assert!(lib.contains(&format!("commands::{name},")), "{name} is not registered in lib.rs");
+        }
+    }
+
+    /// No command lets the page name a file to read, copy or open: a string, path or list argument
+    /// must be on this list, and the list is the two folder pickers (the OS dialog chooses the folder)
+    /// and the item rename (a display name, never a path). A dropped file's path comes from the
+    /// window's native drop event only (drop.rs).
+    #[test]
+    fn no_command_takes_a_path_or_a_string_except_the_listed_ones() {
+        let allowed: &[(&str, &str)] = &[("library_choose", "path"), ("library_locate", "path"), ("item_rename", "name")];
+        let src = include_str!("commands.rs");
+        let body = src.split("#[cfg(test)]").next().unwrap();
+        for c in body.split("#[tauri::command").skip(1) {
+            let name = c.split("fn ").nth(1).and_then(|r| r.split('(').next()).unwrap_or("?");
+            let params = c.split('(').nth(1).and_then(|r| r.split(") ->").next()).unwrap_or("");
+            for p in params.split(',') {
+                let Some((pname, ty)) = p.split_once(':') else { continue };
+                let (pname, ty) = (pname.trim(), ty.trim());
+                let risky = ty.contains("String") || ty.contains("Path") || ty.contains("Vec<") || ty.contains("&str");
+                if risky {
+                    assert!(
+                        allowed.contains(&(name, pname)),
+                        "command {name} takes `{pname}: {ty}`: text or a path from the page. Add it to the list only if it cannot be a path"
+                    );
+                }
+            }
         }
     }
 

@@ -1,9 +1,9 @@
 //! Pairing: QR payload, 6-digit code, the PC's pairing window, and the exchange.
 //!
-//! PLAN Security: "the QR holds the PC's public key, LAN addresses, port, a one-time 128-bit
+//! The QR holds the PC's public key, LAN addresses, port, a one-time 128-bit
 //! secret and a 2-minute expiry, and is shown only on request. Both screens then show a
 //! 6-digit code derived from both public keys and the secret, and the PC owner confirms it
-//! matches. A second use of the secret cancels pairing with a warning."
+//! matches. A second use of the secret cancels pairing with a warning.
 //!
 //! Exchange (ALPN_PAIR connection dialed by the phone to the QR addresses and key; iroh's
 //! TLS proves the PC holds the QR key, so the secret travels only to the real PC):
@@ -31,7 +31,7 @@ use crate::{
     NetError, ALPN_PAIR,
 };
 
-/// QR window length (PLAN: "shows a QR code for 2 minutes").
+/// QR window length (the PC shows a QR code for 2 minutes).
 pub const WINDOW_MS: i64 = 120_000;
 /// How long a shown code waits for the PC user's click before the window cancels itself.
 pub const CONFIRM_TIMEOUT_MS: i64 = 120_000;
@@ -41,8 +41,11 @@ pub const MAX_QR_ADDRS: usize = 4;
 pub const MAX_NAME_CHARS: usize = 64;
 /// Longest accepted QR payload string, in bytes.
 pub const MAX_PAYLOAD_LEN: usize = 512;
-/// Pairing exchange protocol version (the `proto` field of PairHello).
-pub const PAIR_PROTO: u32 = 1;
+/// Pairing exchange protocol version (the `proto` field of PairHello). 2 since 0.2.0, so a 0.1.x
+/// phone and a 0.2.0 PC (or the reverse) are told "Update Tugboat on the PC/phone" while pairing,
+/// not after: both 0.1.x and 0.2.0 answer a mismatch with `PairDecision::Refused{VersionMismatch}`
+/// and show it with the same text, so the message is clear in both directions.
+pub const PAIR_PROTO: u32 = 2;
 /// BLAKE3 derive_key context for the code. Never change it: both sides must agree.
 pub const CODE_CONTEXT: &str = "localtugboat 2026-11-17 pairing code v1";
 
@@ -62,7 +65,7 @@ const CLOSE_WAIT: Duration = Duration::from_secs(DELIVERY_TIMEOUT.as_secs() + PC
 const PAYLOAD_PREFIX: &str = "localtugboat://pair?";
 
 /// Why pairing did not complete. Serialized into PairDecision::Refused so the phone shows
-/// the same reason the PC shows. Each has its own user text (notes/core-design.md).
+/// the same reason the PC shows. Each has its own user text.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 #[serde(tag = "code", rename_all = "snake_case")]
 pub enum PairError {
@@ -554,6 +557,19 @@ pub async fn phone_start(
     app_version: &str,
     timeout: Duration,
 ) -> Result<PhonePairing, NetError> {
+    phone_start_with_proto(node, payload, phone_name, app_version, timeout, PAIR_PROTO).await
+}
+
+/// `phone_start` that speaks pairing protocol `proto` (tests play an older or newer phone with it;
+/// the apps always use `phone_start`).
+pub async fn phone_start_with_proto(
+    node: &Node,
+    payload: &PairPayload,
+    phone_name: &str,
+    app_version: &str,
+    timeout: Duration,
+    proto: u32,
+) -> Result<PhonePairing, NetError> {
     let conn = node.dial(payload.pc_key, &payload.addrs, ALPN_PAIR, timeout).await.map_err(|e| match e {
         // A PC that is not in a pairing window does not offer the pairing protocol at all, and
         // QUIC reports that as a failed handshake. Say what it means.
@@ -562,7 +578,7 @@ pub async fn phone_start(
     })?;
     let (mut tx, rx) = conn.open_stream(StreamKind::Pair).await?;
     let hello = PairHello {
-        proto: PAIR_PROTO,
+        proto,
         secret: payload.secret.to_hex(),
         phone_name: clean_name(phone_name, "Phone"),
         app_version: clean_name(app_version, ""),

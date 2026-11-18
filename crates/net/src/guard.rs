@@ -1,9 +1,9 @@
 //! Live path guard.
 //!
 //! Why: iroh 1.4.1 always negotiates QUIC NAT traversal (`max_remote_nat_traversal_addresses`
-//! ignores values below 8, spike/RESULTS.md correction 1), so a paired peer can advertise
-//! public candidate addresses and the endpoint may open a path to one. PLAN M0 lesson:
-//! "M1 must drop or close any path whose remote address is not on the local network".
+//! ignores values below 8), so a paired peer can advertise
+//! public candidate addresses and the endpoint may open a path to one. The guard must therefore close any path whose remote address is
+//! not on the local network.
 //!
 //! API used (iroh 1.4.1, checked in the registry source):
 //! - `Connection::paths()` -> `PathList` snapshot; `Path::remote_addr() -> &TransportAddr`.
@@ -22,7 +22,7 @@
 //! non-local path for longer than one event-loop turn), it cannot stop the probe itself.
 //! The before-connect hook in `node` and the dial filter stop every non-local address we
 //! would dial ourselves. A real non-local path cannot be produced in a test, so the tests
-//! drive `enforce_path` directly; a packet capture on the real LAN is the proof (M5).
+//! drive `enforce_path` directly; a packet capture on the real LAN is the proof.
 
 use std::sync::Arc;
 

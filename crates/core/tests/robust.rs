@@ -1,6 +1,6 @@
-//! M1 robustness scenarios over loopback: tombstones against a restored backup, new-peer full
+//! Robustness scenarios over loopback: tombstones against a restored backup, new-peer full
 //! snapshot, reconcile catching a dropped change, resumable transfers, corrupt and non-media
-//! files. Design test ids S7-S10, S16, S17.
+//! files. Scenarios S7-S10, S16, S17.
 
 mod common;
 
@@ -223,31 +223,42 @@ async fn s10a_resumes_from_an_existing_part_file() {
 // resumes from the kept part (resumed bytes > 0), the hash is right and no .part is left.
 #[tokio::test(flavor = "multi_thread")]
 async fn s10b_connection_killed_mid_transfer_then_resumes() {
-    let r = Rig::new().await;
-    r.phone.core.debug_set_retry_base_ms(100);
     const SIZE: usize = 64 * 1024 * 1024;
-    let id = r.pc.add("huge.jpg", 301, SIZE);
-    let hash = r.pc.record(id).unwrap().content.val.hash;
-    let part = r.phone.parts_dir().join(format!("{}.part", hex::encode(hash.0)));
-    let t0 = std::time::Instant::now();
-    let mut cut_at = 0u64;
-    while t0.elapsed().as_secs() < 30 {
-        cut_at = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
-        if cut_at >= 10 * 1024 * 1024 {
-            break;
+    // Under load the localhost transfer can finish between the 10 MB read and the kill; then the
+    // cut never happened mid-transfer and the scenario is run again (a fresh rig), at most 3 times.
+    for attempt in 1..=3 {
+        let r = Rig::new().await;
+        r.phone.core.debug_set_retry_base_ms(100);
+        let id = r.pc.add("huge.jpg", 301, SIZE);
+        let hash = r.pc.record(id).unwrap().content.val.hash;
+        let part = r.phone.parts_dir().join(format!("{}.part", hex::encode(hash.0)));
+        let t0 = std::time::Instant::now();
+        let mut cut_at = 0u64;
+        while t0.elapsed().as_secs() < 30 {
+            cut_at = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+            if cut_at >= 10 * 1024 * 1024 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-    }
-    assert!(cut_at >= 10 * 1024 * 1024, "the download never reached 10 MB");
-    r.phone.core.debug_kill_connection();
-    assert!(r.phone.local(id) != Some(LocalFileState::Present) || cut_at as usize >= SIZE, "the file had not finished when the connection was killed (cut at {cut_at})");
+        assert!(cut_at >= 10 * 1024 * 1024, "the download never reached 10 MB");
+        r.phone.core.debug_kill_connection();
+        let finished = r.phone.local(id) == Some(LocalFileState::Present) || std::fs::metadata(&part).map(|m| m.len() as usize >= SIZE).unwrap_or(true);
+        if finished && attempt < 3 {
+            println!("S10b attempt {attempt}: the transfer finished before the kill (cut at {cut_at}), again");
+            r.shutdown().await;
+            continue;
+        }
+        assert!(!finished, "the file had not finished when the connection was killed (cut at {cut_at})");
 
-    until("the file arrived after reconnect", 60, || r.phone.local(id) == Some(LocalFileState::Present)).await;
-    println!("S10b cut at {cut_at} bytes, resumed from {}", r.phone.core.debug_resumed_bytes());
-    assert!(r.phone.core.debug_resumed_bytes() > 0, "resumed from the kept part, not from zero");
-    assert_eq!(r.phone.file_bytes(id), common::jpeg_bytes(301, SIZE));
-    assert!(part_files(&r.phone.parts_dir()).is_empty());
-    r.shutdown().await;
+        until("the file arrived after reconnect", 60, || r.phone.local(id) == Some(LocalFileState::Present)).await;
+        println!("S10b cut at {cut_at} bytes, resumed from {}", r.phone.core.debug_resumed_bytes());
+        assert!(r.phone.core.debug_resumed_bytes() > 0, "resumed from the kept part, not from zero");
+        assert_eq!(r.phone.file_bytes(id), common::jpeg_bytes(301, SIZE));
+        assert!(part_files(&r.phone.parts_dir()).is_empty());
+        r.shutdown().await;
+        return;
+    }
 }
 
 // S16: the sender serves wrong bytes of the right size. The phone's hash check fails: no
@@ -280,7 +291,7 @@ async fn s16_wrong_bytes_never_become_a_file_or_a_receipt() {
 }
 
 // S17: the record says .jpg, the bytes (with a valid hash) are a Windows executable. The phone
-// refuses it: nothing is stored, no receipt, so the PC never expires the item.
+// refuses it: nothing is stored, no receipt, and the PC's Bin says the phone never got it.
 #[tokio::test(flavor = "multi_thread")]
 async fn s17_executable_named_jpg_is_refused() {
     let r = Rig::new().await;
@@ -296,13 +307,16 @@ async fn s17_executable_named_jpg_is_refused() {
     r.together().await;
 
     until("the phone refused the file", 20, || r.phone.local(id) == Some(LocalFileState::Refused)).await;
-    assert!(r.phone.error_kinds().iter().any(|k| k == "not_media"), "{:?}", r.phone.errors());
+    // The state is committed before the session reports the error: wait for it, do not race it.
+    until("the not_media error", 20, || r.phone.error_kinds().iter().any(|k| k == "not_media")).await;
     assert!(part_files(&r.phone.items_dir()).is_empty(), "nothing stored");
     assert!(part_files(&r.phone.parts_dir()).is_empty(), "no part left");
     assert!(!r.pc.has_receipt(tugboat_core::BlobHash(*h.as_bytes()), r.phone.id), "no receipt: the sender never expires it");
     assert!(r.phone.has_activity(ActivityAction::Refused));
     r.pc.clock.advance(30 * HOUR);
     r.pc.core.tick().unwrap();
-    assert_eq!(r.pc.view(id).unwrap().state, tugboat_core::ItemState::Waiting, "the PC keeps it");
+    // The PC no longer holds it back (0.2.0): it expires on time, and the Bin says the phone never got it.
+    assert!(matches!(r.pc.view(id).unwrap().state, tugboat_core::ItemState::Expired { .. }));
+    assert!(r.pc.bin().iter().any(|v| v.id == id && v.never_reached_peer), "the phone refused it: the PC's Bin says so");
     r.shutdown().await;
 }

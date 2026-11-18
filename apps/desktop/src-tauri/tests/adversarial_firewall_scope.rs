@@ -1,5 +1,4 @@
-//! Adversarial tests for the user-scope part of the firewall verdict (verifier stage).
-//! A failing test is a finding.
+//! Adversarial tests for the user-scope part of the firewall verdict.
 //!
 //! The oracle is the Win32 AccessCheck of the current process token against the rule's user
 //! scope, asking for access right 0x1 (FWP_ACTRL_MATCH_FILTER, the "CC" right the firewall
@@ -153,10 +152,10 @@ fn false_alarms_against_the_access_check_are_listed() {
     }
 }
 
-/// The exact Codex scope, checked against the oracle too.
+/// A scope naming another local account, checked against the oracle too.
 #[test]
-fn the_codex_scope_does_not_apply_by_the_access_check_either() {
-    let codex = "O:LSD:(A;;CC;;;S-1-5-21-255584919-3964267139-957157073-1006)";
-    assert!(!oracle_applies(codex));
-    assert_eq!(judge(vec![allow_rule(UserScope::All), block_rule(UserScope::Sddl(codex.into()))]), FirewallStatus::Ok);
+fn a_user_scoped_rule_does_not_apply_by_the_access_check_either() {
+    let other = "O:LSD:(A;;CC;;;S-1-5-21-1000000001-1000000002-1000000003-1006)";
+    assert!(!oracle_applies(other));
+    assert_eq!(judge(vec![allow_rule(UserScope::All), block_rule(UserScope::Sddl(other.into()))]), FirewallStatus::Ok);
 }

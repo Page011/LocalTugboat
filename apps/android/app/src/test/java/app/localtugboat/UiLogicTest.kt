@@ -24,14 +24,15 @@ class UiLogicTest {
     private fun perms(camera: Boolean = true, mic: Boolean = false, loc: LocationAccess = LocationAccess.NONE, notif: Boolean = true, net: Boolean = true) =
         PermState(camera, mic, loc, notif, net, batteryExempt = false)
 
-    private fun pc() = PairedPc("a".repeat(64), "NIGEL-PC", 1L, 2L, listOf("192.168.1.5:47300"))
+    private fun pc() = PairedPc("a".repeat(64), "OFFICE-PC", 1L, 2L, listOf("192.168.1.5:47300"))
 
-    private fun status(state: SyncState, waiting: UInt = 0u, message: String? = null) = SyncStatus(state, "NIGEL-PC", null, waiting, 0u, message)
+    private fun status(state: SyncState, waiting: UInt = 0u, message: String? = null, downloading: UInt = 0u, storageLow: Boolean = false) =
+        SyncStatus(state, "OFFICE-PC", null, waiting, downloading, storageLow, message)
 
     private fun item(
         state: ItemStateInfo = ItemStateInfo.Live(1_000_000L + 5 * hour), local: LocalFileState = LocalFileState.PRESENT,
-        pinned: Boolean = false, kind: MediaKind = MediaKind.IMAGE, path: String? = "/x/a.jpg",
-    ) = ItemInfo("i1", "a", "f1", kind, 10uL, "jpg", 0L, pinned, state, local, path, null)
+        pinned: Boolean = false, kind: MediaKind = MediaKind.IMAGE, path: String? = "/x/a.jpg", neverReached: Boolean = false,
+    ) = ItemInfo("i1", "a", "f1", kind, 10uL, "jpg", 0L, pinned, state, local, path, null, neverReached)
 
     // ---- which screen ----
 
@@ -129,7 +130,7 @@ class UiLogicTest {
     @Test fun banners_list_blockers_first_each_group_in_a_fixed_order() {
         val ui = UiState(
             loaded = true, paired = pc(), perms = perms(notif = false, net = false), stoppedGapFromMs = 1_000L,
-            storageLow = true, errors = listOf("old", "download failed"),
+            status = status(SyncState.SYNCING, downloading = 37u, storageLow = true), errors = listOf("old", "download failed"),
         )
         val ids = UiLogic.banners(ui, ZoneId.of("UTC")).map { it.id }
         assertEquals(
@@ -139,12 +140,28 @@ class UiLogicTest {
         val b = UiLogic.banners(ui, ZoneId.of("UTC"))
         assertEquals(listOf(UiLogic.Level.BLOCKER, UiLogic.Level.BLOCKER, UiLogic.Level.WARNING, UiLogic.Level.WARNING, UiLogic.Level.WARNING), b.map { it.level })
         assertEquals("download failed", b.last().text) // newest error only
+        assertEquals("PHONE STORAGE LOW - 37 items wait on the PC", b.first { it.id == UiLogic.BannerId.STORAGE }.text)
         assertEquals("Fix", b.first { it.id == UiLogic.BannerId.STOPPED }.action)
     }
 
     @Test fun an_unpaired_phone_gets_no_permission_or_storage_banners() {
-        val ui = UiState(loaded = true, perms = perms(notif = false, net = false), storageLow = true)
+        val ui = UiState(loaded = true, perms = perms(notif = false, net = false), storageLow = true, status = status(SyncState.UNPAIRED, storageLow = true))
         assertTrue(UiLogic.banners(ui, ZoneId.of("UTC")).isEmpty())
+    }
+
+    @Test fun the_storage_banner_follows_the_core_not_the_free_bytes_guess() {
+        val zone = ZoneId.of("UTC")
+        // Core holds downloads back: red banner with the count of items that wait on the PC.
+        val low = UiLogic.banners(UiState(loaded = true, paired = pc(), status = status(SyncState.SYNCED, downloading = 1u, storageLow = true)), zone)
+        assertEquals("PHONE STORAGE LOW - 1 item waits on the PC", low.single().text)
+        assertEquals(UiLogic.Level.BLOCKER, low.single().level)
+        assertEquals("PHONE STORAGE LOW", UiLogic.banners(UiState(loaded = true, paired = pc(), status = status(SyncState.SYNCED, storageLow = true)), zone).single().text)
+        // Free space under the setting but the core is not holding anything back (nothing waits): no banner.
+        assertTrue(UiLogic.banners(UiState(loaded = true, paired = pc(), storageLow = true, status = status(SyncState.SYNCED)), zone).isEmpty())
+        // Space is back: the core says storageLow false, banner gone even with items still downloading.
+        assertTrue(UiLogic.banners(UiState(loaded = true, paired = pc(), status = status(SyncState.SYNCING, downloading = 5u)), zone).isEmpty())
+        // No status yet (app just started): nothing to say.
+        assertTrue(UiLogic.banners(UiState(loaded = true, paired = pc()), zone).isEmpty())
     }
 
     @Test fun a_core_that_will_not_open_is_a_blocker() {
@@ -255,6 +272,18 @@ class UiLogicTest {
         assertNull(UiLogic.fileNote(LocalFileState.BINNED, true))
     }
 
+    @Test fun a_pending_file_waits_for_space_while_the_storage_guard_holds_downloads() {
+        val now = 1_000_000L
+        val pending = item(local = LocalFileState.PENDING)
+        assertEquals("Downloading from PC", UiLogic.cell(pending, now, 7u, false).label)
+        assertEquals("Downloading from PC", UiLogic.cell(pending, now, 7u, false, storageLow = false).label)
+        assertEquals("Waiting - phone storage low", UiLogic.cell(pending, now, 7u, false, storageLow = true).label)
+        assertEquals("Waiting - phone storage low", UiLogic.fileNote(LocalFileState.PENDING, false, storageLow = true))
+        // Only the pending note changes: other file problems and held files read the same either way.
+        assertEquals("FILE MISSING on this phone", UiLogic.fileNote(LocalFileState.LOST, false, storageLow = true))
+        assertNull(UiLogic.fileNote(LocalFileState.PRESENT, false, storageLow = true))
+    }
+
     @Test fun cell_label_badges_and_waiting() {
         val now = 1_000_000L
         val live = UiLogic.cell(item(), now, 7u, false)
@@ -264,15 +293,47 @@ class UiLogicTest {
         assertTrue(UiLogic.cell(item(pinned = true), now, 7u, false).kept)
         assertTrue(UiLogic.cell(item(state = ItemStateInfo.FolderKeep), now, 7u, false).kept)
         assertEquals("Kept (folder)", UiLogic.cell(item(state = ItemStateInfo.FolderKeep), now, 7u, false).label)
-        val waiting = UiLogic.cell(item(state = ItemStateInfo.Waiting, kind = MediaKind.VIDEO), now, 7u, false)
-        assertEquals("Waiting for PC", waiting.label)
-        assertTrue(waiting.waiting)
-        assertTrue(waiting.video)
+        assertTrue(UiLogic.cell(item(kind = MediaKind.VIDEO), now, 7u, false).video)
         // A file problem outranks the expiry text.
         assertEquals("FILE MISSING on this phone", UiLogic.cell(item(local = LocalFileState.LOST), now, 7u, false).label)
         // Bin rows count their days.
         val binned = item(state = ItemStateInfo.Deleted(now - day), local = LocalFileState.BINNED)
         assertEquals("In Bin, 6d left", UiLogic.cell(binned, now, 7u, true).label)
+    }
+
+    @Test fun a_file_that_is_not_a_photo_or_video_is_a_file_cell() {
+        val now = 1_000_000L
+        val f = UiLogic.cell(item(kind = MediaKind.FILE, path = "/x/a.pdf"), now, 7u, false)
+        assertTrue(f.file)
+        assertFalse(f.video)
+        assertFalse(UiLogic.cell(item(), now, 7u, false).file)
+        assertFalse(UiLogic.cell(item(kind = MediaKind.VIDEO), now, 7u, false).file)
+        assertEquals("File", UiLogic.kindWord(MediaKind.FILE))
+        assertEquals("Photo", UiLogic.kindWord(MediaKind.IMAGE))
+        assertEquals("Video", UiLogic.kindWord(MediaKind.VIDEO))
+    }
+
+    @Test fun nothing_says_waiting_for_pc_any_more() {
+        // 0.2.0: items expire on time. Every state has a plain label; none of them holds the item back.
+        val now = 100 * day
+        val states = listOf(ItemStateInfo.Live(now + hour), ItemStateInfo.Kept, ItemStateInfo.FolderKeep, ItemStateInfo.Deleted(now), ItemStateInfo.Expired(now))
+        for (st in states) assertFalse(UiLogic.cell(item(state = st, local = LocalFileState.PRESENT), now, 7u, false).label.contains("aiting"))
+    }
+
+    @Test fun a_bin_item_that_never_reached_the_pc_says_so() {
+        val now = 100 * day
+        val gone = item(state = ItemStateInfo.Expired(now - day), local = LocalFileState.BINNED, neverReached = true)
+        assertEquals("In Bin, 6d left - NOT ON PC", UiLogic.cell(gone, now, 7u, true).label)
+        // Only the Bin carries the note; a normal expired item is unchanged.
+        assertEquals("In Bin, 6d left", UiLogic.cell(item(state = ItemStateInfo.Expired(now - day), local = LocalFileState.BINNED), now, 7u, true).label)
+        assertEquals("Expires in 1h", UiLogic.cell(item(state = ItemStateInfo.Live(now + hour), neverReached = true), now, 7u, false).label)
+    }
+
+    @Test fun open_needs_the_file_here_and_outside_the_bin() {
+        assertTrue(UiLogic.canOpen(item(kind = MediaKind.FILE), false))
+        assertFalse(UiLogic.canOpen(item(kind = MediaKind.FILE), true)) // the provider serves items/ only: restore first
+        assertFalse(UiLogic.canOpen(item(kind = MediaKind.FILE, path = null), false))
+        assertFalse(UiLogic.canOpen(item(kind = MediaKind.FILE, local = LocalFileState.PENDING), false))
     }
 
     @Test fun share_and_save_need_the_file_on_this_phone() {
@@ -363,14 +424,14 @@ class UiLogicTest {
         assertEquals(listOf(1u, 3u, 7u, 10u, 14u, 30u), UiLogic.binChoices(10u))
     }
 
-    // ---- R3: a deleted folder is never handed to the core by a cached target ----
+    // ---- a deleted folder is never handed to the core by a cached target ----
 
     @Test fun a_cached_target_whose_folder_was_deleted_is_not_used() {
         assertNull(UiLogic.shotFolder(null, ids, "gone", null)) // automatic, target cached for automatic, folder deleted since
         assertNull(UiLogic.shotFolder("gone", ids, "gone", "gone")) // deleted pick, target cached for that pick, also deleted
     }
 
-    // ---- R4: the full-size photo is decoded again when the held file's content changes ----
+    // ---- the full-size photo is decoded again when the held file's content changes ----
 
     @Test fun the_photo_decode_key_follows_path_size_and_thumbnail() {
         val base = UiLogic.photoDecodeKey("items/a.jpg", 100uL, "thumbs/h1.jpg")

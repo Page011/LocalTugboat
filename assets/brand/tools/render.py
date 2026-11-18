@@ -1,21 +1,22 @@
 """Render an SVG file to PNG through Electron capturePage (img tag, so the real file is what is drawn).
 Small sizes: Windows enforces a minimum window size, so the page is rendered on a larger canvas and cropped."""
 import os
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
 from PIL import Image
 
-# Any Electron works (it only draws the SVG); set TUG_ELECTRON on a PC without that checkout.
-ELECTRON = os.environ.get("TUG_ELECTRON", r"C:\apps\forteConsole\forteops\app\node_modules\electron\dist\electron.exe")
+# Any Electron works (it only draws the SVG): TUG_ELECTRON, else `electron` on PATH.
+ELECTRON = os.environ.get("TUG_ELECTRON") or shutil.which("electron")
 SHOOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shoot.cjs")
 MINC = 320
 
 
 def render_svg(svg_path, out_png, w, h, bg=None, pad=0, flat=False):
     """bg None = transparent. pad = px margin around the image inside the w x h output."""
-    if not os.path.isfile(ELECTRON):
-        raise RuntimeError("Electron not found at %s: set TUG_ELECTRON to the path of electron.exe" % ELECTRON)
+    if not ELECTRON or not os.path.isfile(ELECTRON):
+        raise SystemExit("Electron not found: set TUG_ELECTRON to the path of electron.exe, or put electron on PATH")
     svg_path = Path(svg_path).resolve()
     tmpd = Path(tempfile.mkdtemp(prefix="tug_", dir=os.environ.get("TUG_TMP")))
     html = tmpd / "page.html"

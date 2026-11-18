@@ -270,3 +270,127 @@ async fn a_second_start_on_the_same_profile_keeps_the_identity_and_the_library()
     assert_eq!(second.items(ItemQuery { limit: 10, ..Default::default() }).unwrap().rows.len(), 1, "no re-import, no duplicate");
     second.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn any_file_travels_both_ways_the_pc_marks_what_it_receives_and_a_dropped_file_syncs() {
+    use tugboat_desktop_lib::{drop::NativeDrop, winfs};
+
+    let pc = start_pc().await;
+    let be = &pc.be;
+    let tmp = tempfile::tempdir().unwrap();
+    let (ph, secret) = phone(tmp.path());
+    ph.start_network(NetworkConfig { bind: "127.0.0.1:0".parse().unwrap(), mdns: false, secret_key: secret }).await.unwrap();
+    let payload = be.pairing_begin().unwrap().payload;
+    let phone_core = ph.clone();
+    let pairing = tokio::spawn(async move { phone_core.pair_with(&payload).await });
+    until("the PC shows a code", 10, || !code_events(&pc.out).is_empty()).await;
+    be.pairing_confirm(true).await.unwrap();
+    pairing.await.unwrap().expect("phone paired");
+    until("synced", 20, || be.status().state == SyncState::Synced && ph.status().state == SyncState::Synced).await;
+
+    // ----- phone -> PC: a PDF and a file with no extension -----
+    let pdf = b"%PDF-1.7 report body".to_vec();
+    let make = b"all:\n\techo hi\n".to_vec();
+    for (name, bytes) in [("report.pdf", &pdf), ("Makefile", &make)] {
+        let src = tmp.path().join(format!("src-{name}"));
+        std::fs::write(&src, bytes).unwrap();
+        ph.add_local_file(NewLocalFile { src, name: name.into(), folder: None, captured_at: 1_790_000_000_000, geo: None, thumb: None, how: AddKind::Added, ntfs: None }).unwrap();
+    }
+    until("both files in the library folder", 25, || pc.root.join("report.pdf").exists() && pc.root.join("Makefile").exists()).await;
+    assert_eq!(std::fs::read(pc.root.join("report.pdf")).unwrap(), pdf);
+    assert_eq!(std::fs::read(pc.root.join("Makefile")).unwrap(), make);
+    for n in ["report.pdf", "Makefile"] {
+        assert_eq!(winfs::read_zone_mark(&pc.root.join(n)).as_deref(), Some(winfs::ZONE_TEXT), "{n} was marked as downloaded when it arrived");
+    }
+    let rows = be.items(ItemQuery { limit: 100, ..Default::default() }).unwrap().rows;
+    let r = rows.iter().find(|i| i.name == "report.pdf").unwrap();
+    assert_eq!((r.kind, r.ext.as_str()), (tugboat_core::MediaKind::File, "pdf"));
+    assert_eq!(rows.iter().find(|i| i.name == "Makefile").unwrap().ext, "");
+    // Open / Show in Explorer work for any held file inside the library, whatever its type.
+    for (name, item) in [("report.pdf", r), ("Makefile", rows.iter().find(|i| i.name == "Makefile").unwrap())] {
+        let p = be.item_path(item.id).unwrap_or_else(|e| panic!("{name}: {e:?}"));
+        assert!(tugboat_desktop_lib::library::placement::same_path(&p, &pc.root.join(name)), "{name}: {}", p.display());
+    }
+
+    // ----- PC -> phone: a Word file and a file with no extension put in the folder by the user -----
+    let docx = b"PK docx bytes".to_vec();
+    std::fs::write(pc.root.join("contract.docx"), &docx).unwrap();
+    std::fs::write(pc.root.join("README"), b"read me").unwrap();
+    let phone_rows = || ph.items(&ItemQuery { limit: 100, ..Default::default() }).unwrap().rows;
+    until("the phone has both", 30, || ["contract.docx", "README"].iter().all(|n| phone_rows().iter().any(|r| r.name == *n))).await;
+    let docx_item = phone_rows().into_iter().find(|r| r.name == "contract.docx").unwrap();
+    assert_eq!(docx_item.kind, tugboat_core::MediaKind::File);
+    until("the phone holds the docx bytes", 20, || ph.item(docx_item.id).unwrap().is_some_and(|v| v.path.is_some())).await;
+    assert_eq!(std::fs::read(ph.item(docx_item.id).unwrap().unwrap().path.unwrap()).unwrap(), docx);
+    assert!(winfs::read_zone_mark(&pc.root.join("contract.docx")).is_none(), "the user's own file gets no mark");
+
+    // ----- a shortcut in the folder never leaves the PC and is listed -----
+    std::fs::write(pc.root.join("evil.lnk"), b"x").unwrap();
+    be.library_rescan();
+    until("the shortcut is listed as refused", 15, || be.library_status().not_synced.iter().any(|n| n.name == "evil.lnk" && n.reason.starts_with("REFUSED"))).await;
+
+    // ----- a file dropped on the window: copied in, synced to the phone, source untouched -----
+    let usb = tmp.path().join("usb");
+    std::fs::create_dir_all(&usb).unwrap();
+    let dropped = usb.join("dropped.pdf");
+    std::fs::write(&dropped, b"%PDF-1.4 dropped").unwrap();
+    let target = be.drop_end(); // what the window's Drop event does first
+    let rep = be.drop_files(NativeDrop::from_native(std::slice::from_ref(&dropped)), target);
+    assert_eq!(rep.copied, ["dropped.pdf"], "{rep:?}");
+    assert!(dropped.exists(), "the source is never touched");
+    assert!(pc.root.join("dropped.pdf").is_file());
+    until("the phone has the dropped pdf", 30, || phone_rows().iter().any(|r| r.name == "dropped.pdf")).await;
+    assert!(!phone_rows().iter().any(|r| r.name == "evil.lnk"), "a refused shortcut never reached the phone");
+    {
+        let evs = pc.out.events.lock().unwrap();
+        assert!(evs.iter().any(|(n, v)| n == ev::DROP_RESULT && v["copied"][0] == "dropped.pdf"), "the UI got the result");
+        assert!(evs.iter().any(|(n, v)| n == ev::DROP_STATE && v["t"] == "leave"));
+    }
+
+    ph.stop_network().await;
+    be.shutdown().await;
+}
+
+/// A drop that waits behind another keeps the folder it was dropped on, whatever is dragged over the window
+/// afterwards, and the window's event thread never waits for the folder lookup (it runs on a worker thread).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_drop_keeps_the_folder_it_was_dropped_on_and_a_finished_drag_is_never_announced_late() {
+    use tugboat_core::Retention;
+    use tugboat_desktop_lib::drop::NativeDrop;
+
+    let pc = start_pc().await;
+    let be = &pc.be;
+    let (y, z) = (be.core.create_folder("Y", Retention::Keep).unwrap(), be.core.create_folder("Z", Retention::Keep).unwrap());
+    let usb = pc._tmp.path().join("usb");
+    std::fs::create_dir_all(&usb).unwrap();
+    let (a, b) = (usb.join("a.txt"), usb.join("b.txt"));
+    std::fs::write(&a, b"a").unwrap();
+    std::fs::write(&b, b"b").unwrap();
+    let enters = |name: &str| pc.out.events.lock().unwrap().iter().filter(|(n, v)| n == ev::DROP_STATE && v["t"] == "enter" && v["target_name"] == name).count();
+
+    // B is dropped while the overlay says "Y".
+    be.drop_target_set(Some(y));
+    be.drop_enter(vec![b.clone()]);
+    until("the overlay names Y", 10, || enters("Y") == 1).await;
+    let for_b = be.drop_end();
+    assert_eq!(for_b.as_ref().map(|t| t.name.as_str()), Some("Y"));
+    // Later drags change what is on screen and what the slot holds.
+    be.drop_target_set(Some(z));
+    be.drop_enter(vec![a.clone()]);
+    until("the overlay names Z", 10, || enters("Z") == 1).await;
+    be.drop_leave();
+    // B's turn comes only now: it still goes to Y.
+    let rep = be.drop_files(NativeDrop::from_native(std::slice::from_ref(&b)), for_b);
+    assert_eq!((rep.folder_name.as_str(), rep.copied.as_slice()), ("Y", ["b.txt".to_string()].as_slice()), "{rep:?}");
+    assert!(pc.root.join("Y").join("b.txt").is_file() && !pc.root.join("Z").join("b.txt").exists());
+
+    // A drag that ends at once is never announced after its Leave, whenever the lookup finishes.
+    for _ in 0..20 {
+        be.drop_enter(vec![a.clone()]);
+        be.drop_leave();
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let last = pc.out.events.lock().unwrap().iter().filter(|(n, _)| n == ev::DROP_STATE).map(|(_, v)| v["t"].clone()).next_back();
+    assert_eq!(last, Some(Value::from("leave")), "the overlay is not left showing");
+    be.shutdown().await;
+}

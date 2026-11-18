@@ -9,6 +9,7 @@
   import Banners from "./lib/Banners.svelte";
   import Bin from "./lib/Bin.svelte";
   import Dialog from "./lib/Dialog.svelte";
+  import DropOverlay from "./lib/DropOverlay.svelte";
   import Gallery from "./lib/Gallery.svelte";
   import Mark from "./lib/Mark.svelte";
   import Pair from "./lib/Pair.svelte";
@@ -77,6 +78,8 @@
     </div>
   </div>
 
+  <DropOverlay />
+
   <Dialog bind:open={cloudOpen.get, cloudOpen.set} title="Cloud-synced folder">
     <p>{app.cloudPrompt?.message ?? ""}</p>
     <p class="muted">Photos in a cloud folder are uploaded to the internet. Tugboat is meant to stay on your network.</p>
@@ -94,10 +97,10 @@
   </Dialog>
 
   <Dialog bind:open={app.notSyncedOpen} title="Not synced">
-    <p class="muted">These files are in the library folder but are not photos or videos, so they stay on this PC.</p>
+    <p class="muted">These files are not synced. The reason is on each line.</p>
     <ul class="files">
-      {#each app.library?.not_synced ?? [] as f (f.path)}
-        <li><strong>{f.name}</strong> <span class="chip warn">{f.reason}</span><br /><span class="mono muted">{f.path}</span></li>
+      {#each app.library?.not_synced ?? [] as f, i (i)}
+        <li><strong>{f.name}</strong> <span class="chip warn">{f.reason}</span>{#if f.path}<br /><span class="mono muted">{f.path}</span>{/if}</li>
       {:else}
         <li class="muted">Nothing left.</li>
       {/each}
@@ -138,7 +141,7 @@
     border-right: 1px solid var(--border);
     --mark-fg: #ffffff;
   }
-  /* Small logo, then the word, on one line (owner 2026-11-18: "[Logo] Tugboat ... so the logo is nice and small"). */
+  /* Small logo, then the word, on one line. */
   .brand {
     display: flex;
     align-items: center;

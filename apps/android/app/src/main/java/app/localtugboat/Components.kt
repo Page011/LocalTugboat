@@ -154,6 +154,31 @@ fun ThumbImage(path: String?, desc: String?, modifier: Modifier = Modifier, scal
     }
 }
 
+@DrawableRes
+fun fileIcon(ext: String): Int = when (FileRules.glyph(ext)) {
+    FileGlyph.DOCUMENT -> R.drawable.ic_file_doc
+    FileGlyph.ARCHIVE -> R.drawable.ic_file_archive
+    FileGlyph.AUDIO -> R.drawable.ic_file_audio
+    FileGlyph.OTHER -> R.drawable.ic_file
+}
+
+/** What a file that is not a photo or video shows where a thumbnail would be: type icon, name, "PDF, 1.2 MB". */
+@Composable
+fun FileFace(item: uniffi.tugboat_ffi.ItemInfo, modifier: Modifier = Modifier) {
+    val cs = MaterialTheme.colorScheme
+    Column(
+        modifier.background(cs.surfaceVariant).padding(start = 6.dp, end = 6.dp, top = 6.dp, bottom = 30.dp),
+        horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center,
+    ) {
+        Ico(fileIcon(item.ext), null, tint = cs.onSurfaceVariant, size = 28)
+        Text(
+            FileRules.displayName(item.name, item.ext), style = MaterialTheme.typography.labelMedium, color = cs.onSurface,
+            maxLines = 2, overflow = TextOverflow.Ellipsis, textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+        )
+        Text(FileRules.meta(item.ext, item.size.toLong()), style = MaterialTheme.typography.labelSmall, color = cs.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+    }
+}
+
 /**
  * Bottom sheet to pick a folder. [autoLabel] non-null adds a first row (the rule-based choice).
  * [currentId] gets a check mark and a "Current" word, so the choice is not colour or icon alone.

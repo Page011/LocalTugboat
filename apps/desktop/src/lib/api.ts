@@ -12,6 +12,9 @@ import { open } from "@tauri-apps/plugin-dialog";
 import type { ActivityEntry } from "./bindings/ActivityEntry";
 import type { AppInfo } from "./bindings/AppInfo";
 import type { CmdError } from "./bindings/CmdError";
+import type { DropProgress } from "./bindings/DropProgress";
+import type { DropReport } from "./bindings/DropReport";
+import type { DropState } from "./bindings/DropState";
 import type { Event as CoreEvent } from "./bindings/Event";
 import type { FirewallInfo } from "./bindings/FirewallInfo";
 import type { FolderId } from "./bindings/FolderId";
@@ -28,7 +31,7 @@ import type { SyncStatus } from "./bindings/SyncStatus";
 import type { TrayState } from "./bindings/TrayState";
 
 export type {
-  ActivityEntry, AppInfo, CmdError, CoreEvent, FirewallInfo, FolderId, FolderView, ItemId, ItemQuery,
+  ActivityEntry, AppInfo, CmdError, CoreEvent, DropProgress, DropReport, DropState, FirewallInfo, FolderId, FolderView, ItemId, ItemQuery,
   ItemView, LibraryStatus, Page, PairedDevice, PairingStart, Settings, SyncStatus, TrayState,
 };
 
@@ -96,6 +99,9 @@ export const api = {
   libraryRescan: () => call<void>("library_rescan"),
   libraryOpenFolder: () => call<void>("library_open_folder"),
 
+  /** The gallery's current folder (null = All = Inbox): where a file dropped on the window lands. A folder id, never a path. */
+  dropTargetSet: (folder: FolderId | null) => call<void>("drop_target_set", { folder }),
+
   // Windows Firewall
   firewallStatus: () => call<FirewallInfo>("firewall_status"),
   firewallRecheck: () => call<FirewallInfo>("firewall_recheck"),
@@ -111,6 +117,9 @@ export const EVENTS = {
   firewall: "firewall-status",
   resync: "resync",
   tray: "tray-state",
+  dropState: "drop-state",
+  dropProgress: "drop-progress",
+  dropResult: "drop-result",
 } as const;
 
 /** Core events: sync status, items/folders changed, pairing steps, errors. */
@@ -118,6 +127,10 @@ export const onCoreEvent = (cb: (e: CoreEvent) => void): Promise<UnlistenFn> => 
 export const onLibraryStatus = (cb: (s: LibraryStatus) => void): Promise<UnlistenFn> => listen<LibraryStatus>(EVENTS.library, (m) => cb(m.payload));
 export const onFirewallStatus = (cb: (s: FirewallInfo) => void): Promise<UnlistenFn> => listen<FirewallInfo>(EVENTS.firewall, (m) => cb(m.payload));
 export const onTrayState = (cb: (s: TrayState) => void): Promise<UnlistenFn> => listen<TrayState>(EVENTS.tray, (m) => cb(m.payload));
+/** Files dragged over the window (the overlay) and what a drop did. Rust sends them from the window's native drag-drop event. */
+export const onDropState = (cb: (s: DropState) => void): Promise<UnlistenFn> => listen<DropState>(EVENTS.dropState, (m) => cb(m.payload));
+export const onDropProgress = (cb: (p: DropProgress) => void): Promise<UnlistenFn> => listen<DropProgress>(EVENTS.dropProgress, (m) => cb(m.payload));
+export const onDropResult = (cb: (r: DropReport) => void): Promise<UnlistenFn> => listen<DropReport>(EVENTS.dropResult, (m) => cb(m.payload));
 /** The event stream lagged: re-read everything the screen shows. */
 export const onResync = (cb: () => void): Promise<UnlistenFn> => listen(EVENTS.resync, () => cb());
 

@@ -3,7 +3,7 @@
 //! (`local_addr_filter` on the builder), the QR payload (`pairing::PairPayload::parse`),
 //! and every live connection path (`guard`).
 //!
-//! Rule (PLAN Network + spike lesson): local = loopback, RFC1918 (10/8, 172.16/12, 192.168/16),
+//! Rule: local = loopback, RFC1918 (10/8, 172.16/12, 192.168/16),
 //! IPv4 link-local (169.254/16), IPv6 link-local (fe80::/10), IPv6 ULA (fc00::/7).
 //! IPv4-mapped IPv6 (::ffff:a.b.c.d) is unwrapped first and judged as IPv4.
 //! Everything else, including relay and custom transport addresses, is not local.

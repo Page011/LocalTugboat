@@ -2,7 +2,7 @@
   import { untrack } from "svelte";
   import { ExternalLink, FolderOpen, OctagonAlert, Pin, QrCode, Trash2, WifiOff } from "@lucide/svelte";
   import { api } from "./api";
-  import { act, app, beginPairing } from "./app.svelte";
+  import { act, app, beginPairing, fail } from "./app.svelte";
   import { fmtSize, itemLabel, retentionLabel } from "./format";
   import Chip from "./Chip.svelte";
   import ItemGrid from "./ItemGrid.svelte";
@@ -25,6 +25,13 @@
   $effect(() => {
     if (folder !== null && !app.folders.some((f) => f.id === folder)) folder = null;
   });
+
+  // A file dropped on the window lands in the folder shown here. Only the folder id goes to Rust (never a path); when
+  // this screen goes away the target is None, so a drop elsewhere says "Copy to Inbox".
+  $effect(() => {
+    void api.dropTargetSet(folder).catch(fail);
+  });
+  $effect(() => () => void api.dropTargetSet(null).catch(fail));
 
   const current = $derived(app.folders.find((f) => f.id === folder) ?? null);
   const total = $derived(app.folders.reduce((n, f) => n + f.count, 0));
@@ -78,20 +85,20 @@
       {:else if app.paired === null}
         <span class="ico"><QrCode size={32} aria-hidden="true" /></span>
         <h2>Pair your phone</h2>
-        <p>Scan a code with the Tugboat app. Photos then show up here.</p>
+        <p>Scan a code with the Tugboat app. Photos and files then show up here.</p>
         <button class="btn primary" onclick={beginPairing}><QrCode size={16} aria-hidden="true" /> Pair a phone</button>
       {:else if offline}
         <span class="ico"><WifiOff size={32} aria-hidden="true" /></span>
         <h2>Phone offline</h2>
-        <p>Photos show up here when {app.paired.name} connects.</p>
+        <p>Photos and files show up here when {app.paired.name} connects.</p>
       {:else}
         <span class="art"><Mark width={72} /></span>
         <h2>Nothing yet.</h2>
-        <p>Photos you take on your phone show up here.</p>
+        <p>Photos and files from your phone show up here. Drop files here to copy them in.</p>
       {/if}
     </div>
   {:else}
-    <ItemGrid bind:this={grid} items={list.rows} labelFor={(it) => itemLabel(it, app.now)} bind:selectedId ariaLabel="Photos and videos" onopen={(it) => act(() => api.openItem(it.id))} onend={() => list.loadMore()} />
+    <ItemGrid bind:this={grid} items={list.rows} labelFor={(it) => itemLabel(it, app.now)} bind:selectedId ariaLabel="Files" onopen={(it) => act(() => api.openItem(it.id))} onend={() => list.loadMore()} />
   {/if}
 
   {#if sel}

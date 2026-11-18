@@ -7,12 +7,13 @@ use tauri::{
     image::Image,
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Emitter as _, Manager, WindowEvent,
+    AppHandle, DragDropEvent, Emitter as _, Manager, WindowEvent,
 };
 
 use crate::{
     backend::{Backend, Emitter},
     commands::MAIN,
+    drop::NativeDrop,
     tray::{self, TrayState},
 };
 
@@ -54,13 +55,40 @@ pub fn show_main(app: &AppHandle) {
     }
 }
 
-/// Closing the window hides it; Quit (tray menu or Settings) is the way out.
+/// Closing the window hides it; Quit (tray menu or Settings) is the way out. Files dragged onto the
+/// window are copied into the library: this native event is the ONLY place a copy's paths come from.
 pub fn on_window_event(window: &tauri::Window, event: &WindowEvent) {
-    if let WindowEvent::CloseRequested { api, .. } = event {
-        if window.label() == MAIN {
+    if window.label() != MAIN {
+        return;
+    }
+    match event {
+        WindowEvent::CloseRequested { api, .. } => {
             api.prevent_close();
             let _ = window.hide();
         }
+        WindowEvent::DragDrop(e) => on_drag_drop(window.app_handle(), e),
+        _ => {}
+    }
+}
+
+fn on_drag_drop(app: &AppHandle, e: &DragDropEvent) {
+    let Some(state) = app.try_state::<Arc<Backend>>() else { return };
+    let backend: Arc<Backend> = state.inner().clone();
+    match e {
+        DragDropEvent::Enter { paths, .. } => backend.drop_enter(paths.clone()),
+        DragDropEvent::Leave => backend.drop_leave(),
+        DragDropEvent::Drop { paths, .. } => {
+            let files = NativeDrop::from_native(paths);
+            // The folder is fixed here, at the drop; a drop that waits its turn keeps it.
+            let target = backend.drop_end();
+            // A big copy must not freeze the window: its own thread. The result always arrives as an event.
+            if let Err(e) = std::thread::Builder::new().name("tugboat-drop".into()).spawn(move || {
+                backend.drop_files(files, target);
+            }) {
+                tracing::error!("drop thread did not start: {e}");
+            }
+        }
+        _ => {}
     }
 }
 

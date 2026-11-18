@@ -36,7 +36,9 @@ async fn scripted_sender(conn: Arc<PeerConn>, file: PathBuf, announce: u64, send
     } else {
         // Dropping `tx` would finish the stream and look like a short body, not a cut connection:
         // hold it open until the connection is closed.
-        let _ = tokio::time::timeout(Duration::from_secs(10), conn.closed()).await;
+        // Longer than any wait a test makes before it cuts the connection (n11's readiness wait is
+        // bounded at 30 s), so a slow runner cannot end the sender early.
+        let _ = tokio::time::timeout(Duration::from_secs(60), conn.closed()).await;
     }
     drop(tx);
     req

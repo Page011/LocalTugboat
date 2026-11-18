@@ -16,6 +16,7 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import uniffi.tugboat_ffi.ActivityInfo
@@ -117,6 +118,13 @@ class SnapViewModel(app: Application) : AndroidViewModel(app) {
     private val _permsContinued = MutableStateFlow(false)
     val permsContinued: StateFlow<Boolean> = _permsContinued
 
+    /** One refresh at a time, in call order: an older read must never publish after a newer one (stale paired/unpaired). Declared before init: init calls refresh(). */
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private val refreshDispatcher = Dispatchers.IO.limitedParallelism(1)
+
+    /** Gallery lists kept per folder (see [itemsModel]). Declared before init: the event collector's unpair reset clears it. */
+    private val models = java.util.concurrent.ConcurrentHashMap<Pair<String?, Boolean>, PagedModel<ItemInfo>>()
+
     /** Core events for screens that show lists: re-read what is on screen when one arrives. */
     val events: SharedFlow<FfiEvent> get() = core.events
 
@@ -125,7 +133,8 @@ class SnapViewModel(app: Application) : AndroidViewModel(app) {
             core.events.collect { e ->
                 when (e) {
                     is FfiEvent.PairingCode -> _pairing.value = PairUi.Code(e.code, e.peerName)
-                    is FfiEvent.Unpaired, is FfiEvent.PairingCompleted, is FfiEvent.SettingsChanged, FfiEvent.Resync -> refresh()
+                    is FfiEvent.Unpaired -> { resetAfterUnpair(); refresh() }
+                    is FfiEvent.PairingCompleted, is FfiEvent.SettingsChanged, FfiEvent.Resync -> refresh()
                     else -> {}
                 }
                 when (e) {
@@ -189,10 +198,6 @@ class SnapViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     // ---- state ----
-
-    /** One refresh at a time, in call order: an older read must never publish after a newer one (stale paired/unpaired). */
-    @OptIn(ExperimentalCoroutinesApi::class)
-    private val refreshDispatcher = Dispatchers.IO.limitedParallelism(1)
 
     /** Re-read the small facts behind the banners. Safe to call often. */
     fun refresh() {
@@ -268,6 +273,13 @@ class SnapViewModel(app: Application) : AndroidViewModel(app) {
         if (_pairing.value is PairUi.Dialing || _pairing.value is PairUi.Code) return
         _pairing.value = PairUi.Dialing
         viewModelScope.launch(Dispatchers.IO) {
+            // The code's expiry (the PC's stamp, compared with this phone's clock) is read before dialing: a failure
+            // after it means "expired", whatever words the PC's newer window used to refuse the old secret.
+            val expiresAt = try {
+                inspectPairingPayload(payload).expiresAtMs
+            } catch (e: Exception) {
+                null
+            }
             // The hold is inside the try: if this job is cancelled while waiting for it, the release in finally still runs.
             try {
                 core.hold("pairing").join() // pairing needs the endpoint up
@@ -279,7 +291,7 @@ class SnapViewModel(app: Application) : AndroidViewModel(app) {
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                val line = Texts.pairFailure(e, Perms.localNetworkAllowed(ctx))
+                val line = Texts.pairFailure(e, Perms.localNetworkAllowed(ctx), codeExpired = expiresAt != null && System.currentTimeMillis() >= expiresAt)
                 // The onboarding screen shows this failure; a banner after a later success would be stale, so log only.
                 KLog.log(ctx, "pairing failed: $line")
                 _pairing.value = PairUi.Failed(line)
@@ -345,8 +357,6 @@ class SnapViewModel(app: Application) : AndroidViewModel(app) {
 
     // ---- gallery ----
 
-    private val models = java.util.concurrent.ConcurrentHashMap<Pair<String?, Boolean>, PagedModel<ItemInfo>>()
-
     /**
      * The rows of one gallery list ([folderId] null = all folders), kept here so coming back from the viewer
      * shows the same rows at once and the grid keeps its scroll position. The screen reloads it on entry.
@@ -381,6 +391,16 @@ class SnapViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /** ACTION_VIEW intent for a held file (content URI, read grant), or null (with a message) when it cannot be opened. */
+    suspend fun openIntent(item: ItemInfo): Intent? = withContext(Dispatchers.IO) {
+        try {
+            ItemFileProvider.openIntent(ctx, item)
+        } catch (e: Exception) {
+            fail("Open", e)
+            null
+        }
+    }
+
     fun saveToGallery(item: ItemInfo) = act("Save to phone") {
         ItemExport.saveToGallery(ctx, item)
         _messages.tryEmit("Saved to phone gallery")
@@ -411,12 +431,17 @@ class SnapViewModel(app: Application) : AndroidViewModel(app) {
     fun unpair() = act("Unpair") {
         core.phone().unpair()
         SnapService.stop(ctx)
-        _pairing.value = PairUi.Idle
+        resetAfterUnpair()
+        refresh()
+    }
+
+    /** The PC unpaired too (event) or the user did: forget everything that belonged to the pairing. */
+    private fun resetAfterUnpair() {
+        _pairing.update { UiLogic.pairingAfterUnpair(it) }
         _permsContinued.value = false
         _latest.value = null
         models.clear()
         nav.home()
-        refresh()
     }
 
     /** The share sheet intent for the exported log, or null (with a message) if it could not be built. */

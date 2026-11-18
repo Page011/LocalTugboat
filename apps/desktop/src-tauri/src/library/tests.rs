@@ -206,30 +206,377 @@ fn a_file_still_being_written_is_not_imported_until_it_stops_changing() {
 }
 
 #[test]
-fn non_media_and_mismatched_files_are_listed_never_ignored() {
+fn any_file_becomes_an_item_and_only_refused_and_mismatched_files_are_listed() {
     let mut r = Rig::new();
     std::fs::write(r.root.join("notes.txt"), b"hello").unwrap();
+    std::fs::write(r.root.join("Makefile"), b"all:").unwrap();
     std::fs::create_dir(r.root.join("Work")).unwrap();
     std::fs::write(r.root.join("Work").join("plan.docx"), b"x").unwrap();
     std::fs::write(r.root.join("fake.jpg"), b"this is not a jpeg at all").unwrap();
-    // Windows' own files are not the user's.
-    let hidden = r.root.join("desktop.ini");
+    // Shortcut and folder-setting files are never synced, even when the user can see them.
+    std::fs::write(r.root.join("link.lnk"), b"x").unwrap();
+    std::fs::write(r.root.join("desktop.ini"), b"[x]").unwrap();
+    // Windows' own hidden files are not the user's and are not listed.
+    let hidden = r.root.join("Work").join("desktop.ini");
     std::fs::write(&hidden, b"[x]").unwrap();
-    let _ = crate::winfs::hide(&hidden);
+    crate::winfs::hide(&hidden).unwrap();
     r.settle();
     r.settle();
     let s = r.lib.status();
     let reasons: Vec<(String, String)> = s.not_synced.iter().map(|n| (n.name.clone(), n.reason.clone())).collect();
-    assert!(reasons.iter().any(|(n, why)| n == "notes.txt" && why.starts_with("NOT A PHOTO OR VIDEO")), "{reasons:?}");
-    assert!(reasons.iter().any(|(n, _)| n == "plan.docx"), "files in subfolders too: {reasons:?}");
-    assert!(reasons.iter().any(|(n, why)| n == "fake.jpg" && why.contains("does not match")), "{reasons:?}");
-    assert!(!reasons.iter().any(|(n, _)| n == "desktop.ini"), "hidden files are not listed");
-    assert!(r.items().is_empty());
-    assert!(s.last_error.is_none(), "a rejected file is a listing, not an error: {:?}", s.last_error);
+    let by_name = |n: &str| r.items().into_iter().find(|i| i.name == n);
+    let notes = by_name("notes.txt").expect("a text file syncs");
+    assert_eq!((notes.kind, notes.ext.as_str()), (tugboat_core::MediaKind::File, "txt"));
+    let make = by_name("Makefile").expect("a file with no extension syncs");
+    assert_eq!((make.kind, make.ext.as_str()), (tugboat_core::MediaKind::File, ""));
+    assert_eq!(by_name("plan.docx").expect("files in subfolders too").folder, r.folder_named("Work").id);
+    assert!(reasons.iter().any(|(n, why)| n == "fake.jpg" && why == "REFUSED - content does not match its type"), "{reasons:?}");
+    assert!(reasons.iter().any(|(n, why)| n == "link.lnk" && why.starts_with("REFUSED")), "{reasons:?}");
+    assert!(reasons.iter().any(|(n, why)| n == "desktop.ini" && why.starts_with("REFUSED")), "a visible desktop.ini is listed: {reasons:?}");
+    assert_eq!(reasons.iter().filter(|(n, _)| n == "desktop.ini").count(), 1, "the hidden one is not listed");
+    assert!(by_name("link.lnk").is_none() && by_name("desktop.ini").is_none() && by_name("fake.jpg").is_none());
+    assert_eq!(r.items().len(), 3);
+    assert!(s.last_error.is_none(), "a refused file is a listing, not an error: {:?}", s.last_error);
     // Judged once: changing the file's content makes it get judged again.
     std::fs::write(r.root.join("fake.jpg"), jpeg(4, 64)).unwrap();
     r.settle();
     assert_eq!(r.item("fake.jpg").kind, tugboat_core::MediaKind::Image);
+}
+
+#[test]
+fn downloads_and_editor_lock_files_are_listed_not_synced_yet_and_sync_once_they_are_real_files() {
+    let mut r = Rig::new();
+    let names = ["a.crdownload", "b.part", "c.partial", "d.download", "e.opdownload", "~$f.docx", ".~lock.g.odt#"];
+    for n in names {
+        std::fs::write(r.root.join(n), b"x").unwrap();
+    }
+    r.settle();
+    r.settle();
+    let s = r.lib.status();
+    for n in names {
+        assert!(s.not_synced.iter().any(|f| f.name == n && f.reason.starts_with("IN PROGRESS")), "{n} is listed: {:?}", s.not_synced);
+    }
+    assert!(r.items().is_empty(), "nothing in progress is imported");
+    // The download finishes: it is renamed to the real file and syncs.
+    std::fs::rename(r.root.join("a.crdownload"), r.root.join("a.zip")).unwrap();
+    r.settle();
+    assert_eq!(r.item("a.zip").ext, "zip");
+}
+
+/// The copy a cross-drive move makes sits in the visible library folder under `.tugboat-<id>.tugboat-move`: a scan must
+/// never import it (a crash mid-copy leaves it), and the start-up clean-up removes it from the root and the folders.
+#[test]
+fn a_move_copy_left_in_the_library_is_in_progress_never_an_item_and_is_removed_at_start() {
+    let mut r = Rig::new();
+    std::fs::create_dir(r.root.join("Work")).unwrap();
+    let (a, b) = (".tugboat-0190f2a45b7c7e3a9d4e5f60718293a4.tugboat-move", ".tugboat-0190F2A45B7C7E3A9D4E5F60718293A5.TUGBOAT-MOVE");
+    std::fs::write(r.root.join(a), jpeg(1, 64)).unwrap();
+    std::fs::write(r.root.join("Work").join(b), jpeg(2, 64)).unwrap();
+    r.write("keep.jpg", 3);
+    r.settle();
+    r.settle();
+    let s = r.lib.status();
+    for n in [a, b] {
+        assert!(s.not_synced.iter().any(|f| f.name == n && f.reason.starts_with("IN PROGRESS")), "{n} is listed: {:?}", s.not_synced);
+    }
+    assert_eq!(r.items().iter().map(|i| i.name.as_str()).collect::<Vec<_>>(), ["keep.jpg"], "no move copy is imported");
+    assert_eq!(crate::drop::clean_stale(&r.root), 2);
+    assert!(!r.root.join(a).exists() && !r.root.join("Work").join(b).exists());
+    assert!(r.root.join("keep.jpg").exists(), "nothing else is removed");
+    assert_eq!(crate::drop::clean_stale(&r.root), 0);
+}
+
+/// Any file type syncs, so a file whose extension is the move copy's own ("Notes.tugboat-move") is a real file: the
+/// start-up clean-up must not delete it (that delete would then sync to the phone).
+#[test]
+fn a_real_file_ending_in_tugboat_move_is_synced_and_survives_the_start_up_clean_up() {
+    let mut r = Rig::new();
+    std::fs::write(r.root.join("Notes.tugboat-move"), b"keep me").unwrap();
+    r.settle();
+    r.settle();
+    assert_eq!(r.item("Notes.tugboat-move").ext, "tugboat-move");
+    assert_eq!(crate::drop::clean_stale(&r.root), 0);
+    assert!(r.root.join("Notes.tugboat-move").exists());
+    r.settle();
+    assert_eq!(r.deleted_count(), 0);
+    assert_eq!(r.item("Notes.tugboat-move").local, LocalFileState::Present);
+}
+
+/// A synced file whose name looks like a download in progress ("movie.part" received from the phone) is still a
+/// held file: it is not listed as not synced, and an edit made on the PC reaches the record.
+#[test]
+fn a_synced_file_named_like_a_download_is_not_listed_and_its_edits_still_sync() {
+    let mut r = Rig::new();
+    std::fs::write(r.root.join("movie.txt"), b"one").unwrap();
+    r.settle();
+    let id = r.item("movie.txt").id;
+    // The held file now carries a download-looking name (the same state as one the phone sent under that name).
+    std::fs::rename(r.root.join("movie.txt"), r.root.join("movie.part")).unwrap();
+    r.settle();
+    std::fs::write(r.root.join("movie.part"), b"two two").unwrap();
+    let mut edited = 0;
+    for _ in 0..3 {
+        edited += r.settle().edited;
+    }
+    assert_eq!(edited, 1, "the edit was seen");
+    assert_eq!(r.core.item(id).unwrap().unwrap().size, 7);
+    let s = r.lib.status();
+    assert!(!s.not_synced.iter().any(|f| f.name == "movie.part"), "a held file is not 'not synced': {:?}", s.not_synced);
+    assert_eq!(r.deleted_count(), 0);
+}
+
+/// A 0.1.x library: the config has a path but no `legacy_done`. Its non-photo files were listed
+/// "not synced" and left alone; importing them now would start an expiry clock on files the user
+/// never asked to sync.
+#[test]
+fn files_that_were_there_before_0_2_0_stay_listed_and_are_never_imported() {
+    let mut r = Rig::new();
+    let reopen = |r: &Rig, done: bool| {
+        let mut cfg = LibraryConfig::load(&r.data).unwrap();
+        cfg.legacy_done = done;
+        if !done {
+            cfg.legacy.clear();
+        }
+        cfg.save(&r.data).unwrap();
+        Library::open(r.core.clone(), r.place.clone(), r.data.clone(), cfg, &r.root, LibraryOptions::default(), Box::new(|_| {})).unwrap()
+    };
+    std::fs::write(r.root.join("notes.txt"), b"old").unwrap();
+    r.write("a.jpg", 1);
+    r.lib = reopen(&r, false); // as 0.1.x left it
+    r.settle();
+    assert_eq!(r.items().iter().map(|i| i.name.as_str()).collect::<Vec<_>>(), ["a.jpg"], "the photo syncs as before");
+    let listed = |r: &Rig| r.lib.status().not_synced.iter().any(|n| n.name == "notes.txt" && n.reason.starts_with("FROM BEFORE 0.2.0"));
+    assert!(listed(&r));
+    assert!(LibraryConfig::load(&r.data).unwrap().legacy_done, "the first full pass closed the list");
+    // A file added AFTER the upgrade syncs like any other.
+    std::fs::write(r.root.join("b.txt"), b"new").unwrap();
+    r.settle();
+    assert_eq!(r.item("b.txt").kind, tugboat_core::MediaKind::File);
+    // The list survives a restart (a new Library reads library.json).
+    r.lib = reopen(&r, true);
+    r.settle();
+    assert!(listed(&r));
+    assert!(r.items().iter().all(|i| i.name != "notes.txt"));
+    // Renamed in Explorer it is the same file (NTFS identity): still listed, never imported.
+    std::fs::rename(r.root.join("notes.txt"), r.root.join("notes2.txt")).unwrap();
+    r.settle();
+    assert!(r.lib.status().not_synced.iter().any(|n| n.name == "notes2.txt" && n.reason.starts_with("FROM BEFORE 0.2.0")));
+    // Deleted, its name is free again: a new file with that name syncs.
+    std::fs::remove_file(r.root.join("notes2.txt")).unwrap();
+    r.settle();
+    assert!(r.lib.status().not_synced.iter().all(|n| !n.reason.starts_with("FROM BEFORE")), "{:?}", r.lib.status().not_synced);
+    std::fs::write(r.root.join("notes2.txt"), b"fresh").unwrap();
+    r.settle();
+    assert_eq!(r.item("notes2.txt").kind, tugboat_core::MediaKind::File);
+}
+
+/// Closing the pre-0.2.0 list is written to library.json; when that write fails the in-memory config must not
+/// say "done" while the file does not, or no later pass would ever write it (nothing differs any more).
+#[test]
+fn a_failed_save_of_the_closed_pre_0_2_0_list_is_retried_not_believed() {
+    let mut r = Rig::new();
+    let mut cfg = LibraryConfig::load(&r.data).unwrap();
+    cfg.legacy_done = false;
+    cfg.save(&r.data).unwrap();
+    r.lib = Library::open(r.core.clone(), r.place.clone(), r.data.clone(), cfg, &r.root, LibraryOptions::default(), Box::new(|_| {})).unwrap();
+    std::fs::write(r.root.join("notes.txt"), b"old").unwrap();
+    let blocker = block_config_save(&r.data);
+    r.scan(0);
+    let err = r.lib.status().last_error.expect("the failed save is shown");
+    assert!(err.contains("CANNOT SAVE LIBRARY CONFIG"), "{err}");
+    assert!(!LibraryConfig::load(&r.data).unwrap().legacy_done, "the file was not written");
+    std::fs::remove_dir(&blocker).unwrap();
+    // Nothing changed on disk since: the retry must still happen.
+    r.scan(1);
+    assert_eq!(r.lib.status().last_error, None);
+    let cfg = LibraryConfig::load(&r.data).unwrap();
+    assert!(cfg.legacy_done, "library.json now holds the closed list");
+    assert!(cfg.legacy.iter().any(|e| e.path.to_lowercase().ends_with("notes.txt")), "{cfg:?}");
+}
+
+/// While library.json cannot be saved, a file added AFTER the first complete pass is not a pre-0.2.0 file: it must
+/// sync, and it must never reach the legacy list (in memory or, once the save works, in the file).
+#[test]
+fn a_file_added_while_the_closed_list_cannot_be_saved_is_not_taken_for_old() {
+    let mut r = Rig::new();
+    let mut cfg = LibraryConfig::load(&r.data).unwrap();
+    cfg.legacy_done = false;
+    cfg.save(&r.data).unwrap();
+    r.lib = Library::open(r.core.clone(), r.place.clone(), r.data.clone(), cfg, &r.root, LibraryOptions::default(), Box::new(|_| {})).unwrap();
+    std::fs::write(r.root.join("notes.txt"), b"old").unwrap();
+    let blocker = block_config_save(&r.data);
+    r.scan(0);
+    assert!(r.lib.status().last_error.is_some(), "the save failed");
+    std::fs::write(r.root.join("new.pdf"), b"new").unwrap();
+    r.settle();
+    assert_eq!(r.item("new.pdf").kind, tugboat_core::MediaKind::File, "the new file syncs although the save still fails");
+    assert!(r.lib.status().not_synced.iter().any(|n| n.name == "notes.txt"), "the old file stays listed");
+    std::fs::remove_dir(&blocker).unwrap();
+    r.settle();
+    let cfg = LibraryConfig::load(&r.data).unwrap();
+    assert!(cfg.legacy_done);
+    assert!(cfg.legacy.iter().any(|e| e.path.to_lowercase().ends_with("notes.txt")), "{cfg:?}");
+    assert!(cfg.legacy.iter().all(|e| !e.path.to_lowercase().ends_with("new.pdf")), "{cfg:?}");
+    assert_eq!(r.item("new.pdf").kind, tugboat_core::MediaKind::File);
+}
+
+/// D6: a received file carries `Zone.Identifier` (ZoneId=3). Choosing a new folder reserves each destination
+/// (create_new) and copies over it; the copy must bring the stream along, and Locate must leave it alone.
+#[test]
+fn a_received_files_mark_of_the_web_survives_choose_and_locate() {
+    use crate::winfs::{read_zone_mark, write_zone_mark, ZONE_TEXT};
+    let mut r = Rig::new();
+    for (rel, seed) in [("a.jpg", 1), ("Work/b.jpg", 2)] {
+        let p = r.write(rel, seed);
+        write_zone_mark(&p).unwrap();
+    }
+    r.settle();
+    assert_eq!(r.items().len(), 2);
+    let new_root = r._tmp.path().join("newlib");
+    r.lib.choose(&new_root, false).unwrap();
+    for p in [new_root.join("a.jpg"), new_root.join("Work").join("b.jpg")] {
+        assert_eq!(read_zone_mark(&p).as_deref(), Some(ZONE_TEXT), "Choose kept the mark on {}", p.display());
+    }
+    // Locate: the folder is moved in Explorer, the records follow; no file is rewritten, so the mark stays.
+    let located = r._tmp.path().join("located");
+    std::fs::rename(&new_root, &located).unwrap();
+    r.scan(1);
+    r.lib.locate(&located).unwrap();
+    r.scan(1);
+    assert_eq!(r.items().len(), 2);
+    for p in [located.join("a.jpg"), located.join("Work").join("b.jpg")] {
+        assert_eq!(read_zone_mark(&p).as_deref(), Some(ZONE_TEXT), "Locate kept the mark on {}", p.display());
+    }
+}
+
+/// Copying onto FAT/exFAT drops the Mark-of-the-Web without an error. Choose must then fail and leave the old library
+/// exactly as it was, never move received files over unmarked. (The drop is simulated: the temp drive is NTFS.)
+#[test]
+fn choosing_a_folder_that_would_strip_a_received_files_mark_is_refused_and_changes_nothing() {
+    use crate::winfs::{read_zone_mark, write_zone_mark};
+    let mut r = Rig::new();
+    let marked = r.write("setup.jpg", 1);
+    write_zone_mark(&marked).unwrap();
+    r.write("mine.jpg", 2); // the user's own file: no mark to lose
+    r.settle();
+    let new_root = r._tmp.path().join("newlib");
+    r.place.strip_copy_marks.store(true, std::sync::atomic::Ordering::SeqCst);
+    let err = r.lib.choose(&new_root, false).unwrap_err();
+    assert!(err.message.contains("setup.jpg") && err.message.contains("NOT MARKED AS DOWNLOADED"), "{}", err.message);
+    assert!(read_zone_mark(&marked).is_some(), "the original keeps its mark and stays in place");
+    assert_eq!(r.lib.root().as_deref(), Some(r.root.as_path()), "still the old library");
+    assert!(!new_root.join("setup.jpg").exists(), "no unmarked copy is left");
+    assert_eq!(r.item("setup.jpg").path.as_deref().map(Path::new), Some(marked.as_path()));
+    // The drive can hold the mark (the seam off): the same choice goes through.
+    r.place.strip_copy_marks.store(false, std::sync::atomic::Ordering::SeqCst);
+    r.lib.choose(&new_root, false).unwrap();
+    assert!(read_zone_mark(&new_root.join("setup.jpg")).is_some());
+}
+
+/// Explorer rename to a refused name: the record does not change, the file is listed, Tugboat never
+/// renames it back and never bins it.
+#[test]
+fn a_synced_file_renamed_to_a_refused_name_in_explorer_is_listed_not_binned_or_renamed_back() {
+    let mut r = Rig::new();
+    std::fs::write(r.root.join("a.txt"), b"hello").unwrap();
+    r.settle();
+    let id = r.item("a.txt").id;
+    std::fs::rename(r.root.join("a.txt"), r.root.join("a.lnk")).unwrap();
+    for _ in 0..4 {
+        r.scan(3);
+    }
+    assert!(r.root.join("a.lnk").exists() && !r.root.join("a.txt").exists(), "never renamed back");
+    assert_eq!(r.deleted_count(), 0, "never binned");
+    assert!(r.bin().is_empty());
+    assert_eq!(r.core.item(id).unwrap().unwrap().local, LocalFileState::Present);
+    let s = r.lib.status();
+    assert!(s.not_synced.iter().any(|n| n.name == "a.lnk" && n.reason.starts_with("REFUSED")), "{:?}", s.not_synced);
+    assert!(s.last_error.is_none(), "{:?}", s.last_error);
+}
+
+/// The other device renames a File item to a name this PC refuses: the file stays, one REFUSED row,
+/// no error and no retry storm.
+#[test]
+fn a_rename_to_a_refused_name_on_the_other_device_keeps_the_file_and_lists_one_row() {
+    let mut r = Rig::new();
+    std::fs::write(r.root.join("notes.ini"), b"[x]").unwrap();
+    r.settle();
+    // Core refuses such a rename on THIS device, so the other device's record is written straight into
+    // the database, the way a sync merge would: name "desktop", extension ini stays, disk name desktop.ini.
+    let changed = r.core.debug_conn(|c| c.execute("UPDATE item SET name = 'desktop' WHERE name = 'notes.ini'", []).unwrap());
+    assert_eq!(changed, 1);
+    for _ in 0..4 {
+        r.scan(3);
+    }
+    let s = r.lib.status();
+    assert!(r.root.join("notes.ini").exists(), "the file stays where it is");
+    assert!(!r.root.join("desktop.ini").exists());
+    assert!(s.last_error.is_none(), "no repeated error: {:?}", s.last_error);
+    let rows = s.not_synced.iter().filter(|n| n.name == "notes.ini" && n.reason.starts_with("REFUSED")).count();
+    assert_eq!(rows, 1, "one REFUSED row: {:?}", s.not_synced);
+    assert_eq!(r.deleted_count(), 0);
+}
+
+/// Word and Excel save by writing a temp file and swapping it in with ReplaceFileW, which can give the
+/// path a new NTFS identity. It must be an edit of the same item, never a delete plus an add.
+#[test]
+fn an_office_safe_save_with_replacefilew_is_an_edit_of_the_same_item() {
+    use windows::{
+        core::PCWSTR,
+        Win32::Storage::FileSystem::{ReplaceFileW, REPLACE_FILE_FLAGS},
+    };
+    let wide = |p: &Path| -> Vec<u16> { p.as_os_str().to_string_lossy().encode_utf16().chain(std::iter::once(0)).collect() };
+    let mut r = Rig::new();
+    let p = r.root.join("plan.docx");
+    std::fs::write(&p, b"version one").unwrap();
+    r.settle();
+    let first = r.item("plan.docx");
+    let tmp = r.root.join("~WRL0001.tmp");
+    std::fs::write(&tmp, b"version two, a little longer").unwrap();
+    let (replaced, replacement) = (wide(&p), wide(&tmp));
+    unsafe { ReplaceFileW(PCWSTR(replaced.as_ptr()), PCWSTR(replacement.as_ptr()), PCWSTR::null(), REPLACE_FILE_FLAGS(0), None, None) }.unwrap();
+    r.settle();
+    r.settle();
+    assert_eq!(r.items().len(), 1, "{:?}", r.items().iter().map(|i| &i.name).collect::<Vec<_>>());
+    let now = r.item("plan.docx");
+    assert_eq!(now.id, first.id, "the same item");
+    assert_eq!(now.size, 28, "with the new content");
+    assert!(r.actions().contains(&ActivityAction::Edited));
+    assert_eq!(r.deleted_count(), 0);
+    assert!(r.bin().is_empty());
+    assert!(r.lib.status().last_error.is_none());
+}
+
+/// Same-size edit while the app was closed: the mtime Core remembers is the only thing that shows it.
+#[test]
+fn an_edit_made_while_the_app_was_closed_is_seen_at_the_next_start_even_at_the_same_size() {
+    let mut r = Rig::new();
+    let p = r.write("a.jpg", 1);
+    let t = r.root.join("n.txt");
+    std::fs::write(&t, b"aaaa").unwrap();
+    r.settle();
+    let held = r.core.held_files().unwrap();
+    assert!(held.iter().all(|h| h.mtime_ms.is_some()), "every held file remembers its mtime: {held:?}");
+    // The app is closed; the files change without changing size.
+    let later = std::time::SystemTime::now() + Duration::from_secs(30);
+    let mut bytes = jpeg(2, 64);
+    bytes[10] = 0x77;
+    std::fs::write(&p, &bytes).unwrap();
+    std::fs::write(&t, b"bbbb").unwrap();
+    for f in [&p, &t] {
+        std::fs::OpenOptions::new().write(true).open(f).unwrap().set_modified(later).unwrap();
+    }
+    // A fresh start: a new Library with an empty in-memory cache over the same Core.
+    let cfg = LibraryConfig::load(&r.data).unwrap();
+    let lib2 = Library::open(r.core.clone(), r.place.clone(), r.data.clone(), cfg, &r.root, LibraryOptions::default(), Box::new(|_| {})).unwrap();
+    let now = r.now;
+    lib2.scan_at(false, now);
+    let rep = lib2.scan_at(false, now + Duration::from_secs(3));
+    assert_eq!(rep.edited, 2, "both same-size edits were seen: {rep:?}");
+    assert!(r.actions().iter().filter(|a| **a == ActivityAction::Edited).count() >= 2);
+    // And it is quiet afterwards.
+    let again = lib2.scan_at(false, now + Duration::from_secs(8));
+    assert_eq!((again.edited, again.imported, again.binned), (0, 0, 0));
 }
 
 // ---------- Explorer actions ----------
@@ -604,8 +951,8 @@ fn the_ten_percent_rule_applies_even_below_twenty_files() {
 
 #[test]
 fn a_tiny_library_pauses_on_one_missing_file_under_the_literal_ten_percent_rule() {
-    // PLAN: "more than 20 files or 10% of the library missing". In a 2-file library one delete
-    // is 50%. Pinned here so the behaviour is visible; see the report's open issues.
+    // The rule is "more than 20 files or 10% of the library missing". In a 2-file library one delete
+    // is 50%. Pinned here so the behaviour is visible.
     let mut r = Rig::strict();
     r.write("a.jpg", 1);
     r.write("b.jpg", 2);
@@ -992,7 +1339,7 @@ fn the_ui_is_told_when_the_library_status_changes_and_only_then() {
     assert!(n >= 1, "the first scan published a status");
     r.scan(1);
     assert_eq!(r.statuses.lock().unwrap().len(), n, "an unchanged status is not re-sent");
-    std::fs::write(r.root.join("x.txt"), b"1").unwrap();
+    std::fs::write(r.root.join("x.lnk"), b"1").unwrap();
     r.scan(1);
     let all = r.statuses.lock().unwrap();
     assert_eq!(all.len(), n + 1);
@@ -1031,10 +1378,13 @@ fn the_watcher_thread_imports_a_drop_and_follows_an_explorer_move() {
     wait("the Explorer move is followed", &|| r.core.item(id).unwrap().is_some_and(|i| i.folder != INBOX_ID));
     assert_eq!(r.items().len(), 1);
     assert_eq!(r.deleted_count(), 0);
-    // A manual rescan request works too.
+    // A manual rescan request works too: a text file is a file like any other now.
     std::fs::write(r.root.join("note.txt"), b"x").unwrap();
     worker.request_scan(true);
-    wait("the rescan lists the text file", &|| lib.status().not_synced.iter().any(|n| n.name == "note.txt"));
+    wait("the rescan imports the text file", &|| r.items().iter().any(|i| i.name == "note.txt"));
+    std::fs::write(r.root.join("link.lnk"), b"x").unwrap();
+    worker.request_scan(true);
+    wait("the rescan lists the shortcut as refused", &|| lib.status().not_synced.iter().any(|n| n.name == "link.lnk"));
     drop(worker); // stops the thread and the watcher
 }
 
@@ -1162,11 +1512,14 @@ mod placement {
             assert!(path.exists());
             std::fs::remove_file(path).unwrap();
         }
-        // The extension comes from a synced record: only the allowlist may become part of a path.
-        let mut t = inbox(8, "x.jpg");
-        t.ext = "exe".into();
-        assert!(p.to_bin(&t).is_err());
-        assert!(p.commit(&part(&p, &inbox(8, "x.jpg"), &jpeg(1, 64)), &t).is_err());
+        // The extension comes from a synced record: only a safe one may become part of a path.
+        for bad in ["lnk", "a/b", "..", "x y", "EXE"] {
+            let mut t = inbox(8, "x.jpg");
+            t.ext = bad.into();
+            assert!(p.to_bin(&t).is_err(), "{bad:?}");
+            assert!(p.commit(&part(&p, &inbox(8, "x.jpg"), &jpeg(1, 64)), &t).is_err(), "{bad:?}");
+        }
+        assert_eq!(std::fs::read_dir(&root).unwrap().filter(|e| e.as_ref().unwrap().file_name() != ".tugboat").count(), 0, "nothing was placed");
     }
 
     #[test]
@@ -1443,4 +1796,705 @@ fn path_compare_collapses_dot_and_dot_dot() {
     assert!(!is_inside(Path::new(r"C:\Data"), Path::new(r"C:\Data\..\Datum")));
     // Never above the drive root.
     assert_eq!(norm(Path::new(r"C:\..\..\a")), r"c:\a");
+}
+
+// ---------- any file type and the Mark-of-the-Web (placement) ----------
+
+mod any_file_placement {
+    use super::*;
+    use crate::winfs::{read_zone_mark, write_zone_mark, ZONE_TEXT};
+    use tugboat_core::{placement::FileTarget, BlobHash, CoreError, Placement};
+
+    fn rig() -> (tempfile::TempDir, PcLibrary, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("lib");
+        std::fs::create_dir_all(&root).unwrap();
+        let p = PcLibrary::new(Some(root.clone()), tmp.path().join("bin"), Default::default());
+        (tmp, p, root)
+    }
+
+    fn target(n: u128, name: &str, ext: &str) -> FileTarget {
+        FileTarget {
+            item: ItemId(uuid::Uuid::from_u128(n)),
+            hash: BlobHash([n as u8; 32]),
+            name: name.into(),
+            ext: ext.into(),
+            captured_at: 1_790_000_000_000,
+            folder: INBOX_ID,
+            folder_kind: FolderKind::Inbox,
+            folder_name: "Inbox".into(),
+            current: None,
+        }
+    }
+
+    fn part(p: &PcLibrary, t: &FileTarget, bytes: &[u8]) -> PathBuf {
+        let path = p.part_path(&t.hash).unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_received_file_of_any_type_is_placed_under_its_own_name_and_marked_as_downloaded() {
+        let (_t, p, root) = rig();
+        for (n, name, ext) in [(1, "report.pdf", "pdf"), (2, "Makefile", ""), (3, "data.sqlite3", "sqlite3"), (4, "run.bat", "bat")] {
+            let t = target(n, name, ext);
+            let dest = p.commit(&part(&p, &t, b"some bytes"), &t).unwrap();
+            assert_eq!(dest, root.join(name), "{name}");
+            assert_eq!(read_zone_mark(&dest).as_deref(), Some(ZONE_TEXT), "{name} carries the mark");
+            assert_eq!(std::fs::read(format!("{}:Zone.Identifier", dest.display())).unwrap(), b"[ZoneTransfer]\r\nZoneId=3\r\n", "byte exact");
+        }
+    }
+
+    #[test]
+    fn the_mark_goes_on_the_part_first_and_travels_with_the_file_however_it_is_put_down() {
+        let (tmp, _p, root) = rig();
+        let dir = root.clone();
+        // Hard link (the normal way), the same-item replace (a rename over the old file) and the
+        // copy that a cross-drive move falls back to: all keep the stream, so the file is never visible unmarked.
+        let a = tmp.path().join("a.part");
+        std::fs::write(&a, b"1").unwrap();
+        write_zone_mark(&a).unwrap();
+        let linked = super::super::placement::place_new(&a, &dir, "a.txt", None).unwrap();
+        assert!(read_zone_mark(&linked).is_some(), "hard link");
+        let b = tmp.path().join("b.part");
+        std::fs::write(&b, b"2").unwrap();
+        write_zone_mark(&b).unwrap();
+        let replaced = super::super::placement::place_new(&b, &dir, "a.txt", Some(&linked)).unwrap();
+        assert_eq!(std::fs::read(&replaced).unwrap(), b"2");
+        assert!(read_zone_mark(&replaced).is_some(), "rename over the old file");
+        let copy = tmp.path().join("c.copy");
+        std::fs::copy(&replaced, &copy).unwrap();
+        assert!(read_zone_mark(&copy).is_some(), "std::fs::copy (what move_across and the Bin restore use) carries the stream");
+    }
+
+    #[test]
+    fn replacing_an_items_file_keeps_it_marked_and_the_mark_stays_through_the_bin_and_back() {
+        let (_t, p, root) = rig();
+        let mut t = target(1, "doc.docx", "docx");
+        let first = p.commit(&part(&p, &t, b"v1"), &t).unwrap();
+        t.current = Some(first.clone());
+        t.hash = BlobHash([9; 32]);
+        let second = p.commit(&part(&p, &t, b"v2 longer"), &t).unwrap();
+        assert_eq!(second, first);
+        assert_eq!(std::fs::read(&second).unwrap(), b"v2 longer");
+        assert!(read_zone_mark(&second).is_some(), "the new content is marked too");
+        let binned = p.to_bin(&t).unwrap();
+        assert!(read_zone_mark(&binned).is_some(), "in the Bin");
+        let mut tb = t.clone();
+        tb.current = Some(binned);
+        let back = p.from_bin(&tb).unwrap();
+        assert_eq!(back, root.join("doc.docx"));
+        assert!(read_zone_mark(&back).is_some(), "restored from the Bin");
+    }
+
+    #[test]
+    fn a_bin_restore_that_would_come_out_unmarked_fails_and_the_bin_copy_stays() {
+        let (_t, p, root) = rig();
+        let mut t = target(1, "setup.exe", "exe");
+        let first = p.commit(&part(&p, &t, b"v1"), &t).unwrap();
+        t.current = Some(first);
+        let binned = p.to_bin(&t).unwrap();
+        let mut tb = t.clone();
+        tb.current = Some(binned.clone());
+        // A library on FAT/exFAT: the copy loses the stream without an error.
+        p.strip_copy_marks.store(true, std::sync::atomic::Ordering::SeqCst);
+        let err = p.from_bin(&tb).unwrap_err();
+        assert!(err.to_string().contains("NOT MARKED AS DOWNLOADED"), "{err}");
+        assert!(binned.exists() && read_zone_mark(&binned).is_some(), "the marked Bin copy is untouched");
+        assert!(!root.join("setup.exe").exists(), "nothing appears unmarked");
+        assert!(std::fs::read_dir(root.join(".tugboat")).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().ends_with(".restore")), "no staging copy is left");
+        p.strip_copy_marks.store(false, std::sync::atomic::Ordering::SeqCst);
+        let back = p.from_bin(&tb).unwrap();
+        assert!(read_zone_mark(&back).is_some());
+    }
+
+    #[test]
+    fn a_users_own_file_adopted_in_place_or_copied_in_gets_no_mark() {
+        let (tmp, p, root) = rig();
+        let own = root.join("mine.txt");
+        std::fs::write(&own, b"mine").unwrap();
+        let t = target(1, "mine.txt", "txt");
+        assert_eq!(p.adopt(&own, &t).unwrap(), own);
+        assert!(read_zone_mark(&own).is_none());
+        let outside = tmp.path().join("outside.txt");
+        std::fs::write(&outside, b"x").unwrap();
+        let t2 = target(2, "outside.txt", "txt");
+        let dest = p.adopt(&outside, &t2).unwrap();
+        assert!(read_zone_mark(&dest).is_none(), "copied in by the user: no mark");
+        // A source that already had one (downloaded from the internet) keeps it through the copy.
+        let marked = tmp.path().join("marked.txt");
+        std::fs::write(&marked, b"x").unwrap();
+        write_zone_mark(&marked).unwrap();
+        let t3 = target(3, "marked.txt", "txt");
+        assert!(read_zone_mark(&p.adopt(&marked, &t3).unwrap()).is_some());
+    }
+
+    #[test]
+    fn a_drive_that_cannot_hold_the_mark_gets_nothing_in_the_library_and_the_part_stays() {
+        let (_t, p, root) = rig();
+        let t = target(1, "report.pdf", "pdf");
+        let src = part(&p, &t, b"bytes");
+        p.fail_marks.store(true, std::sync::atomic::Ordering::SeqCst);
+        let err = p.commit(&src, &t).unwrap_err();
+        assert!(matches!(err, CoreError::Io { .. }), "{err:?}");
+        assert!(src.exists(), "the part is kept for the next try");
+        assert!(!root.join("report.pdf").exists(), "nothing appears unmarked");
+        p.fail_marks.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(p.commit(&src, &t).unwrap().exists(), "and the retry works once the drive can mark");
+    }
+
+    #[test]
+    fn a_rename_to_a_refused_name_is_refused_by_relocate_and_the_file_stays() {
+        let (_t, p, root) = rig();
+        let mut t = target(1, "notes.ini", "ini");
+        let placed = p.commit(&part(&p, &t, b"[x]"), &t).unwrap();
+        t.current = Some(placed.clone());
+        t.name = "desktop".into();
+        assert!(matches!(p.relocate(&t), Err(CoreError::Refused(_))));
+        assert!(placed.exists() && !root.join("desktop.ini").exists());
+    }
+
+    #[test]
+    fn this_drive_supports_named_streams_and_a_bad_path_is_an_error_not_a_yes() {
+        let (_t, _p, root) = rig();
+        assert!(crate::winfs::supports_named_streams(&root).unwrap());
+        assert!(crate::winfs::supports_named_streams(Path::new(r"Z:\definitely\not\a\drive")).is_err());
+    }
+
+    #[test]
+    fn a_name_the_pc_refuses_is_refused_visibly_and_left_alone() {
+        let (_t, p, root) = rig();
+        // The record name is harmless, the final disk name is not: desktop + ini.
+        for (name, ext) in [("desktop", "ini"), ("x", "lnk"), ("a:b", "lnk"), ("x.url", "")] {
+            let t = target(5, name, ext);
+            let src = part(&p, &t, b"x");
+            let err = p.commit(&src, &t).unwrap_err();
+            assert!(matches!(err, CoreError::Refused(_)) || matches!(err, CoreError::Invalid(_)), "{name}.{ext}: {err:?}");
+            assert!(src.exists(), "the part is left alone");
+            std::fs::remove_file(&src).unwrap();
+        }
+        assert_eq!(std::fs::read_dir(&root).unwrap().filter(|e| e.as_ref().unwrap().file_name() != ".tugboat").count(), 0);
+    }
+}
+
+// ---------- drag and drop ----------
+
+mod dropping {
+    use super::*;
+    use std::os::windows::fs::OpenOptionsExt;
+
+    use crate::{
+        drop::{clean_stale, copy_dropped, DropReport, DropTarget, NativeDrop, DRIVES_TEXT, EMPTY_TEXT, LINK_TEXT, NOTHING_TEXT, OWN_TEXT},
+        winfs::{read_zone_mark, write_zone_mark},
+    };
+
+    fn target_of(r: &Rig, name: &str) -> DropTarget {
+        let (id, kind, name) = r.core.live_folders().unwrap().into_iter().find(|(_, _, n)| n == name).unwrap_or_else(|| panic!("no folder {name}"));
+        DropTarget { id, kind, name }
+    }
+
+    fn inbox(r: &Rig) -> DropTarget {
+        target_of(r, "Inbox")
+    }
+
+    fn src_dir(r: &Rig) -> PathBuf {
+        let d = r._tmp.path().join("usb");
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn src(r: &Rig, name: &str, bytes: &[u8]) -> PathBuf {
+        let p = src_dir(r).join(name);
+        std::fs::write(&p, bytes).unwrap();
+        p
+    }
+
+    fn copy(r: &Rig, paths: &[PathBuf], t: &DropTarget) -> DropReport {
+        copy_dropped(&r.lib, NativeDrop::from_native(paths), t, &mut |_| {})
+    }
+
+    fn mtime(p: &Path) -> std::time::SystemTime {
+        std::fs::metadata(p).unwrap().modified().unwrap()
+    }
+
+    fn files_in(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir).unwrap().flatten().filter(|e| e.path().is_file()).map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn files_are_copied_into_the_inbox_and_into_a_viewed_folder_and_become_items() {
+        let r = Rig::new();
+        r.core.create_folder("Work", Retention::Keep).unwrap();
+        let paths = [src(&r, "photo.jpg", &jpeg(1, 200)), src(&r, "report.pdf", b"%PDF-1.4 hello"), src(&r, "Makefile", b"all:")];
+        let rep = copy(&r, &paths, &inbox(&r));
+        assert_eq!(rep.folder_name, "Inbox");
+        assert_eq!(rep.copied, ["photo.jpg", "report.pdf", "Makefile"], "{rep:?}");
+        assert!(rep.refused.is_empty() && rep.failed.is_empty());
+        assert_eq!(files_in(&r.root), ["Makefile", "photo.jpg", "report.pdf"]);
+        let kinds: Vec<_> = r.items().into_iter().map(|i| (i.name, i.kind, i.folder)).collect();
+        assert_eq!(kinds.len(), 3);
+        assert!(kinds.iter().all(|(_, _, f)| *f == INBOX_ID));
+        assert!(kinds.iter().any(|(n, k, _)| n == "photo.jpg" && *k == tugboat_core::MediaKind::Image));
+        assert!(kinds.iter().any(|(n, k, _)| n == "report.pdf" && *k == tugboat_core::MediaKind::File));
+        // Into Work: its own directory, its own folder id.
+        let work = target_of(&r, "Work");
+        let more = [src(&r, "two.pdf", b"%PDF-1.4 two")];
+        let rep = copy(&r, &more, &work);
+        assert_eq!((rep.folder_name.as_str(), rep.copied.as_slice()), ("Work", ["two.pdf".to_string()].as_slice()));
+        assert!(r.root.join("Work").join("two.pdf").is_file());
+        assert_eq!(r.item("two.pdf").folder, work.id);
+        // The watcher does not import any of it a second time, nor bin it.
+        r.lib.scan(true);
+        let mut r = r;
+        r.settle();
+        assert_eq!(r.items().len(), 4);
+        assert_eq!(r.deleted_count(), 0);
+        assert!(r.lib.status().last_error.is_none());
+    }
+
+    #[test]
+    fn a_name_that_exists_gets_a_unique_name_and_the_original_is_not_touched() {
+        let r = Rig::new();
+        let a = src(&r, "a.txt", b"first");
+        assert_eq!(copy(&r, std::slice::from_ref(&a), &inbox(&r)).copied, ["a.txt"]);
+        std::fs::write(&a, b"second").unwrap();
+        assert_eq!(copy(&r, std::slice::from_ref(&a), &inbox(&r)).copied, ["a (2).txt"]);
+        assert_eq!(copy(&r, &[a], &inbox(&r)).copied, ["a (3).txt"]);
+        assert_eq!(std::fs::read(r.root.join("a.txt")).unwrap(), b"first");
+        assert_eq!(std::fs::read(r.root.join("a (2).txt")).unwrap(), b"second");
+        assert_eq!(r.items().len(), 3);
+    }
+
+    /// Make a junction `link` -> `target` (mklink /J needs no privilege).
+    fn junction(link: &Path, target: &Path) {
+        let made = std::process::Command::new("cmd").args(["/c", "mklink", "/J"]).arg(link).arg(target).output().map(|o| o.status.success()).unwrap_or(false);
+        assert!(made, "mklink /J {} {}", link.display(), target.display());
+    }
+
+    /// A folder to drop: nested folders, an empty folder, a zero-byte file and a Unicode name.
+    fn trip(r: &Rig) -> PathBuf {
+        let dir = src_dir(r).join("Trip");
+        std::fs::create_dir_all(dir.join("day 1").join("raw")).unwrap();
+        std::fs::create_dir_all(dir.join("empty")).unwrap();
+        std::fs::write(dir.join("IMG_1.jpg"), jpeg(1, 5000)).unwrap();
+        std::fs::write(dir.join("zero.bin"), b"").unwrap();
+        std::fs::write(dir.join("day 1").join("notes.txt"), b"notes").unwrap();
+        std::fs::write(dir.join("day 1").join("raw").join("caf\u{e9} \u{65e5}\u{672c}.txt"), "unicode".as_bytes()).unwrap();
+        dir
+    }
+
+    fn staged(r: &Rig) -> Vec<String> {
+        std::fs::read_dir(r.root.join(".tugboat")).map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n.starts_with("drop-")).collect()).unwrap_or_default()
+    }
+
+    #[test]
+    fn a_dropped_folder_becomes_one_zip_in_the_viewed_folder_that_windows_reads_back_exactly() {
+        let mut r = Rig::new();
+        r.core.create_folder("Work", Retention::Keep).unwrap();
+        let folder = trip(&r);
+        let expected = crate::zipdrop::testing::tree(&folder);
+        // None of these may end up in the zip: Windows housekeeping files and a junction out of the folder.
+        std::fs::write(folder.join("desktop.ini"), b"x").unwrap();
+        std::fs::write(folder.join("day 1").join("Thumbs.db"), b"x").unwrap();
+        let outside = src_dir(&r).join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), b"x").unwrap();
+        junction(&folder.join("link"), &outside);
+
+        let work = target_of(&r, "Work");
+        let rep = copy(&r, std::slice::from_ref(&folder), &work);
+        assert_eq!(rep.copied, ["Trip.zip"], "{rep:?}");
+        assert!(rep.refused.is_empty() && rep.failed.is_empty(), "{rep:?}");
+        assert_eq!(rep.folder_name, "Work");
+        let zip = r.root.join("Work").join("Trip.zip");
+        assert!(zip.is_file());
+        assert!(staged(&r).is_empty(), "no temp copy left");
+        assert!(read_zone_mark(&zip).is_none(), "a drag copy gets no downloaded mark");
+
+        let item = r.item("Trip.zip");
+        assert_eq!(item.folder, work.id);
+        assert!(matches!(item.state, ItemState::FolderKeep), "{:?}", item.state);
+        // The watcher does not import it a second time, nor bin it.
+        r.lib.scan(true);
+        r.settle();
+        assert_eq!(r.items().len(), 1);
+        assert_eq!(r.deleted_count(), 0);
+
+        let dest = r._tmp.path().join("unzipped");
+        let diff = crate::zipdrop::testing::extract_with_dotnet(&zip, &dest, &src_dir(&r));
+        assert!(diff <= 2.0, "modified times are kept (DOS 2 s step), off by {diff} s");
+        assert_eq!(crate::zipdrop::testing::tree(&dest.join("Trip")), expected, "every file's bytes and the empty folders, nothing else");
+        assert!(dest.join("Trip").join("empty").is_dir());
+        // The source folder is only read.
+        assert!(folder.join("IMG_1.jpg").exists() && outside.join("secret.txt").exists());
+        let _ = std::fs::remove_dir(folder.join("link"));
+    }
+
+    #[test]
+    fn a_zip_name_that_exists_gets_a_unique_name() {
+        let r = Rig::new();
+        let folder = trip(&r);
+        assert_eq!(copy(&r, std::slice::from_ref(&folder), &inbox(&r)).copied, ["Trip.zip"]);
+        assert_eq!(copy(&r, std::slice::from_ref(&folder), &inbox(&r)).copied, ["Trip (2).zip"]);
+        assert_eq!(files_in(&r.root), ["Trip (2).zip", "Trip.zip"]);
+        assert_eq!(r.items().len(), 2);
+    }
+
+    #[test]
+    fn files_and_folders_in_one_drop_both_go_in_and_progress_counts_the_zip() {
+        let r = Rig::new();
+        let folder = trip(&r);
+        let file = src(&r, "plan.pdf", b"%PDF-1.4 plan");
+        let mut events = Vec::new();
+        let rep = copy_dropped(&r.lib, NativeDrop::from_native(&[file, folder]), &inbox(&r), &mut |p| events.push(p));
+        assert_eq!(rep.copied, ["plan.pdf", "Trip.zip"], "{rep:?}");
+        let zips: Vec<_> = events.iter().filter(|p| p.zip).collect();
+        assert!(zips.iter().all(|p| p.file == "Trip"), "{zips:?}");
+        // The first one is the folder being listed (no size yet), before anything is copied.
+        assert_eq!((zips[0].done_bytes, zips[0].total_bytes), (0, 0), "{zips:?}");
+        let zipping: Vec<_> = zips.iter().filter(|p| p.total_bytes > 0).collect();
+        assert!(!zipping.is_empty(), "the zip reported progress");
+        assert!(zipping.iter().all(|p| p.index == 2 && p.count == 2 && p.total_bytes == 5000 + 5 + 7 && p.done_bytes <= p.total_bytes), "{zips:?}");
+        assert_eq!(zipping.last().unwrap().done_bytes, 5000 + 5 + 7, "the last event is everything read");
+        assert!(events.iter().filter(|p| !p.zip).all(|p| p.file == "plan.pdf" && p.index == 1));
+    }
+
+    #[test]
+    fn a_folder_of_empty_files_still_reports_progress_and_goes_in() {
+        let r = Rig::new();
+        let dir = src_dir(&r).join("Blank");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), b"").unwrap();
+        let mut events = Vec::new();
+        let rep = copy_dropped(&r.lib, NativeDrop::from_native(&[dir]), &inbox(&r), &mut |p| events.push(p));
+        assert_eq!(rep.copied, ["Blank.zip"], "{rep:?}");
+        assert!(events.len() >= 2 && events.iter().all(|p| p.zip && p.file == "Blank" && p.done_bytes == 0), "{events:?}");
+    }
+
+    #[test]
+    fn the_librarys_own_hidden_folder_is_never_zipped_and_cannot_be_dropped() {
+        let r = Rig::new();
+        std::fs::write(r.root.join("keep.txt"), b"visible").unwrap();
+        let rep = copy(&r, std::slice::from_ref(&r.root), &inbox(&r));
+        assert_eq!(rep.copied.len(), 1, "{rep:?}");
+        let zip = r.root.join(&rep.copied[0]);
+        let dest = r._tmp.path().join("lib-unzipped");
+        crate::zipdrop::testing::extract_with_tar(&zip, &dest).unwrap();
+        let names: Vec<String> = crate::zipdrop::testing::tree(&dest).into_iter().map(|(n, _)| n).collect();
+        assert!(names.iter().all(|n| !n.contains(".tugboat")), "{names:?}");
+        assert!(names.iter().any(|n| n.ends_with("/keep.txt")), "{names:?}");
+
+        let rep = copy(&r, &[r.root.join(".tugboat")], &inbox(&r));
+        assert_eq!(rep.refused.len(), 1, "{rep:?}");
+        assert_eq!(rep.refused[0].reason, OWN_TEXT);
+        assert!(staged(&r).is_empty());
+    }
+
+    #[test]
+    fn the_overlay_counts_only_folders_that_will_be_zipped() {
+        let r = Rig::new();
+        let real = trip(&r);
+        let link = src_dir(&r).join("TripLink");
+        junction(&link, &real);
+        let file = src(&r, "a.txt", b"x");
+        let drive = PathBuf::from(format!("{}\\", std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into())));
+        assert_eq!(crate::drop::count_kinds(&[real, link.clone(), drive, file]), (3, 1));
+        let _ = std::fs::remove_dir(&link);
+    }
+
+    #[test]
+    fn a_folder_with_no_files_a_drive_and_a_folder_link_are_refused_and_nothing_is_staged() {
+        let r = Rig::new();
+        let empty = src_dir(&r).join("Nothing");
+        std::fs::create_dir_all(empty.join("inner")).unwrap();
+        let only_ini = src_dir(&r).join("OnlyIni");
+        std::fs::create_dir_all(&only_ini).unwrap();
+        std::fs::write(only_ini.join("desktop.ini"), b"x").unwrap();
+        let rep = copy(&r, &[empty.clone(), only_ini], &inbox(&r));
+        let lines: Vec<_> = rep.refused.iter().map(|l| (l.name.as_str(), l.reason.as_str())).collect();
+        assert_eq!(lines, [("Nothing", EMPTY_TEXT), ("OnlyIni", EMPTY_TEXT)]);
+        assert!(rep.copied.is_empty() && rep.failed.is_empty());
+
+        let drive = PathBuf::from(format!("{}\\", std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into())));
+        let rep = copy(&r, &[drive], &inbox(&r));
+        assert_eq!(rep.refused.len(), 1, "{rep:?}");
+        assert_eq!(rep.refused[0].reason, DRIVES_TEXT);
+
+        let real = trip(&r);
+        let link = src_dir(&r).join("TripLink");
+        junction(&link, &real);
+        let rep = copy(&r, std::slice::from_ref(&link), &inbox(&r));
+        assert_eq!((rep.refused[0].name.as_str(), rep.refused[0].reason.as_str()), ("TripLink", LINK_TEXT), "{rep:?}");
+        let _ = std::fs::remove_dir(&link); // the junction, not its target
+        assert!(real.join("IMG_1.jpg").exists());
+
+        assert!(files_in(&r.root).is_empty() && r.items().is_empty() && staged(&r).is_empty());
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_read_fails_that_folders_zip_and_leaves_nothing_but_other_items_go_in() {
+        let r = Rig::new();
+        let folder = trip(&r);
+        let busy = folder.join("day 1").join("notes.txt");
+        let ok = src(&r, "ok.txt", b"fine");
+        // Another process holding the file with no sharing: reading it fails.
+        let hold = std::fs::OpenOptions::new().read(true).share_mode(0).open(&busy).unwrap();
+        let rep = copy(&r, &[folder, ok], &inbox(&r));
+        drop(hold);
+        assert_eq!(rep.copied, ["ok.txt"], "{rep:?}");
+        assert!(rep.refused.is_empty());
+        assert_eq!(rep.failed.len(), 1, "{rep:?}");
+        assert!(rep.failed[0].reason.starts_with("ZIP FAILED - Trip: day 1/notes.txt "), "{}", rep.failed[0].reason);
+        assert_eq!(files_in(&r.root), ["ok.txt"], "no zip in the library");
+        assert!(staged(&r).is_empty(), "the temp zip is removed");
+        assert_eq!(r.items().len(), 1);
+    }
+
+    #[test]
+    fn refused_names_virtual_drops_and_vanished_files_are_refused_with_a_reason_each() {
+        let r = Rig::new();
+        let ok = src(&r, "ok.txt", b"x");
+        let lnk = src(&r, "shortcut.lnk", b"x");
+        let ini = src(&r, "desktop.ini", b"x");
+        let gone = src_dir(&r).join("gone.txt");
+        let rep = copy(&r, &[lnk, ok, ini, gone], &inbox(&r));
+        assert_eq!(rep.copied, ["ok.txt"]);
+        let names: Vec<_> = rep.refused.iter().map(|l| (l.name.as_str(), l.reason.as_str())).collect();
+        assert!(names.iter().any(|(n, why)| *n == "shortcut.lnk" && why.starts_with("REFUSED")), "{names:?}");
+        assert!(names.iter().any(|(n, why)| *n == "desktop.ini" && why.starts_with("REFUSED")), "{names:?}");
+        assert!(names.iter().any(|(n, why)| *n == "gone.txt" && why.starts_with("NOT FOUND")), "{names:?}");
+        assert_eq!(files_in(&r.root), ["ok.txt"]);
+        // An Outlook attachment or a zip entry has no path: nothing to copy, and it says so.
+        let rep = copy(&r, &[], &inbox(&r));
+        assert_eq!(rep.refused[0].reason, NOTHING_TEXT);
+    }
+
+    /// Unzipping in Explorer gives every file the zip's mark, so a zip of a folder holding a marked file is marked
+    /// (as the single file would be), and an all-unmarked folder gives an unmarked zip.
+    #[test]
+    fn a_zipped_folder_is_marked_when_a_file_in_it_is_and_fails_when_the_drive_cannot_hold_the_mark() {
+        let r = Rig::new();
+        let plain = src_dir(&r).join("Plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        std::fs::write(plain.join("a.txt"), b"a").unwrap();
+        let tools = src_dir(&r).join("Tools");
+        std::fs::create_dir_all(tools.join("sub")).unwrap();
+        std::fs::write(tools.join("a.txt"), b"a").unwrap();
+        std::fs::write(tools.join("sub").join("setup.exe"), b"MZ").unwrap();
+        write_zone_mark(&tools.join("sub").join("setup.exe")).unwrap();
+        let rep = copy(&r, &[plain, tools.clone()], &inbox(&r));
+        assert_eq!(rep.copied, ["Plain.zip", "Tools.zip"], "{rep:?}");
+        assert!(read_zone_mark(&r.root.join("Plain.zip")).is_none(), "nothing marked inside: no mark");
+        assert!(read_zone_mark(&r.root.join("Tools.zip")).is_some(), "a marked file inside marks the zip");
+        assert!(staged(&r).is_empty());
+        // A drive that cannot hold the mark: no zip at all, a line saying why.
+        r.place.fail_marks.store(true, std::sync::atomic::Ordering::SeqCst);
+        let rep = copy(&r, &[tools], &inbox(&r));
+        assert!(rep.copied.is_empty(), "{rep:?}");
+        assert!(rep.failed.len() == 1 && rep.failed[0].reason.starts_with("ZIP FAILED - Tools"), "{rep:?}");
+        assert!(staged(&r).is_empty(), "no temp copy left");
+        assert!(!r.root.join("Tools (2).zip").exists());
+    }
+
+    #[test]
+    fn the_source_is_untouched_a_marked_source_keeps_its_mark_and_an_unmarked_one_gets_none() {
+        let r = Rig::new();
+        let plain = src(&r, "plain.txt", b"plain bytes");
+        let marked = src(&r, "marked.txt", b"marked bytes");
+        write_zone_mark(&marked).unwrap();
+        let old = std::time::SystemTime::now() - Duration::from_secs(86_400 * 30);
+        for f in [&plain, &marked] {
+            std::fs::OpenOptions::new().write(true).open(f).unwrap().set_modified(old).unwrap();
+        }
+        let before: Vec<_> = [&plain, &marked].iter().map(|p| (std::fs::read(p).unwrap(), mtime(p))).collect();
+        let rep = copy(&r, &[plain.clone(), marked.clone()], &inbox(&r));
+        assert_eq!(rep.copied.len(), 2, "{rep:?}");
+        let after: Vec<_> = [&plain, &marked].iter().map(|p| (std::fs::read(p).unwrap(), mtime(p))).collect();
+        assert_eq!(before, after, "the source bytes and mtime did not change");
+        assert!(read_zone_mark(&marked).is_some() && read_zone_mark(&plain).is_none(), "the sources' own marks are as they were");
+        assert!(read_zone_mark(&r.root.join("plain.txt")).is_none(), "a copy the user made gets no mark");
+        assert!(read_zone_mark(&r.root.join("marked.txt")).is_some(), "an existing mark comes along");
+        assert_eq!(mtime(&r.root.join("plain.txt")), old, "the copy keeps the source's modified time");
+    }
+
+    #[test]
+    #[allow(clippy::permissions_set_readonly_false)] // Windows only: this clears the read-only attribute for the temp-dir cleanup
+    fn a_hidden_read_only_source_gives_an_ordinary_copy_that_stays_an_item() {
+        let mut r = Rig::new();
+        let s = src(&r, "secret.txt", b"hidden one");
+        crate::winfs::hide(&s).unwrap();
+        let mut perm = std::fs::metadata(&s).unwrap().permissions();
+        perm.set_readonly(true);
+        std::fs::set_permissions(&s, perm).unwrap();
+        let rep = copy(&r, std::slice::from_ref(&s), &inbox(&r));
+        assert_eq!(rep.copied, ["secret.txt"], "{rep:?}");
+        let meta = std::fs::metadata(r.root.join("secret.txt")).unwrap();
+        assert!(!crate::winfs::is_hidden_or_system(&meta) && !meta.permissions().readonly(), "the copy is an ordinary file");
+        // The scan must see it (a hidden file would be skipped and then counted as missing).
+        r.settle();
+        r.settle();
+        assert_eq!(r.deleted_count(), 0);
+        assert_eq!(r.item("secret.txt").local, LocalFileState::Present);
+        let mut perm = std::fs::metadata(&s).unwrap().permissions();
+        perm.set_readonly(false);
+        std::fs::set_permissions(&s, perm).unwrap();
+    }
+
+    #[test]
+    fn a_big_copy_never_shows_a_partial_file_in_the_library_and_reports_progress() {
+        let r = Rig::new();
+        const SIZE: usize = 96 * 1024 * 1024;
+        let big = src_dir(&r).join("big.mp4");
+        {
+            let mut v = vec![0u8; SIZE];
+            v[4..8].copy_from_slice(b"ftyp");
+            v[8..12].copy_from_slice(b"isom");
+            std::fs::write(&big, &v).unwrap();
+        }
+        let lib = r.lib.clone();
+        let t = inbox(&r);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let ev = events.clone();
+        let paths = vec![big.clone()];
+        let worker = std::thread::spawn(move || copy_dropped(&lib, NativeDrop::from_native(&paths), &t, &mut |p| ev.lock().unwrap().push(p)));
+        let mut saw_tmp = false;
+        while !worker.is_finished() {
+            for e in std::fs::read_dir(&r.root).unwrap().flatten() {
+                let p = e.path();
+                if p.is_file() {
+                    assert_eq!(std::fs::metadata(&p).map(|m| m.len()).unwrap_or(SIZE as u64), SIZE as u64, "a partial file is visible: {}", p.display());
+                }
+            }
+            if let Ok(rd) = std::fs::read_dir(r.root.join(".tugboat")) {
+                saw_tmp |= rd.flatten().any(|e| e.file_name().to_string_lossy().starts_with("drop-"));
+            }
+        }
+        let rep = worker.join().unwrap();
+        assert_eq!(rep.copied, ["big.mp4"], "{rep:?}");
+        assert!(saw_tmp, "the copy was staged in the hidden folder");
+        let ev = events.lock().unwrap();
+        assert!(!ev.is_empty(), "progress was reported");
+        assert!(ev.iter().all(|p| p.index == 1 && p.count == 1 && p.done_bytes <= p.total_bytes && p.total_bytes == SIZE as u64), "{:?}", ev.last());
+        assert_eq!(ev.last().unwrap().done_bytes, SIZE as u64, "the last event is the whole file");
+        assert!(std::fs::read_dir(r.root.join(".tugboat")).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().starts_with("drop-")), "no temp copy left");
+    }
+
+    #[test]
+    fn a_missing_or_paused_library_takes_nothing() {
+        let mut r = Rig::new();
+        let f = src(&r, "a.txt", b"x");
+        // Paused: more than ten percent of the files gone.
+        let mut strict = Rig::strict();
+        fill(&mut strict, 25);
+        for i in 0..25 {
+            std::fs::remove_file(strict.root.join(format!("p{i:02}.jpg"))).unwrap();
+        }
+        strict.scan(1);
+        let f2 = src(&strict, "b.txt", b"x");
+        let rep = copy(&strict, &[f2], &inbox(&strict));
+        assert!(rep.copied.is_empty());
+        assert_eq!(rep.refused[0].reason, "PAUSED - nothing copied");
+        // Missing: the folder is gone.
+        let away = r.root.with_file_name("lib-away");
+        std::fs::rename(&r.root, &away).unwrap();
+        let rep = copy(&r, std::slice::from_ref(&f), &inbox(&r));
+        assert!(rep.copied.is_empty());
+        assert_eq!(rep.refused[0].reason, "LIBRARY NOT FOUND - nothing copied");
+        assert!(f.exists());
+        std::fs::rename(&away, &r.root).unwrap();
+        r.settle();
+        assert_eq!(copy(&r, &[f], &inbox(&r)).copied, ["a.txt"], "and it works again once the library is back");
+    }
+
+    #[test]
+    fn a_failed_add_removes_the_copy_and_lists_the_file_as_failed() {
+        let r = Rig::new();
+        let fake = src(&r, "fake.jpg", b"MZ this is a program, not a photo");
+        let rep = copy(&r, &[fake], &inbox(&r));
+        assert!(rep.copied.is_empty(), "{rep:?}");
+        assert_eq!(rep.failed.len(), 1, "{rep:?}");
+        assert!(rep.failed[0].reason.starts_with("COPY FAILED"), "{:?}", rep.failed);
+        assert!(files_in(&r.root).is_empty(), "the copy was removed again: nothing the next scan could adopt");
+        assert!(std::fs::read_dir(r.root.join(".tugboat")).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().starts_with("drop-")));
+        assert!(r.items().is_empty());
+    }
+
+    #[test]
+    fn unfinished_copies_left_by_a_quit_are_removed_at_start_and_nothing_else_is() {
+        let r = Rig::new();
+        let hidden = r.root.join(".tugboat");
+        std::fs::write(hidden.join("drop-0123.tmp"), b"half").unwrap();
+        std::fs::write(hidden.join("DROP-ABCD.TMP"), b"half").unwrap();
+        std::fs::write(hidden.join("0123.part"), b"a download").unwrap();
+        assert_eq!(clean_stale(&r.root), 2);
+        assert!(hidden.join("0123.part").exists() && hidden.join("library-id").exists());
+        assert_eq!(clean_stale(&r.root), 0);
+    }
+
+    #[test]
+    fn a_drop_during_a_scan_makes_exactly_one_item() {
+        let r = Rig::new();
+        let lib = r.lib.clone();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = stop.clone();
+        let scanner = std::thread::spawn(move || {
+            let mut now = Instant::now();
+            while !flag.load(std::sync::atomic::Ordering::SeqCst) {
+                now += Duration::from_secs(3);
+                lib.scan_at(false, now);
+            }
+        });
+        for i in 0..8 {
+            let rep = copy(&r, &[src(&r, &format!("f{i}.txt"), format!("file {i}").as_bytes())], &inbox(&r));
+            assert_eq!(rep.copied.len(), 1, "{rep:?}");
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        scanner.join().unwrap();
+        assert_eq!(r.items().len(), 8, "one item per file, none twice: {:?}", r.items().iter().map(|i| &i.name).collect::<Vec<_>>());
+        assert_eq!(r.deleted_count(), 0);
+    }
+
+    #[test]
+    fn a_source_inside_the_library_is_copied_under_a_new_name_and_left_alone() {
+        let mut r = Rig::new();
+        let own = r.root.join("a.txt");
+        std::fs::write(&own, b"mine").unwrap();
+        let rep = copy(&r, std::slice::from_ref(&own), &inbox(&r));
+        assert_eq!(rep.copied, ["a (2).txt"], "{rep:?}");
+        assert_eq!(std::fs::read(&own).unwrap(), b"mine");
+        r.settle();
+        r.settle();
+        assert_eq!(r.items().len(), 2, "the original is imported by the scan, the copy by the drop");
+    }
+
+    #[test]
+    fn expiry_runs_from_the_copy_not_from_the_sources_age() {
+        let r = Rig::new();
+        let old = src(&r, "old.txt", b"two years old");
+        std::fs::OpenOptions::new().write(true).open(&old).unwrap().set_modified(std::time::SystemTime::now() - Duration::from_secs(86_400 * 730)).unwrap();
+        assert_eq!(copy(&r, &[old], &inbox(&r)).copied, ["old.txt"]);
+        let it = r.item("old.txt");
+        assert!(matches!(it.state, ItemState::Live { .. }), "a year-old source is not already expired: {:?}", it.state);
+        assert!(r.bin().is_empty());
+    }
+
+    /// The "no path from the page" guarantee: the window's own event is the only source of copy paths.
+    #[test]
+    fn only_the_shell_and_the_drop_module_build_a_native_drop() {
+        for (name, text) in [
+            ("commands.rs", include_str!("../commands.rs")),
+            ("backend.rs", include_str!("../backend.rs")),
+            ("lib.rs", include_str!("../lib.rs")),
+            ("library/mod.rs", include_str!("mod.rs")),
+            ("library/reconcile.rs", include_str!("reconcile.rs")),
+            ("library/placement.rs", include_str!("placement.rs")),
+            ("library/worker.rs", include_str!("worker.rs")),
+        ] {
+            assert!(!text.contains("from_native("), "{name} builds a NativeDrop");
+        }
+        assert!(include_str!("../shell.rs").contains("NativeDrop::from_native(paths)"));
+    }
 }

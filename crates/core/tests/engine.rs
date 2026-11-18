@@ -1,5 +1,5 @@
 //! Protocol-level tests: two `Session`s pumped against each other over in-memory message queues
-//! and real SQLite files, no network. Fast and deterministic. Design ids S19, S20 plus the
+//! and real SQLite files, no network. Fast and deterministic. Scenarios S19, S20 plus the
 //! sync rules in engine.rs (cursor, snapshot restart, digest comparability, bad records).
 
 use std::collections::VecDeque;
@@ -241,7 +241,7 @@ fn a_message_before_hello_is_a_protocol_error() {
 #[test]
 fn version_mismatch_is_refused_on_both_sides_without_exchanging_records() {
     let (mut phone, mut pc) = pair_up();
-    phone.sess.proto = 2;
+    phone.sess.proto = 3;
     phone.folder("secret");
     let hello = phone.sess.hello(&phone.db.conn).unwrap();
     let step = pc.sess.handle(&mut pc.db.conn, hello, T0).unwrap();
