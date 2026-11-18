@@ -92,6 +92,8 @@ pub(crate) struct Inner {
     pub pairing: Mutex<Option<pair::PairState>>,
     pub proto: AtomicU32,
     pub retry_base_ms: AtomicU64,
+    /// Test hook: extra delay before the PC saves a confirmed pairing (0 in the apps).
+    pub pair_save_delay_ms: AtomicU64,
     pub generation: AtomicU64,
     /// Bytes of downloads that continued from an existing part file (tests assert on it).
     pub resumed_bytes: AtomicU64,
@@ -142,6 +144,7 @@ impl Core {
                 pairing: Mutex::new(None),
                 proto: AtomicU32::new(wire::PROTO),
                 retry_base_ms: AtomicU64::new(2000),
+                pair_save_delay_ms: AtomicU64::new(0),
                 generation: AtomicU64::new(0),
                 resumed_bytes: AtomicU64::new(0),
                 notice_running: std::sync::atomic::AtomicBool::new(false),
@@ -220,6 +223,12 @@ impl Core {
     #[doc(hidden)]
     pub fn debug_set_retry_base_ms(&self, ms: u64) {
         self.inner.retry_base_ms.store(ms.max(1), Ordering::SeqCst);
+    }
+
+    /// Test hook: make the PC slow to save a confirmed pairing (a busy disk or CPU).
+    #[doc(hidden)]
+    pub fn debug_set_pairing_save_delay_ms(&self, ms: u64) {
+        self.inner.pair_save_delay_ms.store(ms, Ordering::SeqCst);
     }
 
     /// Test hook: total bytes that downloads resumed from an existing part file.

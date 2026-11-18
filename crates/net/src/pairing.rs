@@ -51,6 +51,9 @@ pub const CODE_CONTEXT: &str = "localtugboat 2026-11-17 pairing code v1";
 const MAX_PAIR_FRAME: u32 = 4096;
 /// Waiting for the decision to reach the phone before the PC closes the connection.
 const DELIVERY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Phone, after Accepted: waiting for the PC to close the pairing connection, which it does once
+/// it has saved the pairing (the PC waits up to 10 s for that save).
+const CLOSE_WAIT: Duration = Duration::from_secs(12);
 
 const PAYLOAD_PREFIX: &str = "localtugboat://pair?";
 
@@ -594,15 +597,16 @@ impl PhonePairing {
     /// Step 2b, after `read_decision`: let the PC see the decision arrived, then leave. Accepted
     /// -> Ok(pc_name, cleaned). Refused -> Err(NetError::Pairing(reason)). Once the decision is
     /// read the PC may already have completed its side, so a caller must not abandon this step
-    /// (it takes up to DELIVERY_TIMEOUT + 2 s) before it stores the pairing.
+    /// (it takes up to DELIVERY_TIMEOUT + CLOSE_WAIT) before it stores the pairing.
     pub async fn finish(self, decision: PairDecision) -> Result<String, NetError> {
         let mut this = self;
         // Read the stream to its end before leaving: that is what tells the PC the decision
         // arrived. Closing first would make a delivered decision look undelivered on the PC.
         let mut one = [0u8; 1];
         let _ = tokio::time::timeout(DELIVERY_TIMEOUT, this.rx.read(&mut one)).await;
-        // The PC closes after it sees the delivery; give it a moment, then leave ourselves.
-        let _ = tokio::time::timeout(Duration::from_secs(2), this.conn.conn.closed()).await;
+        // The PC closes once it has saved the pairing. Wait for that: a sync dial made earlier is
+        // refused as "not paired". If the PC never closes, leave after CLOSE_WAIT.
+        let _ = tokio::time::timeout(CLOSE_WAIT, this.conn.conn.closed()).await;
         this.conn.close(close::NORMAL, "pairing finished");
         match decision {
             PairDecision::Accepted { pc_name } => Ok(clean_name(&pc_name, "PC")),

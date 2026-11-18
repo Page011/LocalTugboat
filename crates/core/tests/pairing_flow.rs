@@ -452,3 +452,24 @@ async fn s21_fake_phone_pairs_sends_and_lists() {
     assert!(text.contains("3 items"), "{text}");
     pc.stop().await;
 }
+
+// A PC that is slow to save the pairing (2 s, a busy disk or CPU): the phone must not make its
+// first sync dial before the save, or the PC refuses it as "not paired" and the phone unpairs
+// itself a moment after pairing (seen on a loaded CI runner).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slow_pairing_save_on_the_pc_still_ends_paired_on_both() {
+    let r = Rig::unconnected();
+    r.pc.start().await;
+    r.phone.start().await;
+    r.pc.core.debug_set_pairing_save_delay_ms(2000);
+    let payload = r.pc.core.begin_pairing(false).unwrap();
+    let phone = r.phone.core.clone();
+    let task = tokio::spawn(async move { phone.pair_with(&payload).await });
+    until("codes", 10, || r.pc.code().is_some() && r.phone.code().is_some()).await;
+    r.pc.core.confirm_pairing(true).await.unwrap();
+    task.await.unwrap().unwrap();
+    r.settle().await;
+    assert!(r.phone.core.paired_device().unwrap().is_some(), "the phone is still paired");
+    assert!(r.pc.core.paired_device().unwrap().is_some(), "the PC is still paired");
+    r.shutdown().await;
+}
