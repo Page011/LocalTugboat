@@ -362,4 +362,21 @@ class UiLogicTest {
         assertEquals(listOf(1u, 3u, 7u, 14u, 30u), UiLogic.binChoices(7u))
         assertEquals(listOf(1u, 3u, 7u, 10u, 14u, 30u), UiLogic.binChoices(10u))
     }
+
+    // ---- R3: a deleted folder is never handed to the core by a cached target ----
+
+    @Test fun a_cached_target_whose_folder_was_deleted_is_not_used() {
+        assertNull(UiLogic.shotFolder(null, ids, "gone", null)) // automatic, target cached for automatic, folder deleted since
+        assertNull(UiLogic.shotFolder("gone", ids, "gone", "gone")) // deleted pick, target cached for that pick, also deleted
+    }
+
+    // ---- R4: the full-size photo is decoded again when the held file's content changes ----
+
+    @Test fun the_photo_decode_key_follows_path_size_and_thumbnail() {
+        val base = UiLogic.photoDecodeKey("items/a.jpg", 100uL, "thumbs/h1.jpg")
+        assertEquals(base, UiLogic.photoDecodeKey("items/a.jpg", 100uL, "thumbs/h1.jpg"))
+        assertFalse(base == UiLogic.photoDecodeKey("items/a.jpg", 101uL, "thumbs/h1.jpg")) // edited, size changed
+        assertFalse(base == UiLogic.photoDecodeKey("items/a.jpg", 100uL, "thumbs/h2.jpg")) // edited, same size, new thumbnail
+        assertFalse(base == UiLogic.photoDecodeKey("items/b.jpg", 100uL, "thumbs/h1.jpg"))
+    }
 }

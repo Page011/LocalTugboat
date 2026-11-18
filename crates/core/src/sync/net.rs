@@ -776,7 +776,9 @@ async fn drive(core: &Core, conn: &Arc<PeerConn>, dialer: bool, mut cmd_rx: mpsc
 async fn apply_step(core: &Core, conn: &Arc<PeerConn>, sess: &Session, tx: &mut SendStream, step: Step, now: i64, refused: &mut Option<String>) -> Flow {
     let peer = sess.peer;
     if step.unpair {
-        // A failure is already shown by unpair_local; the pairing stays until a retry works.
+        // A failure is already shown by unpair_local. A phone retries on its next dial (this PC
+        // answers NOT_PAIRED); a PC keeps the pairing until the user unpairs it there (an
+        // app-level acknowledgement to the phone would need a wire change).
         let _ = unpair_local(core, peer);
     }
     if let Some(text) = &step.refused {
@@ -963,7 +965,9 @@ fn pick_into(
                 if f.in_flight.contains(&id) || f.backoff.get(&id).is_some_and(|b| b.1 > t) {
                     continue;
                 }
-                if f.lost_tried.get(&id).is_some_and(|next| *next > t) {
+                // The retry deadline belongs to Lost items only: a Pending item (restored from the
+                // Bin, or new content) that still carries one is downloaded at once.
+                if state == LocalFileState::Lost && f.lost_tried.get(&id).is_some_and(|next| *next > t) {
                     continue;
                 }
                 let Some((rec, lfs)) = crate::store::get_item(c, id)? else { continue };
@@ -1015,10 +1019,23 @@ fn schedule(core: &Core, conn: &Arc<PeerConn>, peer: DeviceId, f: &mut Fetcher, 
         let guard = HashGuard { core: core.clone(), hash };
         let (core, conn, tx) = (core.clone(), conn.clone(), done_tx.clone());
         tokio::spawn(async move {
-            let outcome = fetch_item(&core, &conn, peer, id).await;
+            let outcome = fetch_item(&core, &conn, peer, id, hash).await;
             let _ = tx.send(FetchDone { id, outcome });
             drop(guard);
         });
+    }
+}
+
+/// The record a download task works on, or None (Dropped) when the item is no longer Pending or
+/// Lost, or its content is no longer the hash the scheduler claimed. The claim covers `claimed`
+/// only: downloading another hash would write a `.part` no claim protects. Dropping frees the
+/// claim and the item is picked again under its current hash.
+fn load_for_fetch(core: &Core, id: ItemId, claimed: BlobHash) -> Result<Option<(ItemRecord, Settings)>> {
+    let db = lock(&core.inner.db);
+    match (crate::store::get_item(&db.conn, id), crate::store::load_settings(&db.conn)) {
+        (Ok(Some((rec, LocalFileState::Pending | LocalFileState::Lost))), Ok(s)) if rec.content.val.hash == claimed => Ok(Some((rec, s))),
+        (Ok(_), Ok(_)) => Ok(None),
+        (Err(e), _) | (_, Err(e)) => Err(e),
     }
 }
 
@@ -1027,16 +1044,9 @@ fn retry(e: &NetError, conn: &PeerConn) -> FetchOutcome {
 }
 
 /// S9 / S10: thumbnail first (best effort), then the file, then verify type, commit, receipt.
-async fn fetch_item(core: &Core, conn: &Arc<PeerConn>, peer: DeviceId, id: ItemId) -> FetchOutcome {
+async fn fetch_item(core: &Core, conn: &Arc<PeerConn>, peer: DeviceId, id: ItemId, claimed: BlobHash) -> FetchOutcome {
     let inner = &core.inner;
-    let loaded = {
-        let db = lock(&inner.db);
-        match (crate::store::get_item(&db.conn, id), crate::store::load_settings(&db.conn)) {
-            (Ok(Some((rec, LocalFileState::Pending | LocalFileState::Lost))), Ok(s)) => Ok(Some((rec, s))),
-            (Ok(_), Ok(_)) => Ok(None),
-            (Err(e), _) | (_, Err(e)) => Err(e),
-        }
-    };
+    let loaded = load_for_fetch(core, id, claimed);
     let (rec, settings) = match loaded {
         Ok(Some(x)) => x,
         Ok(None) => return FetchOutcome::Dropped,
@@ -1230,6 +1240,52 @@ mod tests {
         let got = pick(&core, &f, 2);
         assert_eq!(got.iter().map(|g| g.0).collect::<Vec<_>>(), vec![items[500].0, items[501].0]);
         assert!(got.iter().all(|g| g.2), "Lost picks are marked so they are not asked in a loop");
+    }
+
+    // Round 2, R13: a Lost item asked for earlier keeps its retry deadline. When it turns Pending
+    // (restored from the Bin, new content) the deadline must not hold its download back.
+    #[tokio::test]
+    async fn a_pending_item_with_a_stale_lost_deadline_is_picked_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = open_core(dir.path());
+        let items = add_items(&core, 2, LocalFileState::Pending);
+        let mut f = Fetcher::default();
+        f.lost_tried.insert(items[0].0, Instant::now() + Duration::from_secs(3600));
+        let got = pick(&core, &f, 2);
+        assert_eq!(got.iter().map(|g| g.0).collect::<Vec<_>>(), vec![items[0].0, items[1].0]);
+        assert!(got.iter().all(|g| !g.2), "Pending picks are not marked Lost");
+    }
+
+    // Round 2, R14: the task works on the hash the scheduler claimed. The pick hands out the claimed
+    // hash; a record whose content changed (or that is no longer Pending/Lost) between the pick and
+    // the load is dropped (the claim is freed, the item is picked again under its new hash), never
+    // downloaded under the old claim.
+    #[tokio::test]
+    async fn a_record_changed_after_the_pick_is_not_downloaded_under_the_old_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = open_core(dir.path());
+        let items = add_items(&core, 1, LocalFileState::Pending);
+        let id = items[0].0;
+        let picked = pick(&core, &Fetcher::default(), 1);
+        assert_eq!(picked.len(), 1);
+        let (pid, claimed, _) = picked[0];
+        assert_eq!((pid, claimed), items[0], "the pick hands out the hash it claimed");
+        assert!(lock(&core.inner.fetching).contains(&claimed));
+        assert!(load_for_fetch(&core, id, claimed).unwrap().is_some(), "the claimed hash loads");
+
+        // The content changes after the pick: the old claim no longer matches.
+        core.debug_conn(|c| {
+            let (mut rec, _) = store::get_item(c, id).unwrap().unwrap();
+            rec.content.val.hash.0[31] ^= 0xff;
+            store::update_item(c, &rec).unwrap();
+        });
+        assert!(load_for_fetch(&core, id, claimed).unwrap().is_none(), "the old claim is dropped");
+        let fresh = core.debug_conn(|c| store::get_item(c, id).unwrap().unwrap().0.content.val.hash);
+        assert!(load_for_fetch(&core, id, fresh).unwrap().is_some(), "the item loads under its current hash");
+
+        // No longer Pending or Lost (already present): nothing to download.
+        core.debug_conn(|c| store::set_local_state(c, id, LocalFileState::Present, T0).unwrap());
+        assert!(load_for_fetch(&core, id, fresh).unwrap().is_none(), "a present item is dropped");
     }
 
     // Review finding 11: a hash still held by a download task (of an earlier session) is not

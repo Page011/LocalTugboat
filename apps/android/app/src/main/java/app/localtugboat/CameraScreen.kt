@@ -288,6 +288,8 @@ fun CameraScreen(vm: SnapViewModel, ui: UiState, banners: List<UiLogic.BannerUi>
         val fix = tracker.current()
         val geo = geoNow()
         val at = System.currentTimeMillis()
+        // Before the camera writes the file: a process death after that leaves a shot recover() can still route and date.
+        ShotMeta.write(ctx, file, ShotMeta(folderId, at, geo))
         shutterFlash = true
         haptic.performHapticFeedback(HapticFeedbackType.LongPress)
         Capture.shotTaken(ctx)
@@ -295,6 +297,7 @@ fun CameraScreen(vm: SnapViewModel, ui: UiState, banners: List<UiLogic.BannerUi>
             override fun onImageSaved(r: ImageCapture.OutputFileResults) = handOff(vm, ctx, file, folderId, at, geo, fix, false)
             override fun onError(e: ImageCaptureException) {
                 file.delete()
+                ShotMeta.delete(ctx, file)
                 ctx.core.reportError("photo: ${e.message}")
                 vm.say("Photo failed: ${e.message}")
             }
@@ -313,6 +316,7 @@ fun CameraScreen(vm: SnapViewModel, ui: UiState, banners: List<UiLogic.BannerUi>
         val fix = tracker.current()
         val geo = geoNow()
         val at = System.currentTimeMillis()
+        ShotMeta.write(ctx, file, ShotMeta(folderId, at, geo)) // before recording starts: a killed process leaves a file recover() can route
         var pending = vc.output.prepareRecording(ctx, FileOutputOptions.Builder(file).build())
         if (ContextCompat.checkSelfPermission(ctx, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) pending = pending.withAudioEnabled()
         haptic.performHapticFeedback(HapticFeedbackType.LongPress)
@@ -328,7 +332,10 @@ fun CameraScreen(vm: SnapViewModel, ui: UiState, banners: List<UiLogic.BannerUi>
                         ctx.core.reportError("video: error ${ev.error} ${ev.cause?.message.orEmpty()}")
                         vm.say("Video stopped: ${videoErrorText(ev.error)}")
                     }
-                    if (file.length() > 0) handOff(vm, ctx, file, folderId, at, geo, fix, true) else file.delete()
+                    if (file.length() > 0) handOff(vm, ctx, file, folderId, at, geo, fix, true) else {
+                        file.delete()
+                        ShotMeta.delete(ctx, file)
+                    }
                 }
                 else -> {}
             }

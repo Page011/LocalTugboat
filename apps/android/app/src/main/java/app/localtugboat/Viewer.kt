@@ -215,7 +215,7 @@ private fun PhotoPage(item: ItemInfo, path: String, onZoomed: (Boolean) -> Unit)
     val ctx = LocalContext.current
     // Full-size decode off the main thread, capped so a 50 MP photo never exhausts memory. A file that cannot be
     // decoded (or runs out of memory) ends in Failed, never in a spinner that never stops or a crash.
-    val state by produceState<PhotoState>(PhotoState.Loading, path) {
+    val state by produceState<PhotoState>(PhotoState.Loading, UiLogic.photoDecodeKey(path, item.size, item.thumbPath)) {
         value = withContext(Dispatchers.IO) {
             try {
                 Thumbs.imageBitmap(File(path), 2048)?.let { PhotoState.Ready(it.asImageBitmap()) } ?: PhotoState.Failed

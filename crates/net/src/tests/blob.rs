@@ -80,13 +80,20 @@ async fn n11_resume_after_a_cut_connection() {
     let parts = dir.path().join("parts");
     let part = parts.join(format!("{hash}.part"));
 
-    // First attempt: the sender delivers 2 MB, waits for them to arrive, then the PC's
+    // First attempt: the sender delivers 2 MB, the test waits for them to arrive, then the PC's
     // connection is closed under the transfer (a Wi-Fi drop looks the same to the receiver).
     let sender = {
-        let (conn, src) = (l.a_conn.clone(), src.clone());
+        let (conn, src, part) = (l.a_conn.clone(), src.clone(), part.clone());
         tokio::spawn(async move {
             let held = tokio::spawn(scripted_sender(conn.clone(), src, 20 * MB, 2 * MB as usize, &[], false));
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            // Cut only once every byte the sender writes is in the part file (which also means the
+            // sender's write_all has returned): a readiness wait, not a guess at how long that takes.
+            bounded(30, async {
+                while std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0) < 2 * MB {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
             conn.close(0, "test cut");
             held.await.unwrap()
         })

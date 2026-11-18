@@ -204,13 +204,21 @@ object UiLogic {
     /**
      * Folder id for a shot at the moment of the shutter, or null = decide at hand-off (place rule). The chip's
      * [targetFolderId] is recomputed off the main thread after a pick, so it only counts when it was computed for
-     * the pick that is live now ([targetPick]). A live pick that still exists always wins.
+     * the pick that is live now ([targetPick]) and the folder is still there (it may have just been deleted).
+     * A live pick that still exists always wins.
      */
     fun shotFolder(pick: String?, folderIds: Collection<String>, targetFolderId: String?, targetPick: String?): String? = when {
         pick != null && pick in folderIds -> pick
-        targetFolderId != null && targetPick == pick -> targetFolderId
+        targetFolderId != null && targetPick == pick && targetFolderId in folderIds -> targetFolderId
         else -> null
     }
+
+    /**
+     * What a decoded full-size photo depends on. A held file keeps its path when its content changes (a new
+     * version replaces it in place), so size and the hash-named thumbnail path stand in for a content revision.
+     * Moves, pins and state changes leave all three alone, so they never re-decode.
+     */
+    fun photoDecodeKey(path: String, size: ULong, thumbPath: String?): List<Any?> = listOf(path, size, thumbPath)
 
     /** Saved-state keys of viewer screens that were seen but are no longer anywhere on the stack: their state is dropped. */
     fun droppedViewerKeys(seen: Set<Route>, current: List<Route>): Set<String> =

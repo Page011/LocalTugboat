@@ -186,6 +186,22 @@ pub(super) fn check_new_library(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Delete `src` only while it is still what was copied: same length and, within the 2 s a FAT
+/// volume rounds to, same last-write time (the copy keeps the source's time). A file another
+/// program edited while a big library copied is kept, and shows as an old file not deleted.
+/// Any metadata or delete error also keeps it. True = the source is gone.
+pub(super) fn remove_if_unchanged(src: &Path, copy: &Path) -> bool {
+    const SLACK: Duration = Duration::from_secs(2);
+    let (Ok(a), Ok(b)) = (std::fs::metadata(src), std::fs::metadata(copy)) else {
+        return false;
+    };
+    let (Ok(x), Ok(y)) = (a.modified(), b.modified()) else {
+        return false;
+    };
+    let gap = x.max(y).duration_since(x.min(y)).unwrap_or_default();
+    a.len() == b.len() && gap <= SLACK && std::fs::remove_file(src).is_ok()
+}
+
 pub(super) fn build_status(st: &State) -> LibraryStatus {
     let path = st.cfg.path.as_ref().map(|p| p.display().to_string());
     let (health, message) = match (&st.cfg.path, &st.pause) {
@@ -1112,15 +1128,28 @@ impl Inner {
                 for h in fresh {
                     let rel = Path::new(&h.path).strip_prefix(old).map(Path::to_path_buf).unwrap_or_default();
                     let dest = path.join(&rel);
-                    let r = dest
+                    // Reserve the place first: create_new fails on ANY existing entry, hidden
+                    // ones included (check_new_library skips those). The copy then lands on a
+                    // file this attempt made, so no clean-up below can touch a user's file.
+                    let reserved = dest
                         .parent()
                         .map(std::fs::create_dir_all)
                         .transpose()
-                        .and_then(|_| std::fs::copy(&h.path, &dest))
-                        .and_then(|n| if n == h.size { Ok(()) } else { Err(std::io::Error::other("copy is shorter than the original")) });
+                        .and_then(|_| std::fs::OpenOptions::new().write(true).create_new(true).open(&dest).map(drop));
+                    if let Err(e) = reserved {
+                        discard(&items);
+                        clean(&dest, false);
+                        let why = if e.kind() == std::io::ErrorKind::AlreadyExists { "already exists in the new folder".to_string() } else { e.to_string() };
+                        return Err(CmdError::new("io", format!("MOVE FAILED - {}: {why}", h.name)));
+                    }
+                    let r = std::fs::copy(&h.path, &dest).and_then(|n| if n == h.size { Ok(()) } else { Err(std::io::Error::other("copy is shorter than the original")) });
                     match r {
                         Ok(()) => items.push((h, dest, true)),
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !Path::new(&h.path).exists() => items.push((h, dest, false)),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !Path::new(&h.path).exists() => {
+                            // Nothing to copy: give the reserved empty file back.
+                            let _ = std::fs::remove_file(&dest);
+                            items.push((h, dest, false));
+                        }
                         Err(e) => {
                             // This item's own partial copy (a short or failed one) is not in
                             // `items`, so it is cleaned here.
@@ -1177,7 +1206,12 @@ impl Inner {
         st.pause_reason = None;
         self.core.set_paused(None);
         // The old files go last; failures are reported, never fatal (the new copies are live).
-        st.leftovers = items.iter().filter(|(_, _, copied)| *copied).map(|(h, _, _)| PathBuf::from(&h.path)).filter(|p| std::fs::remove_file(p).is_err()).collect();
+        st.leftovers = items
+            .iter()
+            .filter(|(_, _, copied)| *copied)
+            .filter(|(h, dest, _)| !remove_if_unchanged(Path::new(&h.path), dest))
+            .map(|(h, _, _)| PathBuf::from(&h.path))
+            .collect();
         st.last_error = leftover_message(st);
         self.publish(st);
         Ok(())

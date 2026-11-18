@@ -86,4 +86,43 @@ class ReviewFixesTest {
         assertTrue(ShareRuns.interrupted("token-from-a-dead-process"))
         assertFalse(ShareRuns.interrupted(null)) // nothing was started
     }
+
+    // ---- R1: meta is written at the shutter, orphans are swept ----
+
+    @Test fun sweep_removes_an_old_orphan_meta_and_keeps_the_rest() {
+        val dir = Files.createTempDirectory("shots").toFile()
+        try {
+            val meta = File(dir, "meta").apply { mkdirs() }
+            val now = 10_000_000L
+            fun meta(name: String, ageMs: Long) = File(meta, "$name.properties").apply {
+                writeText(ShotMeta("inbox", 1L, null).encode())
+                setLastModified(now - ageMs)
+            }
+            val orphanOld = meta("IMG_old.jpg", 120_000)
+            val orphanFresh = meta("IMG_fresh.jpg", 5_000)
+            val withShot = meta("IMG_have.jpg", 120_000)
+            File(dir, "IMG_have.jpg").writeText("x")
+            assertEquals(1, Capture.sweepOrphanMetas(dir, now, 60_000))
+            assertFalse(orphanOld.exists())
+            assertTrue(orphanFresh.exists()) // the camera may still be writing its shot
+            assertTrue(withShot.exists()) // its shot is there for recover()
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test fun a_camerax_temp_file_is_not_a_shot() {
+        assertTrue(Capture.isCameraTemp("CameraX1234567890.tmp"))
+        assertFalse(Capture.isCameraTemp("IMG_20261118_101500_000.jpg"))
+        assertFalse(Capture.isCameraTemp("VID_20261118_101500_000.mp4"))
+    }
+
+    @Test fun sweep_with_no_meta_folder_is_a_no_op() {
+        val dir = Files.createTempDirectory("shots").toFile()
+        try {
+            assertEquals(0, Capture.sweepOrphanMetas(dir, 1L, 0L))
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
 }

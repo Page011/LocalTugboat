@@ -7,10 +7,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Mutex, Once,
-    },
+    sync::{Arc, Mutex, Once},
 };
 
 use tracing_subscriber::fmt::MakeWriter;
@@ -86,36 +83,44 @@ type Report = Arc<dyn Fn(String) + Send + Sync>;
 struct Sink {
     log: Option<RotatingLog>,
     report: Report,
+    /// A write failure was already reported for this sink. Per sink, not global: `init` makes a
+    /// fresh sink, so it starts false and no other sink's state can change it.
+    failed: bool,
 }
 
 static SINK: Mutex<Option<Sink>> = Mutex::new(None);
 static INSTALLED: Once = Once::new();
-static WRITE_FAILED: AtomicBool = AtomicBool::new(false);
+
+/// Write one line to the sink in `slot`. The first failure is reported through the sink's callback.
+fn write_to(slot: &Mutex<Option<Sink>>, buf: &[u8]) {
+    // The failure text and, for the first failure only, the callback to report it with.
+    let mut failure: Option<(String, Report)> = None;
+    {
+        let mut g = slot.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(sink) = g.as_mut() {
+            if let Some(log) = sink.log.as_mut() {
+                if let Err(e) = log.write_all(buf) {
+                    // Only the first failure is reported, so a full disk is not an error storm.
+                    if !sink.failed {
+                        sink.failed = true;
+                        failure = Some((format!("log write failed: {e}"), sink.report.clone()));
+                    }
+                }
+            }
+        }
+    }
+    // Report with the lock released: the callback may log, and that log write takes the lock.
+    if let Some((text, report)) = failure {
+        report(text);
+    }
+}
 
 #[derive(Clone, Copy)]
 struct SinkWriter;
 
 impl Write for SinkWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        // The failure text and, for the first failure only, the callback to report it with.
-        let mut failure: Option<(String, Report)> = None;
-        {
-            let mut g = SINK.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(sink) = g.as_mut() {
-                if let Some(log) = sink.log.as_mut() {
-                    if let Err(e) = log.write_all(buf) {
-                        // Only the first failure is reported, so a full disk is not an error storm.
-                        if !WRITE_FAILED.swap(true, Ordering::Relaxed) {
-                            failure = Some((format!("log write failed: {e}"), sink.report.clone()));
-                        }
-                    }
-                }
-            }
-        }
-        // Report with the lock released: the callback may log, and that log write takes the lock.
-        if let Some((text, report)) = failure {
-            report(text);
-        }
+        write_to(&SINK, buf);
         Ok(buf.len())
     }
 
@@ -142,8 +147,7 @@ pub fn init(data_dir: &Path, report: Report) -> Result<PathBuf, (PathBuf, io::Er
         Ok(l) => (Some(l), None),
         Err(e) => (None, Some(e)),
     };
-    WRITE_FAILED.store(false, Ordering::Relaxed);
-    *SINK.lock().unwrap_or_else(|e| e.into_inner()) = Some(Sink { log, report });
+    *SINK.lock().unwrap_or_else(|e| e.into_inner()) = Some(Sink { log, report, failed: false });
     INSTALLED.call_once(|| {
         let filter = "warn,tugboat_ffi=info,tugboat_core=info,tugboat_net=info";
         // try_init: another subscriber (a test harness) already installed is not an error here.
@@ -185,32 +189,30 @@ mod tests {
     }
 
     /// The failure callback may log (the app's listener logs when it throws). That nested write must
-    /// not wait for a lock the first write still holds: it used to deadlock.
+    /// not wait for a lock the first write still holds: it used to deadlock. The test owns its sink
+    /// (`SLOT`), so other tests that call `init` (every core open) cannot swap it mid-test.
     #[test]
     fn a_log_failure_report_that_logs_again_does_not_deadlock() {
+        static SLOT: Mutex<Option<Sink>> = Mutex::new(None);
         let dir = tempfile::tempdir().unwrap();
         let broken = RotatingLog { path: dir.path().join("tugboat.log"), file: None, size: 0, max: 100 };
         let reports = Arc::new(Mutex::new(Vec::<String>::new()));
         let seen = reports.clone();
-        WRITE_FAILED.store(false, Ordering::Relaxed);
-        *SINK.lock().unwrap_or_else(|e| e.into_inner()) = Some(Sink {
+        *SLOT.lock().unwrap_or_else(|e| e.into_inner()) = Some(Sink {
             log: Some(broken),
             report: Arc::new(move |text| {
                 seen.lock().unwrap().push(text);
                 // Like `deliver` logging "the event listener threw": a log write inside the report.
-                let _ = SinkWriter.write(b"nested line
-");
+                write_to(&SLOT, b"nested line\n");
             }),
+            failed: false,
         });
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = SinkWriter.write(b"first line
-");
+            write_to(&SLOT, b"first line\n");
             let _ = tx.send(());
         });
         let finished = rx.recv_timeout(std::time::Duration::from_secs(5));
-        // Leave the global clean for any later test.
-        *SINK.lock().unwrap_or_else(|e| e.into_inner()) = None;
         assert!(finished.is_ok(), "the write finished instead of deadlocking");
         assert_eq!(reports.lock().unwrap().len(), 1, "reported once, the nested failure is not reported again");
     }

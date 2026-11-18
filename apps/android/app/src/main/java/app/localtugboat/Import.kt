@@ -233,15 +233,38 @@ object Capture {
     }
 
     /**
+     * Meta is written at the shutter, before the camera has made the file, so a failed capture followed by a
+     * crash leaves a meta with no shot. Delete those once they are older than [minAgeMs] (a shot still being
+     * written or handed over keeps its meta). Returns how many were deleted.
+     */
+    fun sweepOrphanMetas(shotsDir: File, nowMs: Long, minAgeMs: Long): Int {
+        var gone = 0
+        for (m in File(shotsDir, "meta").listFiles().orEmpty()) {
+            if (!m.isFile || !m.name.endsWith(".properties") || nowMs - m.lastModified() < minAgeMs) continue
+            val shot = File(shotsDir, m.name.removeSuffix(".properties"))
+            if (shot.exists() || shot.path in inFlight) continue
+            if (m.delete()) gone++
+        }
+        return gone
+    }
+
+    /**
+     * CameraX saves a photo to "CameraX*.tmp" next to the target and renames it when complete, so a crash
+     * mid-save leaves a partial file in the shots folder. That is no shot: [recover] skips it.
+     */
+    fun isCameraTemp(name: String): Boolean = name.endsWith(".tmp", ignoreCase = true)
+
+    /**
      * Retry shots left in [shotsDir] by a crash or a failed hand-off. Files younger than [minAgeMs] are
      * skipped (a shot being written right now). Blocking. Returns how many were taken; failures stay in
      * the folder and are logged.
      */
     fun recover(c: Context, nowMs: Long = System.currentTimeMillis(), minAgeMs: Long = 60_000): Int {
+        sweepOrphanMetas(shotsDir(c), nowMs, minAgeMs)
         var taken = 0
         val knownFolders by lazy { c.core.phone().folders().map { it.id }.toSet() }
         for (f in shotsDir(c).listFiles().orEmpty()) {
-            if (!f.isFile || nowMs - f.lastModified() < minAgeMs || f.path in inFlight) continue
+            if (!f.isFile || isCameraTemp(f.name) || nowMs - f.lastModified() < minAgeMs || f.path in inFlight) continue
             val video = f.extension.equals("mp4", ignoreCase = true)
             try {
                 if (f.length() == 0L) {

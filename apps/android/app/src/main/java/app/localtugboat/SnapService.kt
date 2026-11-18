@@ -49,8 +49,11 @@ class SnapService : Service() {
                     if (!ServiceGate.wanted(this@SnapService, "service start, second look")) {
                         KLog.log(this@SnapService, "service not wanted any more, stopping")
                         stopWanted = true
-                        stopSelf()
-                        return@launch
+                        // stopSelfResult, not stopSelf: false means a newer start arrived (the setting went back on while we
+                        // looked). That start found this job alive and did nothing, so this job must carry on instead of stopping.
+                        if (stopSelfResult(startId)) return@launch
+                        stopWanted = false
+                        KLog.log(this@SnapService, "a newer start arrived, staying up")
                     }
                     core.serviceRunning = true
                 }

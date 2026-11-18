@@ -7,6 +7,7 @@
 
 import { api, ApiError, onCoreEvent, onFirewallStatus, onLibraryStatus, onResync, pickFolder } from "./api";
 import type { AppInfo, FirewallInfo, FolderView, LibraryStatus, PairedDevice, Settings, SyncStatus } from "./api";
+import { claimAll } from "./generation";
 import { nextPairPhase, type PairInput, type PairPhase } from "./pairing";
 
 export type Screen = "gallery" | "bin" | "activity" | "pair" | "settings";
@@ -51,7 +52,8 @@ export async function act(run: () => Promise<unknown>): Promise<boolean> {
 }
 
 /** One counter per field the events and the loaders both write. A loader bumps its counter before the request and
- *  applies the answer only if nobody wrote the field since: a slow read must not undo a newer event. Plain (not
+ *  applies the answer only if nobody wrote the field since: a slow read must not undo a newer event. A full reload
+ *  claims every counter (claimAll), so an older overlapping reload cannot overwrite a newer one. Plain (not
  *  reactive) on purpose. */
 const gen = { sync: 0, library: 0, firewall: 0, folders: 0, paired: 0, settings: 0 };
 
@@ -70,22 +72,27 @@ async function loadPaired(): Promise<void> {
   if (g === gen.paired) app.paired = paired;
 }
 
-/** Read everything. Throws on the first failure so the caller can show the load error. */
+/** Read everything. Applies every answer that came back, then throws the first failure so the caller can show
+ *  the load error. (The claim above voids answers of loaders already in flight, so one failed request must not
+ *  also drop the other fields' fresh answers.) */
 async function loadAll(): Promise<void> {
-  const before = { ...gen };
-  const [info, sync, library, firewall, folders, paired, settings] = await Promise.all([
+  const current = claimAll(gen);
+  const all = await Promise.allSettled([
     api.appInfo(), api.syncStatus(), api.libraryStatus(), api.firewallStatus(), api.folders(), api.pairedDevice(), api.settings(),
-  ]);
-  app.info = info;
+  ] as const);
+  const [info, sync, library, firewall, folders, paired, settings] = all;
+  if (info.status === "fulfilled") app.info = info.value;
   // A field an event wrote while these requests ran is newer than what came back: keep it.
-  if (before.sync === gen.sync) app.sync = sync;
-  if (before.library === gen.library) app.library = library;
-  if (before.firewall === gen.firewall) app.firewall = firewall;
-  if (before.folders === gen.folders) app.folders = folders;
-  if (before.paired === gen.paired) app.paired = paired;
-  if (before.settings === gen.settings) app.settings = settings;
+  if (sync.status === "fulfilled" && current("sync")) app.sync = sync.value;
+  if (library.status === "fulfilled" && current("library")) app.library = library.value;
+  if (firewall.status === "fulfilled" && current("firewall")) app.firewall = firewall.value;
+  if (folders.status === "fulfilled" && current("folders")) app.folders = folders.value;
+  if (paired.status === "fulfilled" && current("paired")) app.paired = paired.value;
+  if (settings.status === "fulfilled" && current("settings")) app.settings = settings.value;
   app.itemsRev++;
   app.activityRev++;
+  const failed = all.find((r) => r.status === "rejected");
+  if (failed) throw failed.reason;
 }
 
 export async function reload(): Promise<void> {

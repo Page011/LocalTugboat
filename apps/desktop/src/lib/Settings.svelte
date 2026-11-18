@@ -31,16 +31,24 @@
   }
 
   async function saveBin() {
-    binDirty = false;
-    const r = parseBinDays(binText);
+    const text = binText;
+    const r = parseBinDays(text);
     if (!r.ok) {
+      binDirty = false;
       binError = r.message;
       return;
     }
     binError = null;
-    if (app.settings && r.days !== app.settings.bin_days) {
-      const next = { ...app.settings, bin_days: r.days };
-      if (await act(() => api.saveSettings(next))) app.settings = next;
+    if (!app.settings || r.days === app.settings.bin_days) {
+      binDirty = false;
+      return;
+    }
+    // Stay dirty while the save runs and if it fails: the effect above must not put the old saved value back
+    // over the typed text. After a success, release only when nothing was typed meanwhile.
+    const next = { ...app.settings, bin_days: r.days };
+    if (await act(() => api.saveSettings(next))) {
+      app.settings = next;
+      if (binText === text) binDirty = false;
     }
   }
 

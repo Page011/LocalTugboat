@@ -687,6 +687,62 @@ fn choosing_a_new_library_copies_held_files_first_then_switches() {
     assert_eq!(r.lib.status().health, LibraryHealth::Ready);
 }
 
+/// R5: a hidden folder passes the "must be empty" check, so its files can sit exactly where a
+/// copy is about to go. The copy must refuse, never overwrite, and clean-up must not delete it.
+#[test]
+fn a_file_hidden_in_the_new_folder_is_never_overwritten_by_the_move() {
+    let mut r = Rig::new();
+    r.write("Work/a.jpg", 1);
+    r.settle();
+    let before = held_paths(&r);
+    let new_root = r._tmp.path().join("newlib");
+    let work = new_root.join("Work");
+    std::fs::create_dir_all(&work).unwrap();
+    let theirs = jpeg(9, 80);
+    std::fs::write(work.join("a.jpg"), &theirs).unwrap();
+    crate::winfs::hide(&work).unwrap();
+    let e = r.lib.choose(&new_root, false).unwrap_err();
+    assert!(e.message.contains("already exists"), "{}", e.message);
+    assert_eq!(std::fs::read(work.join("a.jpg")).unwrap(), theirs, "the user's own file is untouched");
+    assert_eq!(held_paths(&r), before, "every record still points at the old library");
+    assert!(r.root.join("Work").join("a.jpg").exists());
+    assert_eq!(r.lib.root().as_deref(), Some(r.root.as_path()));
+    assert_eq!(r.lib.status().health, LibraryHealth::Ready, "sync is not left paused");
+}
+
+/// R6: the old file goes only while it is still what was copied.
+#[test]
+fn an_old_file_is_deleted_only_while_it_is_what_was_copied() {
+    use super::reconcile::remove_if_unchanged;
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, dst) = (tmp.path().join("src.jpg"), tmp.path().join("dst.jpg"));
+    // Untouched: the copy keeps the source's time and length, so it is deleted.
+    std::fs::write(&src, jpeg(1, 64)).unwrap();
+    std::fs::copy(&src, &dst).unwrap();
+    assert!(remove_if_unchanged(&src, &dst));
+    assert!(!src.exists());
+    // Edited to a different length after the copy: kept.
+    std::fs::write(&src, jpeg(1, 64)).unwrap();
+    std::fs::copy(&src, &dst).unwrap();
+    std::fs::write(&src, jpeg(2, 99)).unwrap();
+    assert!(!remove_if_unchanged(&src, &dst));
+    assert_eq!(std::fs::read(&src).unwrap(), jpeg(2, 99));
+    // Same length, newer time (an in-place edit): kept.
+    std::fs::write(&src, jpeg(1, 64)).unwrap();
+    std::fs::copy(&src, &dst).unwrap();
+    std::fs::write(&src, jpeg(3, 64)).unwrap();
+    let f = std::fs::OpenOptions::new().write(true).open(&src).unwrap();
+    f.set_modified(std::time::SystemTime::now() + Duration::from_secs(60)).unwrap();
+    drop(f);
+    assert!(!remove_if_unchanged(&src, &dst));
+    assert_eq!(std::fs::read(&src).unwrap(), jpeg(3, 64));
+    // Source or copy missing: nothing to delete, reported as kept.
+    assert!(!remove_if_unchanged(&tmp.path().join("gone.jpg"), &dst));
+    std::fs::remove_file(&dst).unwrap();
+    assert!(!remove_if_unchanged(&src, &dst));
+    assert!(src.exists());
+}
+
 #[test]
 fn a_cloud_synced_location_is_refused_unless_the_user_insists() {
     let r = Rig::new();
