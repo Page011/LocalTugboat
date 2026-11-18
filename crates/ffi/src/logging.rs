@@ -9,7 +9,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Mutex, Once,
+        Arc, Mutex, Once,
     },
 };
 
@@ -81,7 +81,7 @@ impl Write for RotatingLog {
     }
 }
 
-type Report = Box<dyn Fn(String) + Send + Sync>;
+type Report = Arc<dyn Fn(String) + Send + Sync>;
 
 struct Sink {
     log: Option<RotatingLog>,
@@ -97,26 +97,24 @@ struct SinkWriter;
 
 impl Write for SinkWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let mut failure: Option<String> = None;
+        // The failure text and, for the first failure only, the callback to report it with.
+        let mut failure: Option<(String, Report)> = None;
         {
             let mut g = SINK.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(sink) = g.as_mut() {
                 if let Some(log) = sink.log.as_mut() {
                     if let Err(e) = log.write_all(buf) {
-                        failure = Some(format!("log write failed: {e}"));
+                        // Only the first failure is reported, so a full disk is not an error storm.
+                        if !WRITE_FAILED.swap(true, Ordering::Relaxed) {
+                            failure = Some((format!("log write failed: {e}"), sink.report.clone()));
+                        }
                     }
                 }
             }
         }
-        // Report outside the lock: the callback may log, which would take the lock again.
-        // Only the first failure is reported, so a full disk is not an error storm.
-        if let Some(text) = failure {
-            if !WRITE_FAILED.swap(true, Ordering::Relaxed) {
-                let g = SINK.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(sink) = g.as_ref() {
-                    (sink.report)(text);
-                }
-            }
+        // Report with the lock released: the callback may log, and that log write takes the lock.
+        if let Some((text, report)) = failure {
+            report(text);
         }
         Ok(buf.len())
     }
@@ -184,6 +182,37 @@ mod tests {
         assert!(!all.contains("line 00"), "the oldest lines were dropped with the oldest file");
         // Whole lines only.
         assert!(all.lines().all(|l| l.starts_with("line ") && l.ends_with('x')));
+    }
+
+    /// The failure callback may log (the app's listener logs when it throws). That nested write must
+    /// not wait for a lock the first write still holds: it used to deadlock.
+    #[test]
+    fn a_log_failure_report_that_logs_again_does_not_deadlock() {
+        let dir = tempfile::tempdir().unwrap();
+        let broken = RotatingLog { path: dir.path().join("tugboat.log"), file: None, size: 0, max: 100 };
+        let reports = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = reports.clone();
+        WRITE_FAILED.store(false, Ordering::Relaxed);
+        *SINK.lock().unwrap_or_else(|e| e.into_inner()) = Some(Sink {
+            log: Some(broken),
+            report: Arc::new(move |text| {
+                seen.lock().unwrap().push(text);
+                // Like `deliver` logging "the event listener threw": a log write inside the report.
+                let _ = SinkWriter.write(b"nested line
+");
+            }),
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = SinkWriter.write(b"first line
+");
+            let _ = tx.send(());
+        });
+        let finished = rx.recv_timeout(std::time::Duration::from_secs(5));
+        // Leave the global clean for any later test.
+        *SINK.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        assert!(finished.is_ok(), "the write finished instead of deadlocking");
+        assert_eq!(reports.lock().unwrap().len(), 1, "reported once, the nested failure is not reported again");
     }
 
     #[test]

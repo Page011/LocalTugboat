@@ -6,13 +6,16 @@ import tempfile
 from pathlib import Path
 from PIL import Image
 
-ELECTRON = r"C:\apps\forteConsole\forteops\app\node_modules\electron\dist\electron.exe"
+# Any Electron works (it only draws the SVG); set TUG_ELECTRON on a PC without that checkout.
+ELECTRON = os.environ.get("TUG_ELECTRON", r"C:\apps\forteConsole\forteops\app\node_modules\electron\dist\electron.exe")
 SHOOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shoot.cjs")
 MINC = 320
 
 
 def render_svg(svg_path, out_png, w, h, bg=None, pad=0, flat=False):
     """bg None = transparent. pad = px margin around the image inside the w x h output."""
+    if not os.path.isfile(ELECTRON):
+        raise RuntimeError("Electron not found at %s: set TUG_ELECTRON to the path of electron.exe" % ELECTRON)
     svg_path = Path(svg_path).resolve()
     tmpd = Path(tempfile.mkdtemp(prefix="tug_", dir=os.environ.get("TUG_TMP")))
     html = tmpd / "page.html"

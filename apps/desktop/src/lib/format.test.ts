@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { actionLabel, ago, binLabel, duration, fmtSize, isProblem, itemLabel, parseBinDays, shortPath, syncLabel } from "./format";
+import { actionLabel, ago, binLabel, deviceLabel, duration, fmtSize, isProblem, itemLabel, parseBinDays, shortPath, syncLabel } from "./format";
 import type { ItemView } from "./bindings/ItemView";
 import type { SyncStatus } from "./bindings/SyncStatus";
 
@@ -119,6 +119,18 @@ describe("small helpers", () => {
     expect(shortPath("C:\\a\\b")).toBe("C:\\a\\b");
     expect(shortPath("C:\\Users\\Nigel\\Documents\\Pictures\\Local Tugboat", 30)).toBe("C:\\...\\Pictures\\Local Tugboat");
     expect(shortPath("C:\\Users\\Nigel\\Documents\\A-very-long-last-folder-name-here", 30)).toBe("C:\\...\\A-very-long-last-folder-name-here");
+  });
+});
+
+describe("deviceLabel", () => {
+  const me = "aa" as never;
+  const phone = { id: "bb" as never, name: "Sam's phone" };
+  test("system, this PC, the paired phone and a former phone", () => {
+    expect(deviceLabel(null, me, phone)).toBe("System");
+    expect(deviceLabel(me, me, phone)).toBe("This PC");
+    expect(deviceLabel(phone.id, me, phone)).toBe("Sam's phone");
+    expect(deviceLabel("cc" as never, me, phone)).toBe("Earlier phone");
+    expect(deviceLabel("cc" as never, me, null)).toBe("Earlier phone");
   });
 });
 

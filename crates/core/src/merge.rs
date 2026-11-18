@@ -198,6 +198,14 @@ fn check_name(what: &str, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Every version in a remote record is bounded, so none can pin the local clock (M7).
+fn check_lamports(vs: &[Version]) -> Result<()> {
+    if vs.iter().any(|v| v.lamport > store::MAX_LAMPORT) {
+        return Err(proto("version out of range"));
+    }
+    Ok(())
+}
+
 fn validate_remote(record: &Record) -> Result<()> {
     match record {
         Record::Item(r) => {
@@ -212,14 +220,15 @@ fn validate_remote(record: &Record) -> Result<()> {
             if r.content.val.size > i64::MAX as u64 || r.content.val.thumb.as_ref().is_some_and(|t| t.size > i64::MAX as u64) {
                 return Err(proto("item size out of range"));
             }
-            for v in [r.name.v, r.content.v, r.location.v, r.pinned.v, r.deleted.v] {
-                if v.lamport > i64::MAX as u64 {
-                    return Err(proto("version out of range"));
-                }
-            }
+            check_lamports(&[r.name.v, r.content.v, r.location.v, r.pinned.v, r.deleted.v])?;
         }
         Record::Folder(r) => {
             check_name("folder", &r.name.val)?;
+            check_lamports(&[r.name.v, r.retention.v, r.deleted.v])?;
+            // The Keep folder keeps everything: an expiring retention would delete unpinned Keep items.
+            if (r.id == KEEP_ID || r.kind == FolderKind::Keep) && r.retention.val != Retention::Keep {
+                return Err(proto("the Keep folder keeps everything"));
+            }
             if matches!(r.retention.val, Retention::Secs { secs: 0 }) {
                 return Err(proto("folder retention of 0 seconds"));
             }
@@ -231,6 +240,7 @@ fn validate_remote(record: &Record) -> Result<()> {
         }
         Record::Place(r) => {
             check_name("place", &r.name.val)?;
+            check_lamports(&[r.name.v, r.area.v, r.target.v, r.deleted.v])?;
             let a = r.area.val;
             let ok = a.lat.is_finite()
                 && a.lon.is_finite()
@@ -531,7 +541,7 @@ mod tests {
     }
 
     fn random_version(g: &mut Lcg) -> Version {
-        v(1 + g.next() % 4, if g.next() % 2 == 0 { p() } else { f() })
+        v(1 + g.next() % 4, if g.next().is_multiple_of(2) { p() } else { f() })
     }
 
     /// Every value is a function of its version, so equal versions always carry equal values
@@ -804,15 +814,15 @@ mod tests {
     fn folders_and_places_merge_per_group() {
         let d = db_with_peer(p(), f());
         // E9: retention Keep (GENESIS) vs 3 days (4,F).
-        let mut inbox = store::get_folder(&d.conn, KEEP_ID).unwrap().unwrap();
+        let mut inbox = store::get_folder(&d.conn, INBOX_ID).unwrap().unwrap();
         inbox.retention = vs(v(4, f()), Retention::Secs { secs: 3 * 86_400 });
         let a = apply_remote(&d.conn, p(), f(), &Record::Folder(inbox.clone()), T0).unwrap();
-        assert_eq!(a.changed, Some(EntityKey::Folder { id: KEEP_ID }));
-        assert_eq!(store::get_folder(&d.conn, KEEP_ID).unwrap().unwrap().retention.val, Retention::Secs { secs: 3 * 86_400 });
+        assert_eq!(a.changed, Some(EntityKey::Folder { id: INBOX_ID }));
+        assert_eq!(store::get_folder(&d.conn, INBOX_ID).unwrap().unwrap().retention.val, Retention::Secs { secs: 3 * 86_400 });
         // The same record again: no change. The default records themselves: no change.
         assert_eq!(apply_remote(&d.conn, p(), f(), &Record::Folder(inbox), T0).unwrap().changed, None);
         for fr in crate::folders::default_folders() {
-            if fr.id != KEEP_ID {
+            if fr.id != INBOX_ID {
                 assert_eq!(apply_remote(&d.conn, p(), f(), &Record::Folder(fr), T0).unwrap().changed, None);
             }
         }
@@ -832,6 +842,41 @@ mod tests {
         let got = store::get_place(&d.conn, pl.id).unwrap().unwrap();
         assert_eq!(got.name.val, "Site 2");
         assert_eq!(got.area, pl.area);
+    }
+
+    // The Keep folder never expires: a remote record giving it a duration is refused, nothing stored.
+    #[test]
+    fn remote_keep_folder_with_expiring_retention_is_refused() {
+        let d = db_with_peer(p(), f());
+        let mut keep = store::get_folder(&d.conn, KEEP_ID).unwrap().unwrap();
+        keep.retention = vs(v(4, f()), Retention::Secs { secs: 3 * 86_400 });
+        assert!(matches!(apply_remote(&d.conn, p(), f(), &Record::Folder(keep), T0), Err(CoreError::Protocol(_))));
+        assert_eq!(store::get_folder(&d.conn, KEEP_ID).unwrap().unwrap().retention.val, Retention::Keep);
+    }
+
+    // A version near u64::MAX must not pin the clock: refused, clock and next_version untouched.
+    #[test]
+    fn remote_versions_beyond_the_lamport_bound_are_refused() {
+        let d = db_with_peer(p(), f());
+        let before = store::max_lamport(&d.conn).unwrap();
+        assert!(matches!(store::observe_lamport(&d.conn, u64::MAX), Err(CoreError::Protocol(_))));
+        assert_eq!(store::max_lamport(&d.conn).unwrap(), before);
+        let mut fo = store::get_folder(&d.conn, INBOX_ID).unwrap().unwrap();
+        fo.name = vs(v(u64::MAX, f()), "x".into());
+        assert!(matches!(apply_remote(&d.conn, p(), f(), &Record::Folder(fo), T0), Err(CoreError::Protocol(_))));
+        let pl = PlaceRecord {
+            id: PlaceId(Uuid::from_u128(0x902)),
+            name: vs(v(u64::MAX, f()), "x".into()),
+            area: vs(v(1, f()), Area { lat: 1.0, lon: 1.0, radius_m: 10.0 }),
+            target: vs(v(1, f()), INBOX_ID),
+            deleted: vs(v(1, f()), None),
+        };
+        assert!(matches!(apply_remote(&d.conn, p(), f(), &Record::Place(pl), T0), Err(CoreError::Protocol(_))));
+        let mut it = item(7, f(), v(2, f()));
+        it.name = vs(v(i64::MAX as u64, f()), "x.jpg".into());
+        assert!(matches!(apply_remote(&d.conn, p(), f(), &Record::Item(it), T0), Err(CoreError::Protocol(_))));
+        assert_eq!(store::max_lamport(&d.conn).unwrap(), before);
+        assert_eq!(store::next_version(&d.conn, p()).unwrap().lamport, before + 1);
     }
 
     // Trust boundary: a paired peer's malformed record is refused, nothing stored.

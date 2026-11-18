@@ -25,6 +25,13 @@ fn werr(what: &str, e: windows::core::Error) -> io::Error {
 
 /// Write a JPEG thumbnail of `src` to `out`.
 pub fn make_thumbnail(src: &Path, out: &Path) -> io::Result<()> {
+    let (w, h, rgb) = shell_rgb(src)?;
+    let enc = jpeg_encoder::Encoder::new_file(out, 85).map_err(|e| io::Error::other(e.to_string()))?;
+    enc.encode(&rgb, w as u16, h as u16, jpeg_encoder::ColorType::Rgb).map_err(|e| io::Error::other(e.to_string()))
+}
+
+/// The Shell's thumbnail of `src` as tightly packed RGB (width, height, bytes).
+fn shell_rgb(src: &Path) -> io::Result<(usize, usize, Vec<u8>)> {
     let wide: Vec<u16> = src.as_os_str().to_string_lossy().encode_utf16().chain(std::iter::once(0)).collect();
     // The Shell needs COM on this thread. S_FALSE (already initialised) is fine and still needs
     // the matching uninitialise; a different apartment model (RPC_E_CHANGED_MODE) is also fine
@@ -37,9 +44,7 @@ pub fn make_thumbnail(src: &Path, out: &Path) -> io::Result<()> {
         unsafe {
             let _ = DeleteObject(HGDIOBJ(bmp.0));
         }
-        let (w, h, rgb) = pixels?;
-        let enc = jpeg_encoder::Encoder::new_file(out, 85).map_err(|e| io::Error::other(e.to_string()))?;
-        enc.encode(&rgb, w as u16, h as u16, jpeg_encoder::ColorType::Rgb).map_err(|e| io::Error::other(e.to_string()))
+        pixels
     })();
     if com_ok {
         unsafe { CoUninitialize() };
@@ -47,7 +52,9 @@ pub fn make_thumbnail(src: &Path, out: &Path) -> io::Result<()> {
     result
 }
 
-/// Read a shell bitmap (32-bit BGRA, alpha premultiplied) as tightly packed RGB on white.
+/// Read a shell bitmap (32-bit BGRA) as tightly packed RGB. GetDIBits with BI_RGB leaves the
+/// fourth byte of each pixel undefined, and shell thumbnails of photos often come back with it
+/// 0; `bgra_premultiplied_to_rgb` handles both cases.
 fn read_bitmap(bmp: windows::Win32::Graphics::Gdi::HBITMAP) -> io::Result<(usize, usize, Vec<u8>)> {
     let mut info = BITMAP::default();
     let got = unsafe { GetObjectW(HGDIOBJ(bmp.0), std::mem::size_of::<BITMAP>() as i32, Some(&mut info as *mut BITMAP as *mut _)) };
@@ -77,10 +84,16 @@ fn read_bitmap(bmp: windows::Win32::Graphics::Gdi::HBITMAP) -> io::Result<(usize
     Ok((w, h, bgra_premultiplied_to_rgb(&bgra)))
 }
 
-/// Premultiplied BGRA -> RGB composited on white (premultiplied: c + (255 - a)).
+/// BGRA -> RGB. When every pixel's fourth byte is 0 the bitmap has no alpha (BI_RGB leaves the
+/// byte undefined, and an all-zero byte would turn every pixel white): it is opaque. Otherwise
+/// the alpha is premultiplied and the pixel is composited on white (c + (255 - a)).
 pub fn bgra_premultiplied_to_rgb(bgra: &[u8]) -> Vec<u8> {
+    let (pixels, _) = bgra.as_chunks::<4>();
+    if pixels.iter().all(|px| px[3] == 0) {
+        return pixels.iter().flat_map(|px| [px[2], px[1], px[0]]).collect();
+    }
     let mut rgb = Vec::with_capacity(bgra.len() / 4 * 3);
-    for px in bgra.chunks_exact(4) {
+    for px in pixels {
         let bg = 255 - px[3] as u16;
         rgb.push((px[2] as u16 + bg).min(255) as u8);
         rgb.push((px[1] as u16 + bg).min(255) as u8);
@@ -98,6 +111,26 @@ mod tests {
         // B, G, R, A
         let rgb = bgra_premultiplied_to_rgb(&[0, 0, 0, 0, 10, 20, 30, 255]);
         assert_eq!(rgb, vec![255, 255, 255, 30, 20, 10]);
+    }
+
+    #[test]
+    fn a_bitmap_without_alpha_is_opaque_not_white() {
+        // B, G, R, 0 on every pixel: the fourth byte means nothing.
+        assert_eq!(bgra_premultiplied_to_rgb(&[10, 20, 30, 0]), vec![30, 20, 10]);
+        assert_eq!(bgra_premultiplied_to_rgb(&[10, 20, 30, 0, 1, 2, 3, 0]), vec![30, 20, 10, 3, 2, 1]);
+    }
+
+    #[test]
+    fn the_shell_thumbnail_of_a_solid_photo_keeps_its_colour() {
+        let d = tempfile::tempdir().unwrap();
+        let src = d.path().join("red.jpg");
+        let px: Vec<u8> = (0..64 * 64).flat_map(|_| [200u8, 40, 40]).collect();
+        jpeg_encoder::Encoder::new_file(&src, 95).unwrap().encode(&px, 64, 64, jpeg_encoder::ColorType::Rgb).unwrap();
+        let (w, h, rgb) = shell_rgb(&src).expect("shell thumbnail of a real JPEG");
+        assert_eq!(rgb.len(), w * h * 3);
+        let mean = |c: usize| rgb.as_chunks::<3>().0.iter().map(|p| p[c] as u64).sum::<u64>() / (w * h) as u64;
+        let (r, g, b) = (mean(0) as i64, mean(1) as i64, mean(2) as i64);
+        assert!((r - 200).abs() < 25 && (g - 40).abs() < 25 && (b - 40).abs() < 25, "mean colour {r},{g},{b} is not the source (200,40,40): a white thumbnail is the bug");
     }
 
     #[test]

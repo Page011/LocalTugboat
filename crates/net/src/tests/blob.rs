@@ -33,7 +33,12 @@ async fn scripted_sender(conn: Arc<PeerConn>, file: PathBuf, announce: u64, send
         tx.finish().unwrap();
         // Keep the stream alive until the receiver has read it all.
         let _ = tokio::time::timeout(Duration::from_secs(5), tx.stopped()).await;
+    } else {
+        // Dropping `tx` would finish the stream and look like a short body, not a cut connection:
+        // hold it open until the connection is closed.
+        let _ = tokio::time::timeout(Duration::from_secs(10), conn.closed()).await;
     }
+    drop(tx);
     req
 }
 
@@ -80,16 +85,16 @@ async fn n11_resume_after_a_cut_connection() {
     let sender = {
         let (conn, src) = (l.a_conn.clone(), src.clone());
         tokio::spawn(async move {
-            let req = scripted_sender(conn.clone(), src, 20 * MB, 2 * MB as usize, &[], false).await;
+            let held = tokio::spawn(scripted_sender(conn.clone(), src, 20 * MB, 2 * MB as usize, &[], false));
             tokio::time::sleep(Duration::from_millis(500)).await;
             conn.close(0, "test cut");
-            req
+            held.await.unwrap()
         })
     };
     let err = bounded(30, fetch_blob(&l.b_conn, &hash, size, &part, u64::MAX)).await.unwrap_err();
     let req = sender.await.unwrap();
     assert_eq!(req.offset, 0);
-    assert!(matches!(err, NetError::ClosedByPeer { .. } | NetError::Stream(_)), "{err}");
+    assert!(matches!(err, NetError::ClosedByPeer { code: 0, .. }), "a cut connection, not a short body: {err}");
     let kept = std::fs::metadata(&part).expect("part file is kept").len();
     assert!(kept >= MB && kept < size, "kept {kept}");
 

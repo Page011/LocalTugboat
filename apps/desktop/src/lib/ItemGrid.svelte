@@ -6,7 +6,7 @@
   import type { ItemView } from "./api";
   import type { Label } from "./format";
   import ItemTile from "./ItemTile.svelte";
-  import { arrowTarget, GRID, gridLayout, innerWidth, tileWidth, visibleRows } from "./virtual";
+  import { arrowTarget, focusIndexFor, GRID, gridLayout, innerWidth, tileWidth, visibleRows } from "./virtual";
 
   let {
     items,
@@ -42,8 +42,10 @@
   const start = $derived(range[0] * layout.cols);
   const end = $derived(Math.min(items.length, range[1] * layout.cols));
   const shown = $derived(items.slice(start, end));
-  // The Tab stop must be a tile that exists: fall back to the first one on screen.
-  const stop = $derived(focusIdx >= start && focusIdx < end ? focusIdx : start);
+  // The focused tile follows the selected item by id (new items shift every index during sync); focusIdx is only
+  // the fallback. The Tab stop must be a tile that exists: fall back to the first one on screen.
+  const focus = $derived(focusIndexFor(items, selectedId, focusIdx));
+  const stop = $derived(focus >= start && focus < end ? focus : start);
 
   // Measure the scroller's own clientWidth, which is the visible width WITHOUT the vertical scrollbar. (Svelte's
   // bind:clientWidth reports the width the scrollbar sits inside, so the columns were sized for room the scrollbar

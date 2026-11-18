@@ -201,6 +201,21 @@ object UiLogic {
     /** The core's own rule (under 2 minutes old, 100 m or better) applied again before a location is stored on a shot. */
     fun usableFix(accuracyM: Double, ageMs: Long) = ageMs in 0 until 120_000 && accuracyM > 0 && accuracyM <= 100.0
 
+    /**
+     * Folder id for a shot at the moment of the shutter, or null = decide at hand-off (place rule). The chip's
+     * [targetFolderId] is recomputed off the main thread after a pick, so it only counts when it was computed for
+     * the pick that is live now ([targetPick]). A live pick that still exists always wins.
+     */
+    fun shotFolder(pick: String?, folderIds: Collection<String>, targetFolderId: String?, targetPick: String?): String? = when {
+        pick != null && pick in folderIds -> pick
+        targetFolderId != null && targetPick == pick -> targetFolderId
+        else -> null
+    }
+
+    /** Saved-state keys of viewer screens that were seen but are no longer anywhere on the stack: their state is dropped. */
+    fun droppedViewerKeys(seen: Set<Route>, current: List<Route>): Set<String> =
+        seen.filterIsInstance<Route.Viewer>().filter { it !in current }.map { it.toString() }.toSet()
+
     class ChipUi(val text: String, val noLocation: Boolean)
 
     /**

@@ -4,7 +4,7 @@
 //! start-up scan and the 10-minute rescan are the same code as an event-driven one.
 
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     sync::mpsc::{self, RecvTimeoutError, Sender},
     thread::JoinHandle,
     time::Instant,
@@ -12,7 +12,11 @@ use std::{
 
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
-use super::{config::HIDDEN_DIR, placement::is_inside, Inner, Library};
+use super::{
+    config::HIDDEN_DIR,
+    placement::{is_inside, same_path},
+    Inner, Library,
+};
 
 enum Msg {
     /// Something changed under the library.
@@ -87,11 +91,16 @@ fn start_watcher(root: &Path, tx: Sender<Msg>, inner: &Inner) -> Option<Recommen
     };
     let started = notify::recommended_watcher(handler).and_then(|mut w| w.watch(root, RecursiveMode::Recursive).map(|()| w));
     match started {
-        Ok(w) => Some(w),
+        Ok(w) => {
+            super::lock(&inner.st).watcher_error = None;
+            Some(w)
+        }
         Err(e) => {
             tracing::error!("file watcher did not start: {e}");
+            // Kept in State: every pass rewrites last_error from it, so it stays on screen.
+            // A missing folder is reported once, as LIBRARY FOLDER NOT FOUND, not twice.
             let mut st = super::lock(&inner.st);
-            st.last_error = Some(format!("FILE WATCHER NOT RUNNING - rescans every 10 minutes only: {e}"));
+            st.watcher_error = root.exists().then(|| format!("FILE WATCHER NOT RUNNING - rescans every 10 minutes only: {e}"));
             None
         }
     }
@@ -100,6 +109,7 @@ fn start_watcher(root: &Path, tx: Sender<Msg>, inner: &Inner) -> Option<Recommen
 fn run(inner: std::sync::Arc<Inner>, rx: mpsc::Receiver<Msg>, tx: Sender<Msg>) {
     let o = inner.opts.clone();
     let root = super::lock(&inner.st).cfg.path.clone();
+    let mut watched: Option<PathBuf> = root.clone();
     let mut watcher = root.as_deref().and_then(|r| start_watcher(r, tx.clone(), &inner));
     let mut last_full = Instant::now();
     let mut dirty_first: Option<Instant> = None;
@@ -116,11 +126,28 @@ fn run(inner: std::sync::Arc<Inner>, rx: mpsc::Receiver<Msg>, tx: Sender<Msg>) {
             inner.publish(&mut st);
             super::PassReport { retry_after: Some(std::time::Duration::from_secs(30)), ..Default::default() }
         });
-        // The folder was missing and is back: the old watch handle may be dead, make a new one.
-        let rewatch = std::mem::take(&mut super::lock(&inner.st).rewatch);
-        if rewatch {
+        // Watch the library as it is NOW. The folder was missing and is back (the old watch
+        // handle may be dead), or Choose / Locate pointed the library elsewhere, or it was
+        // chosen after start: make a new watcher on the current root.
+        let (current, rewatch) = {
+            let mut st = super::lock(&inner.st);
+            (st.cfg.path.clone(), std::mem::take(&mut st.rewatch))
+        };
+        let moved = match (&current, &watched) {
+            (Some(a), Some(b)) => !same_path(a, b),
+            (None, None) => false,
+            _ => true,
+        };
+        if rewatch || moved {
+            let before = super::lock(&inner.st).watcher_error.clone();
             watcher = None;
-            watcher = root.as_deref().and_then(|r| start_watcher(r, tx.clone(), &inner));
+            watcher = current.as_deref().and_then(|r| start_watcher(r, tx.clone(), &inner));
+            watched = current;
+            // The pass above showed the watcher error as it was before this new watcher: if it
+            // came or went, look again so the screen does not keep a stale line.
+            if super::lock(&inner.st).watcher_error != before {
+                let _ = tx.send(Msg::Scan(false));
+            }
         }
         if full {
             *last_full = now;

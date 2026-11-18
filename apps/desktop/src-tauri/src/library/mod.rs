@@ -139,6 +139,9 @@ pub(crate) struct State {
     pub published: Option<LibraryStatus>,
     /// Set when a missing library came back: the worker makes a fresh watcher.
     pub rewatch: bool,
+    /// Set while the file watcher is not running; shown in `last_error` on every pass, because
+    /// a pass rewrites `last_error` and would otherwise hide it at once.
+    pub watcher_error: Option<String>,
 }
 
 pub(crate) struct Inner {
@@ -201,6 +204,7 @@ impl Library {
             leftovers: Vec::new(),
             published: None,
             rewatch: false,
+            watcher_error: None,
         };
         Ok(Library { inner: Arc::new(Inner { core, place, data_dir, opts, st: Mutex::new(st), notify }) })
     }

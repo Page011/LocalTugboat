@@ -4,8 +4,9 @@ import numpy as np
 from PIL import Image
 from scipy import ndimage
 
-SRC = r"C:\Users\Nigel\Downloads\Tugboat.png"
 import os
+from lib import source_png
+SRC = source_png()
 OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "loops.json")
 SIGMA = 0.6
 DARK, LIGHT = 39.0, 254.0

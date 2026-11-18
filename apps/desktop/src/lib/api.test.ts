@@ -19,7 +19,7 @@ mock.module("@tauri-apps/api/core", () => ({
 mock.module("@tauri-apps/api/event", () => ({ listen: async () => () => {} }));
 mock.module("@tauri-apps/plugin-dialog", () => ({ open: async () => null }));
 
-const { api, ApiError, EVENTS, thumbUrl } = await import("./api");
+const { api, ApiError, EVENTS, thumbSrc, thumbUrl } = await import("./api");
 
 const root = join(import.meta.dir, "..", "..");
 const rust = (f: string) => readFileSync(join(root, "src-tauri", "src", f), "utf8");
@@ -80,5 +80,14 @@ describe("wrappers", () => {
 
   test("thumbnail URLs point at the snapthumb scheme", () => {
     expect(thumbUrl("0197-abc" as never)).toBe("http://snapthumb.localhost/0197-abc");
+  });
+
+  test("a tile asks for its thumbnail only when one exists, and again when it changes", () => {
+    const id = "0197-abc" as never;
+    expect(thumbSrc({ id, thumb_path: null })).toBeNull();
+    const a = thumbSrc({ id, thumb_path: "C:\\data\\thumbs\\a b.jpg" });
+    expect(a).toBe("http://snapthumb.localhost/0197-abc?v=C%3A%5Cdata%5Cthumbs%5Ca%20b.jpg");
+    expect(thumbSrc({ id, thumb_path: "C:\\data\\thumbs\\other.jpg" })).not.toBe(a);
+    expect(thumbSrc({ id, thumb_path: "C:\\data\\thumbs\\a b.jpg" })).toBe(a);
   });
 });

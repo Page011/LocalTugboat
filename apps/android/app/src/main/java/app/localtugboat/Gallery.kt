@@ -24,6 +24,7 @@ import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.itemsIndexed
 import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.CircularProgressIndicator
@@ -182,6 +183,14 @@ fun BinScreen(vm: SnapViewModel, ui: UiState) {
     val nowMs by rememberNow(60_000)
     val binDays = ui.settings?.binDays ?: 7u
     val scope = androidx.compose.runtime.rememberCoroutineScope()
+    val listState = rememberLazyListState()
+
+    // Next page when the last visible row is near the end of what is loaded (same rule as the gallery grid).
+    LaunchedEffect(model, listState) {
+        snapshotFlow { (listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0) to model.rows.size }.collect { (last, size) ->
+            if (model.hasMore && last >= size - 12) model.loadMore()
+        }
+    }
 
     Column(Modifier.fillMaxSize()) {
         ScreenBar("Bin", onBack = { vm.nav.back() })
@@ -189,7 +198,7 @@ fun BinScreen(vm: SnapViewModel, ui: UiState) {
         Box(Modifier.weight(1f)) {
             ListStates(model, null, true, null, { scope.launch { model.reload() } }) {
                 val bottom = with(LocalDensity.current) { WindowInsets.navigationBars.getBottom(this).toDp() }
-                LazyColumn(contentPadding = PaddingValues(bottom = bottom)) {
+                LazyColumn(state = listState, contentPadding = PaddingValues(bottom = bottom)) {
                     items(model.rows, key = { it.id }) { item ->
                         val cell = UiLogic.cell(item, nowMs, binDays, true)
                         Row(

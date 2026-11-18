@@ -67,14 +67,35 @@ class PagedModelTest {
         assertEquals((0 until 240).toList(), m.rows)
     }
 
-    @Test fun reload_never_asks_for_more_than_the_core_allows() = runBlocking {
-        val f = Fake(2000)
+    @Test fun reload_never_asks_for_more_than_the_core_allows_and_keeps_every_row_on_screen() = runBlocking {
+        val f = Fake(700)
         val m = model(f)
         m.reload()
-        repeat(10) { m.loadMore() } // 660 rows
+        repeat(8) { m.loadMore() } // 540 rows
+        assertEquals(540, m.rows.size)
+        f.limits.clear()
         m.reload()
-        assertEquals(500, f.limits.last())
-        assertEquals(500, m.rows.size)
+        assertTrue("every limit within the core cap: ${f.limits}", f.limits.all { it <= 500 })
+        assertEquals((0 until 540).toList(), m.rows)
+        assertTrue(m.hasMore)
+        m.loadMore() // continues after the reloaded block
+        assertEquals((0 until 600).toList(), m.rows)
+    }
+
+    @Test fun a_reload_that_fails_part_way_keeps_the_old_rows() = runBlocking {
+        val f = Fake(700)
+        var calls = 0
+        val m = PagedModel<Int>(60) { c, n ->
+            calls++
+            if (calls > 10) throw IllegalStateException("cut off") // calls 1-9 build 540 rows, 10 = first page of the reload, 11 = its second page
+            f.load(c, n)
+        }
+        m.reload()
+        repeat(8) { m.loadMore() } // 540 rows, 9 calls
+        m.reload() // the first page of 500 comes back, the second page fails: nothing is half-applied
+        assertEquals(11, calls)
+        assertEquals((0 until 540).toList(), m.rows)
+        assertEquals("cut off", m.error)
     }
 
     @Test fun a_failed_reload_keeps_the_rows_and_says_why_and_the_next_success_clears_it() = runBlocking {

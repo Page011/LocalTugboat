@@ -158,7 +158,17 @@ async fn send(core: &Core, data: &Path, n: u32) -> Result<(), String> {
     // An item shows Waiting until the PC has confirmed holding the file (its receipt).
     let t0 = Instant::now();
     loop {
-        let waiting = ids.iter().filter(|id| matches!(core.item(**id), Ok(Some(v)) if v.state == ItemState::Waiting)).count();
+        // Confirmed means the item is there and no longer Waiting. A failed query or a missing
+        // item is not a confirmation: stop and say which one.
+        let mut waiting = 0;
+        for id in &ids {
+            match core.item(*id) {
+                Ok(Some(v)) if v.state == ItemState::Waiting => waiting += 1,
+                Ok(Some(_)) => {}
+                Ok(None) => return Err(format!("item {} is missing, it cannot be confirmed", id.0)),
+                Err(e) => return Err(format!("could not read item {}: {e}", id.0)),
+            }
+        }
         if waiting == 0 {
             break;
         }
@@ -186,9 +196,20 @@ fn print_items(core: &Core, ids: &[ItemId]) {
 async fn list(core: &Core) -> Result<(), String> {
     wait_synced(core).await?;
     // Let queued downloads finish: Synced is only reported when nothing is left to fetch.
-    let page = core.items(&ItemQuery { folder: None, bin: false, after: None, limit: 500 }).map_err(|e| e.to_string())?;
-    println!("{} items", page.rows.len());
-    for v in page.rows {
+    // Every page, then the true count first, so the total is never a silent first-page cut.
+    let mut rows = Vec::new();
+    let mut after = None;
+    loop {
+        let page = core.items(&ItemQuery { folder: None, bin: false, after, limit: 500 }).map_err(|e| e.to_string())?;
+        let (more, last) = (page.next.is_some(), page.rows.last().map(|v| v.id));
+        rows.extend(page.rows);
+        match (more, last) {
+            (true, Some(id)) => after = Some(id),
+            _ => break,
+        }
+    }
+    println!("{} items", rows.len());
+    for v in rows {
         println!("{}", serde_json::to_string(&v).map_err(|e| e.to_string())?);
     }
     Ok(())

@@ -40,6 +40,20 @@ class SnapService : Service() {
             core.hold(HOLD)
             watchWifi()
             job = core.scope.launch {
+                // A start that was still queued when the setting went off or the phone was unpaired: stop() saw no running
+                // service and did nothing, so the check is repeated here (after startForeground, which must come first).
+                if (!ServiceGate.wanted(this@SnapService, "service start")) {
+                    // Free the flag first, then look again: a setting turned back on in between either sees the flag free
+                    // (and starts us anew) or is seen by this second look.
+                    core.serviceRunning = false
+                    if (!ServiceGate.wanted(this@SnapService, "service start, second look")) {
+                        KLog.log(this@SnapService, "service not wanted any more, stopping")
+                        stopWanted = true
+                        stopSelf()
+                        return@launch
+                    }
+                    core.serviceRunning = true
+                }
                 launch { while (true) { Heartbeat.beat(this@SnapService); delay(HeartbeatLog.BEAT_MS) } }
                 launch { keepNotificationCurrent() }
                 launch {

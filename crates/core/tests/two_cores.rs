@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use common::*;
 use tugboat_core::{
-    events::SyncState, ActivityAction, FolderId, ItemState, LocalFileState, Retention, Role, TestClock, INBOX_ID,
+    events::{Event, PairingEvent, SyncState}, ActivityAction, FolderId, ItemState, LocalFileState, Retention, Role, TestClock, INBOX_ID,
 };
 
 fn live(v: &Option<tugboat_core::ItemView>) -> bool {
@@ -236,10 +236,14 @@ async fn s05c_repaired_device_old_receipt_counts_new_item_waits() {
 
     let phone2 = Dev::new(Role::Phone, "phone two", &TestClock::new(T0));
     phone2.start().await;
+    // The PC still holds phone one's Code event: wait for a NEW one, or the confirm can land
+    // before the PC has read phone two's hello (the window is still Open: not_open).
+    let is_code = |e: &Event| matches!(e, Event::Pairing(PairingEvent::Code { .. }));
+    let pc_codes = pc.count_events(is_code);
     let payload = pc.core.begin_pairing(false).unwrap();
     let p2 = phone2.core.clone();
     let task = tokio::spawn(async move { p2.pair_with(&payload).await });
-    until("code", 10, || pc.code().is_some() && phone2.code().is_some()).await;
+    until("code", 10, || pc.count_events(is_code) > pc_codes && phone2.code().is_some()).await;
     pc.core.confirm_pairing(true).await.unwrap();
     task.await.unwrap().unwrap();
     phone2.wait_state(SyncState::Synced).await;

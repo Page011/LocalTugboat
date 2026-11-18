@@ -429,7 +429,6 @@ pub struct PhoneCore {
     storage: Arc<AppStorage>,
     secret: [u8; 32],
     bind: SocketAddr,
-    listener: Arc<dyn EventListener>,
     pair_cancel: Arc<Notify>,
     log_path: PathBuf,
     self_id: DeviceId,
@@ -473,7 +472,7 @@ impl PhoneCore {
         let report_to = listener.clone();
         let log_path = match logging::init(
             &data_dir,
-            Box::new(move |text| deliver(&report_to, FfiEvent::Error { kind: "log".into(), message: text })),
+            std::sync::Arc::new(move |text| deliver(&report_to, FfiEvent::Error { kind: "log".into(), message: text })),
         ) {
             Ok(p) => p,
             Err((p, e)) => {
@@ -536,7 +535,7 @@ impl PhoneCore {
         });
 
         tracing::info!(app = %app_version, id = %self_id, "phone core open");
-        Ok(Arc::new(PhoneCore { rt: Some(rt), core, storage, secret, bind, listener, pair_cancel: Arc::new(Notify::new()), log_path, self_id }))
+        Ok(Arc::new(PhoneCore { rt: Some(rt), core, storage, secret, bind, pair_cancel: Arc::new(Notify::new()), log_path, self_id }))
     }
 
     /// This phone's public key, 64 hex chars (its device id on the PC).
@@ -594,20 +593,12 @@ impl PhoneCore {
             let mut cancelled = std::pin::pin!(cancel.notified());
             // Register before the exchange starts, so a cancel made at any moment is seen.
             cancelled.as_mut().enable();
-            tokio::select! {
-                r = core.pair_with(&payload) => r.map(Some),
-                _ = &mut cancelled => Ok(None),
-            }
+            // Core ends the exchange on a cancel only while that is still safe: once the PC's
+            // decision is read the pairing is stored whatever the user taps. It emits the
+            // Cancelled event itself.
+            core.pair_with_cancel(&payload, &mut cancelled).await
         });
-        match result {
-            Ok(Some(row)) => Ok(paired_pc(row)),
-            Ok(None) => {
-                let message = "Pairing cancelled".to_string();
-                deliver(&self.listener, FfiEvent::PairingCancelled { code: "cancelled".into(), message: message.clone() });
-                Err(SnapError::PairCancelled(message))
-            }
-            Err(e) => Err(e.into()),
-        }
+        result.map(paired_pc).map_err(Into::into)
     }
 
     /// Abandon a `pair_with` that is waiting. It returns `PairCancelled`. No effect otherwise.

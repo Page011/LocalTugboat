@@ -18,12 +18,14 @@ fn jpeg(seed: u8, len: usize) -> Vec<u8> {
 }
 
 struct Rig {
-    tmp: tempfile::TempDir,
     core: Core,
     lib: Library,
     root: PathBuf,
     data: PathBuf,
     now: Instant,
+    /// Last on purpose: fields drop in declaration order, and the temp folder must be removed
+    /// after Core's SQLite handle and the library are closed (Windows cannot delete open files).
+    tmp: tempfile::TempDir,
 }
 
 impl Rig {

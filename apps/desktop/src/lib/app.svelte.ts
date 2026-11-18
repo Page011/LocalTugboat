@@ -50,23 +50,40 @@ export async function act(run: () => Promise<unknown>): Promise<boolean> {
   }
 }
 
+/** One counter per field the events and the loaders both write. A loader bumps its counter before the request and
+ *  applies the answer only if nobody wrote the field since: a slow read must not undo a newer event. Plain (not
+ *  reactive) on purpose. */
+const gen = { sync: 0, library: 0, firewall: 0, folders: 0, paired: 0, settings: 0 };
+
 function pair(i: PairInput): void {
   app.pairing = nextPairPhase(app.pairing, i);
 }
 
 async function loadFolders(): Promise<void> {
-  app.folders = await api.folders();
+  const g = ++gen.folders;
+  const folders = await api.folders();
+  if (g === gen.folders) app.folders = folders;
 }
 async function loadPaired(): Promise<void> {
-  app.paired = await api.pairedDevice();
+  const g = ++gen.paired;
+  const paired = await api.pairedDevice();
+  if (g === gen.paired) app.paired = paired;
 }
 
 /** Read everything. Throws on the first failure so the caller can show the load error. */
 async function loadAll(): Promise<void> {
+  const before = { ...gen };
   const [info, sync, library, firewall, folders, paired, settings] = await Promise.all([
     api.appInfo(), api.syncStatus(), api.libraryStatus(), api.firewallStatus(), api.folders(), api.pairedDevice(), api.settings(),
   ]);
-  Object.assign(app, { info, sync, library, firewall, folders, paired, settings });
+  app.info = info;
+  // A field an event wrote while these requests ran is newer than what came back: keep it.
+  if (before.sync === gen.sync) app.sync = sync;
+  if (before.library === gen.library) app.library = library;
+  if (before.firewall === gen.firewall) app.firewall = firewall;
+  if (before.folders === gen.folders) app.folders = folders;
+  if (before.paired === gen.paired) app.paired = paired;
+  if (before.settings === gen.settings) app.settings = settings;
   app.itemsRev++;
   app.activityRev++;
 }
@@ -86,11 +103,14 @@ export async function start(): Promise<() => void> {
   const stops: Array<() => void> = [];
   const refreshFolders = () => void loadFolders().catch(fail);
   const refreshPaired = () => void loadPaired().catch(fail);
-  stops.push(
-    await onCoreEvent((e) => {
+  // Each disposer is kept as soon as its listener exists: a later listen() that rejects must not leave the
+  // earlier ones registered.
+  try {
+    stops.push(await onCoreEvent((e) => {
       switch (e.t) {
         case "sync": {
           const { t: _t, ...s } = e;
+          gen.sync++;
           app.sync = s;
           break;
         }
@@ -105,9 +125,11 @@ export async function start(): Promise<() => void> {
         case "activity_added":
           app.activityRev++;
           break;
-        case "settings_changed":
-          void api.settings().then((s) => (app.settings = s)).catch(fail);
+        case "settings_changed": {
+          const g = ++gen.settings;
+          void api.settings().then((s) => { if (g === gen.settings) app.settings = s; }).catch(fail);
           break;
+        }
         case "pairing":
           pair({ t: "event", e });
           if (e.kind === "completed" || e.kind === "unpaired") refreshPaired();
@@ -118,11 +140,14 @@ export async function start(): Promise<() => void> {
         case "places_changed":
           break;
       }
-    }),
-    await onLibraryStatus((s) => (app.library = s)),
-    await onFirewallStatus((s) => (app.firewall = s)),
-    await onResync(() => void reload()),
-  );
+    }));
+    stops.push(await onLibraryStatus((s) => { gen.library++; app.library = s; }));
+    stops.push(await onFirewallStatus((s) => { gen.firewall++; app.firewall = s; }));
+    stops.push(await onResync(() => void reload()));
+  } catch (e) {
+    stops.forEach((s) => s());
+    throw e;
+  }
   await reload();
   const timer = setInterval(() => {
     app.now = Date.now();
@@ -183,7 +208,9 @@ async function tryChoose(path: string, acceptCloud: boolean): Promise<void> {
   try {
     await api.libraryChoose(path, acceptCloud);
     app.cloudPrompt = null;
-    app.library = await api.libraryStatus();
+    const g = ++gen.library;
+    const library = await api.libraryStatus();
+    if (g === gen.library) app.library = library;
   } catch (e) {
     if (e instanceof ApiError && e.kind === "cloud_folder") app.cloudPrompt = { path, message: e.message };
     else throw e;

@@ -5,6 +5,10 @@
 ; (group policy can ignore it) and shows a banner if not (src/firewall.rs).
 ;
 ; The delete before the add makes a reinstall or upgrade idempotent: exactly one rule.
+; The rule is removed in POSTUNINSTALL, not PREUNINSTALL: Tauri's template runs PREUNINSTALL before
+; its "is the app running" prompt, so cancelling that prompt would abort the uninstall with the
+; rule already gone. An upgrade is unaffected: the old uninstaller finishes before POSTINSTALL
+; adds the rule again.
 
 !define TUGBOAT_RULE "Local Tugboat"
 
@@ -19,7 +23,7 @@
   ${EndIf}
 !macroend
 
-!macro NSIS_HOOK_PREUNINSTALL
+!macro NSIS_HOOK_POSTUNINSTALL
   nsExec::ExecToLog 'netsh advfirewall firewall delete rule name="${TUGBOAT_RULE}" program="$INSTDIR\${MAINBINARYNAME}.exe"'
   Pop $0
 !macroend

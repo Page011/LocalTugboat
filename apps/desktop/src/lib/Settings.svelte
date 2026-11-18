@@ -9,6 +9,8 @@
   let autostart = $state<boolean | null>(null);
   let binText = $state("");
   let binError = $state<string | null>(null);
+  /** The user typed since the last save started: the saved value must not overwrite the text. */
+  let binDirty = $state(false);
   let confirmUnpair = $state(false);
   const uid = $props.id();
   // A missing or paused library has no scan to report and no folder to open.
@@ -20,7 +22,7 @@
 
   // Follow the saved value (another save, or the first load), but never overwrite what is being typed.
   $effect(() => {
-    if (app.settings && binError === null) binText = String(app.settings.bin_days);
+    if (app.settings && !binDirty && binError === null) binText = String(app.settings.bin_days);
   });
 
   async function setAutostart(on: boolean) {
@@ -29,6 +31,7 @@
   }
 
   async function saveBin() {
+    binDirty = false;
     const r = parseBinDays(binText);
     if (!r.ok) {
       binError = r.message;
@@ -74,6 +77,7 @@
           class="num"
           inputmode="numeric"
           bind:value={binText}
+          oninput={() => (binDirty = true)}
           aria-invalid={binError !== null}
           aria-describedby="{uid}-bin-help"
           onchange={saveBin}

@@ -6,7 +6,7 @@ const lib = (over: Partial<LibraryStatus> = {}): LibraryStatus => ({
   path: "C:\\Snap", health: { t: "ready" }, message: null, cloud_warning: null, not_synced: [], last_scan_at: null, last_error: null, ...over,
 });
 const base: BannerInput = {
-  info: { version: "0.1.0", device_name: "PC", bind: "127.0.0.1:47300", network_error: null, data_dir: "C:\\d" },
+  info: { version: "0.1.0", device_name: "PC", device_id: "aa", bind: "127.0.0.1:47300", network_error: null, data_dir: "C:\\d" },
   sync: { state: "synced", peer_name: "Pixel", last_synced_at: 1, waiting: 0, downloading: 0, message: null },
   library: lib(),
   firewall: { status: { t: "ok" }, message: null, can_fix: false },

@@ -12,13 +12,15 @@ use std::{
     collections::{HashMap, HashSet},
     net::SocketAddr,
     path::PathBuf,
-    sync::{Arc, Weak},
+    sync::{Arc, Mutex, Weak},
     time::Duration,
 };
 
+use rusqlite::Connection;
 use tugboat_net::{
     blob::{fetch_blob, serve_blob, BlobSource},
     close,
+    error::stream_err,
     frame::{read_frame, write_frame},
     iroh::endpoint::{RecvStream, SendStream},
     node::{AccessGate, Accepted, Node, NodeConfig, PeerConn, Role as NetRole, StreamKind},
@@ -93,8 +95,8 @@ fn short(e: &dyn std::fmt::Display) -> String {
 struct Gate(Weak<Inner>);
 
 impl AccessGate for Gate {
-    fn is_paired(&self, peer: &[u8; 32]) -> bool {
-        let Some(inner) = self.0.upgrade() else { return false };
+    fn is_paired(&self, peer: &[u8; 32]) -> std::result::Result<bool, String> {
+        let Some(inner) = self.0.upgrade() else { return Ok(false) };
         // A peer we owe an unpair notice still passes the gate, or our own hook would refuse
         // the one connection that delivers it.
         let r = {
@@ -107,12 +109,13 @@ impl AccessGate for Gate {
             })
         };
         match r {
-            Ok(paired) => paired,
+            Ok(paired) => Ok(paired),
             // Refusing is the safe answer, but a database failure must not look like an
-            // ordinary "not paired" refusal: say what happened.
+            // ordinary "not paired" refusal (the other device deletes its pairing on that
+            // code): say what happened and let the caller close without NOT_PAIRED.
             Err(e) => {
                 Core { inner }.emit_error(e.kind(), &format!("could not check the paired device, connection refused: {e}"));
-                false
+                Err(e.to_string())
             }
         }
     }
@@ -174,6 +177,8 @@ pub(crate) async fn stop(core: &Core) {
     for t in &ns.tasks {
         t.abort();
     }
+    // An aborted notice task cannot reset its own flag.
+    core.inner.notice_running.store(false, std::sync::atomic::Ordering::SeqCst);
     if let Some(a) = lock(&core.inner.active).take() {
         a.conn.close(close::NORMAL, "network stopped");
     }
@@ -318,16 +323,14 @@ async fn deliver_unpair(core: &Core, node: &Node, pending: &crate::store::Pendin
     let sent = async {
         let (mut tx, _rx) = conn.open_stream(StreamKind::Control).await?;
         write_frame(&mut tx, &Msg::Unpair).await?;
-        finish_and_wait(&mut tx).await;
-        Ok::<(), NetError>(())
+        finish_and_wait(&mut tx).await
     }
     .await;
     conn.close(close::UNPAIRED, "unpaired");
-    match sent {
-        Ok(()) => {}
-        // The PC closed on us because it does not pair this phone any more: same result.
-        Err(NetError::ClosedByPeer { code, .. }) if code == close::NOT_PAIRED || code == close::UNPAIRED => {}
-        Err(e) => return Err(e),
+    // Not confirmed (stopped, timed out, failed): the notice stays and is tried again. A PC that
+    // closed on us because it no longer pairs this phone counts as told.
+    if !unpair_delivered(&sent) {
+        return sent;
     }
     // Clear only the notice just delivered: a newer one for another PC stays.
     match core.with_ctx(|c, _| match crate::store::get_pending_unpair(c)? {
@@ -347,8 +350,9 @@ fn spawn_notice(core: &Core, node: &Node, first: crate::store::PendingUnpair) {
     if core.inner.notice_running.swap(true, SeqCst) {
         return;
     }
-    let (core, node) = (core.clone(), node.clone());
-    tokio::spawn(async move {
+    let (task_core, node) = (core.clone(), node.clone());
+    let handle = tokio::spawn(async move {
+        let core = task_core;
         let mut pending = first;
         let mut backoff = Duration::from_secs(1);
         loop {
@@ -377,10 +381,21 @@ fn spawn_notice(core: &Core, node: &Node, first: crate::store::PendingUnpair) {
         }
         core.inner.notice_running.store(false, SeqCst);
     });
+    // The task belongs to this network instance: `stop` aborts it with the loops, so a restarted
+    // network never inherits a task that holds the old, shut-down node.
+    match lock(&core.inner.net).as_mut() {
+        Some(ns) => ns.tasks.push(handle),
+        None => {
+            handle.abort();
+            core.inner.notice_running.store(false, SeqCst);
+        }
+    }
 }
 
 /// Local side of an unpair (also run when the peer tells us it unpaired). Files stay.
-fn unpair_local(core: &Core, peer: DeviceId) {
+/// Ok(true) = unpaired now, Ok(false) = nothing was paired. A failure is returned (and shown):
+/// callers that are about to tell the peer must not do so when this device is still paired.
+fn unpair_local(core: &Core, peer: DeviceId) -> Result<bool> {
     let r = core.with_ctx(|c, ctx| {
         if crate::store::is_paired(c, peer)? {
             ops::unpair(c, ctx, peer)?;
@@ -389,7 +404,7 @@ fn unpair_local(core: &Core, peer: DeviceId) {
             Ok(false)
         }
     });
-    match r {
+    match &r {
         Ok(true) => {
             core.emit(Event::Pairing(PairingEvent::Unpaired { peer }));
             core.emit(Event::ActivityAdded);
@@ -398,6 +413,7 @@ fn unpair_local(core: &Core, peer: DeviceId) {
         Ok(false) => {}
         Err(e) => core.emit_error(e.kind(), &format!("could not unpair: {e}")),
     }
+    r
 }
 
 pub(crate) async fn unpair(core: &Core) -> Result<()> {
@@ -406,7 +422,9 @@ pub(crate) async fn unpair(core: &Core) -> Result<()> {
         crate::store::paired_peer(&db.conn)?
     }
     .ok_or(CoreError::NotPaired)?;
-    unpair_local(core, peer.id);
+    // If this device cannot unpair, say so and tell nobody: the peer would drop the pairing while
+    // this device kept it, and the caller would see success.
+    unpair_local(core, peer.id)?;
     let cmd = lock(&core.inner.active).as_ref().filter(|a| a.conn.peer() == peer.id.0).map(|a| a.cmd.clone());
     let mut delivered = false;
     if let Some(cmd) = cmd {
@@ -464,7 +482,8 @@ pub(crate) async fn run_session(core: Core, conn: Arc<PeerConn>, dialer: bool) {
         End::Core(e) => core.emit_error(e.kind(), &e.to_string()),
         End::Net(NetError::ClosedByPeer { code, reason }) if code == close::NOT_PAIRED || code == close::UNPAIRED => {
             tracing::info!("the other device unpaired us: {reason}");
-            unpair_local(&core, peer);
+            // A failure is already shown by unpair_local; the pairing stays until a retry works.
+            let _ = unpair_local(&core, peer);
         }
         End::Net(NetError::ClosedByPeer { code, reason }) if code == close::NORMAL => tracing::debug!("peer closed: {reason}"),
         End::Net(e @ (NetError::Timeout(_) | NetError::Stream(_))) => tracing::debug!("connection lost: {e}"),
@@ -478,10 +497,50 @@ pub(crate) async fn run_session(core: Core, conn: Arc<PeerConn>, dialer: bool) {
     }
 }
 
-/// finish + wait until the peer has the bytes, so a following close cannot drop them.
-async fn finish_and_wait(tx: &mut SendStream) {
-    if tx.finish().is_ok() {
-        let _ = tokio::time::timeout(Duration::from_secs(2), tx.stopped()).await;
+/// How `finish_and_wait` ended: what the transport said about the finished stream.
+#[derive(Debug)]
+enum StreamEnd {
+    /// Every byte and the FIN were acknowledged.
+    Acked,
+    /// The peer sent STOP_SENDING: it may not have the whole frame.
+    Stopped(u64),
+    /// The stream or connection failed.
+    Failed(NetError),
+    /// No answer in time.
+    TimedOut,
+}
+
+/// A frame counts as delivered only when the transport acknowledged all of it.
+fn confirmed(end: StreamEnd) -> std::result::Result<(), NetError> {
+    match end {
+        StreamEnd::Acked => Ok(()),
+        StreamEnd::Stopped(code) => Err(NetError::Stream(format!("the peer stopped reading (code {code})"))),
+        StreamEnd::Failed(e) => Err(e),
+        StreamEnd::TimedOut => Err(NetError::Timeout("the peer did not confirm it received the frame".into())),
+    }
+}
+
+/// finish + wait until the peer has the bytes, so a following close cannot drop them. The result
+/// says whether it did: callers that must know (the unpair notice) use it, the others may ignore it.
+async fn finish_and_wait(tx: &mut SendStream) -> std::result::Result<(), NetError> {
+    if let Err(e) = tx.finish() {
+        return confirmed(StreamEnd::Failed(stream_err("finish", &e)));
+    }
+    confirmed(match tokio::time::timeout(Duration::from_secs(2), tx.stopped()).await {
+        Err(_) => StreamEnd::TimedOut,
+        Ok(Ok(None)) => StreamEnd::Acked,
+        Ok(Ok(Some(code))) => StreamEnd::Stopped(code.into_inner()),
+        Ok(Err(e)) => StreamEnd::Failed(stream_err("confirm delivery", &e)),
+    })
+}
+
+/// The unpair notice reached the other device: the transport confirmed it, or the device closed
+/// on us because it no longer pairs this one (the very thing the notice says).
+fn unpair_delivered(r: &std::result::Result<(), NetError>) -> bool {
+    match r {
+        Ok(()) => true,
+        Err(NetError::ClosedByPeer { code, .. }) => *code == close::NOT_PAIRED || *code == close::UNPAIRED,
+        Err(_) => false,
     }
 }
 
@@ -520,11 +579,19 @@ async fn drive(core: &Core, conn: &Arc<PeerConn>, dialer: bool, mut cmd_rx: mpsc
     let peer = DeviceId(conn.peer());
     let paired = {
         let db = lock(&inner.db);
-        crate::store::is_paired(&db.conn, peer).unwrap_or(false)
+        crate::store::is_paired(&db.conn, peer)
     };
-    if !paired {
-        conn.close(close::NOT_PAIRED, "not paired");
-        return (End::Clean, None);
+    match paired {
+        Ok(true) => {}
+        Ok(false) => {
+            conn.close(close::NOT_PAIRED, "not paired");
+            return (End::Clean, None);
+        }
+        // A database fault is not "not paired": NOT_PAIRED makes the healthy device delete its pairing.
+        Err(e) => {
+            conn.close(close::NORMAL, "could not check pairing");
+            return (End::Core(e), None);
+        }
     }
     core.set_state(SyncState::Syncing, None);
 
@@ -659,11 +726,16 @@ async fn drive(core: &Core, conn: &Arc<PeerConn>, dialer: bool, mut cmd_rx: mpsc
                 evaluate(core, &sess, &refused);
             }
             Some(Cmd::Unpair(done)) = cmd_rx.recv() => {
-                let sent = write_frame(&mut tx, &Msg::Unpair).await;
-                finish_and_wait(&mut tx).await;
+                let sent = async {
+                    write_frame(&mut tx, &Msg::Unpair).await?;
+                    finish_and_wait(&mut tx).await
+                }
+                .await;
                 conn.close(close::UNPAIRED, "unpaired");
-                let _ = done.send(sent.is_ok());
-                return (sent.map(|_| End::Clean).unwrap_or_else(End::Net), refused);
+                // Reported as delivered only when the transport confirmed the whole frame.
+                let delivered = unpair_delivered(&sent);
+                let _ = done.send(delivered);
+                return (if delivered { End::Clean } else { sent.err().map_or(End::Clean, End::Net) }, refused);
             }
             _ = ticker.tick() => {
                 if fetcher.has_backoff() || fetcher.lost_due() {
@@ -704,7 +776,8 @@ async fn drive(core: &Core, conn: &Arc<PeerConn>, dialer: bool, mut cmd_rx: mpsc
 async fn apply_step(core: &Core, conn: &Arc<PeerConn>, sess: &Session, tx: &mut SendStream, step: Step, now: i64, refused: &mut Option<String>) -> Flow {
     let peer = sess.peer;
     if step.unpair {
-        unpair_local(core, peer);
+        // A failure is already shown by unpair_local; the pairing stays until a retry works.
+        let _ = unpair_local(core, peer);
     }
     if let Some(text) = &step.refused {
         *refused = Some(text.clone());
@@ -732,7 +805,8 @@ async fn apply_step(core: &Core, conn: &Arc<PeerConn>, sess: &Session, tx: &mut 
         }
     }
     if let Some((code, reason)) = &step.close {
-        finish_and_wait(tx).await;
+        // Best effort: the close below follows either way.
+        let _ = finish_and_wait(tx).await;
         conn.close(*code, reason);
         return Flow::Stop(End::Clean);
     }
@@ -771,7 +845,6 @@ fn evaluate(core: &Core, sess: &Session, refused: &Option<String>) {
 
 struct FetchDone {
     id: ItemId,
-    hash: BlobHash,
     outcome: FetchOutcome,
 }
 
@@ -789,7 +862,6 @@ enum FetchOutcome {
 #[derive(Default)]
 struct Fetcher {
     in_flight: HashSet<ItemId>,
-    hashes: HashSet<BlobHash>,
     backoff: HashMap<ItemId, (u32, Instant)>,
     /// Lost items already asked for in this session -> earliest time to ask again.
     lost_tried: HashMap<ItemId, Instant>,
@@ -808,7 +880,6 @@ impl Fetcher {
 
     fn finish(&mut self, d: &FetchDone, base_ms: u64) {
         self.in_flight.remove(&d.id);
-        self.hashes.remove(&d.hash);
         match &d.outcome {
             FetchOutcome::Retry { .. } => {
                 let tries = self.backoff.get(&d.id).map(|b| b.0).unwrap_or(0) + 1;
@@ -825,6 +896,97 @@ impl Fetcher {
     }
 }
 
+/// Rows read per page when looking for something to download.
+const PICK_PAGE: u32 = 500;
+
+/// Owned by a download task: while it lives its content hash is claimed core-wide, so no second
+/// task (this session's or a later one's) writes the same `<hash>.part`. Dropping it, whatever
+/// ended the task, frees the hash and wakes the scheduler: a new session may have skipped the
+/// item only because this task still held it.
+struct HashGuard {
+    core: Core,
+    hash: BlobHash,
+}
+
+impl Drop for HashGuard {
+    fn drop(&mut self) {
+        lock(&self.core.inner.fetching).remove(&self.hash);
+        self.core.inner.kick.notify_one();
+    }
+}
+
+/// Choose up to `slots` items to download: Pending oldest first, then Lost (asked at most once per
+/// `LOST_RETRY`). It pages past every item it has to skip (in flight, in back-off, in the Bin, hash
+/// already being fetched), so a block of failing items never starves the ones behind it. The hash of
+/// each pick is claimed in `fetching` before this returns. On an error nothing stays claimed: no
+/// task would ever own those claims, so the items would be skipped until the app restarts.
+fn pick_downloads(
+    c: &Connection,
+    f: &Fetcher,
+    fetching: &Mutex<HashSet<BlobHash>>,
+    slots: usize,
+    now: i64,
+    t: Instant,
+) -> Result<Vec<(ItemId, BlobHash, bool)>> {
+    let mut out: Vec<(ItemId, BlobHash, bool)> = Vec::new();
+    match pick_into(c, f, fetching, slots, now, t, &mut out) {
+        Ok(()) => Ok(out),
+        Err(e) => {
+            let mut held = lock(fetching);
+            for (_, hash, _) in &out {
+                held.remove(hash);
+            }
+            Err(e)
+        }
+    }
+}
+
+fn pick_into(
+    c: &Connection,
+    f: &Fetcher,
+    fetching: &Mutex<HashSet<BlobHash>>,
+    slots: usize,
+    now: i64,
+    t: Instant,
+    out: &mut Vec<(ItemId, BlobHash, bool)>,
+) -> Result<()> {
+    'states: for state in [LocalFileState::Pending, LocalFileState::Lost] {
+        let mut after = None;
+        loop {
+            let page = crate::store::items_in_state_after(c, &[state], after, PICK_PAGE)?;
+            for (captured_at, id) in &page {
+                after = Some((*captured_at, *id));
+                if out.len() >= slots {
+                    break 'states;
+                }
+                let id = *id;
+                if f.in_flight.contains(&id) || f.backoff.get(&id).is_some_and(|b| b.1 > t) {
+                    continue;
+                }
+                if f.lost_tried.get(&id).is_some_and(|next| *next > t) {
+                    continue;
+                }
+                let Some((rec, lfs)) = crate::store::get_item(c, id)? else { continue };
+                let hash = rec.content.val.hash;
+                // A Pending item that sits in the Bin is never downloaded: the sweep purges it.
+                if expiry::in_bin(bin::derive_state(c, &rec, now)?) {
+                    continue;
+                }
+                // Two items with the same file share one part file: one download at a time per
+                // hash, across sessions (a task outlives its session). The last check, the claim.
+                if !lock(fetching).insert(hash) {
+                    continue;
+                }
+                out.push((id, hash, lfs == LocalFileState::Lost));
+            }
+            if page.len() < PICK_PAGE as usize {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Start downloads for Pending items, oldest first, up to `MAX_PARALLEL_FETCH`.
 fn schedule(core: &Core, conn: &Arc<PeerConn>, peer: DeviceId, f: &mut Fetcher, done_tx: &mpsc::UnboundedSender<FetchDone>) {
     if lock(&core.inner.paused).is_some() || f.in_flight.len() >= MAX_PARALLEL_FETCH || !conn.is_open() {
@@ -832,48 +994,11 @@ fn schedule(core: &Core, conn: &Arc<PeerConn>, peer: DeviceId, f: &mut Fetcher, 
     }
     let now = core.now();
     let t = Instant::now();
-    // Walk the oldest Pending items lazily and stop as soon as the free slots are filled: a
-    // first sync of a big library must not re-read every pending item after each download.
     let slots = MAX_PARALLEL_FETCH - f.in_flight.len();
-    let picked: Result<Vec<(ItemId, BlobHash)>> = (|| {
+    let picked = {
         let db = lock(&core.inner.db);
-        let c = &db.conn;
-        let mut out: Vec<(ItemId, BlobHash)> = Vec::new();
-        // Pending first; Lost items only once per LOST_RETRY (and once at session start).
-        let mut candidates = crate::store::items_in_state(c, &[LocalFileState::Pending], 500)?;
-        if candidates.len() < slots.max(1) {
-            candidates.extend(crate::store::items_in_state(c, &[LocalFileState::Lost], 500)?);
-        }
-        for id in candidates {
-            if out.len() >= slots {
-                break;
-            }
-            if f.in_flight.contains(&id) || f.backoff.get(&id).is_some_and(|b| b.1 > t) {
-                continue;
-            }
-            if f.lost_tried.get(&id).is_some_and(|next| *next > t) {
-                continue;
-            }
-            let Some((rec, _)) = crate::store::get_item(c, id)? else { continue };
-            let hash = rec.content.val.hash;
-            // Two items with the same file share one part file: one download at a time per hash.
-            if f.hashes.contains(&hash) || out.iter().any(|(_, h)| *h == hash) {
-                continue;
-            }
-            // A Pending item that sits in the Bin is never downloaded: the sweep purges it.
-            if expiry::in_bin(bin::derive_state(c, &rec, now)?) {
-                continue;
-            }
-            out.push((id, hash));
-        }
-        // Remember when each picked Lost item was asked, so it is not asked in a loop.
-        for (id, _) in &out {
-            if let Some((_, LocalFileState::Lost)) = crate::store::get_item(c, *id)? {
-                f.lost_tried.insert(*id, t + LOST_RETRY);
-            }
-        }
-        Ok(out)
-    })();
+        pick_downloads(&db.conn, f, &core.inner.fetching, slots, now, t)
+    };
     let picked = match picked {
         Ok(c) => c,
         Err(e) => {
@@ -881,13 +1006,18 @@ fn schedule(core: &Core, conn: &Arc<PeerConn>, peer: DeviceId, f: &mut Fetcher, 
             return;
         }
     };
-    for (id, hash) in picked {
+    for (id, hash, was_lost) in picked {
         f.in_flight.insert(id);
-        f.hashes.insert(hash);
+        // Remember when each picked Lost item was asked, so it is not asked in a loop.
+        if was_lost {
+            f.lost_tried.insert(id, t + LOST_RETRY);
+        }
+        let guard = HashGuard { core: core.clone(), hash };
         let (core, conn, tx) = (core.clone(), conn.clone(), done_tx.clone());
         tokio::spawn(async move {
             let outcome = fetch_item(&core, &conn, peer, id).await;
-            let _ = tx.send(FetchDone { id, hash, outcome });
+            let _ = tx.send(FetchDone { id, outcome });
+            drop(guard);
         });
     }
 }
@@ -1030,5 +1160,163 @@ impl BlobSource for CoreBlobSource {
             ids.into_iter().find_map(|id| crate::store::get_file_ref(&db.conn, id).ok().flatten().map(|r| PathBuf::from(r.path)).filter(|p| p.exists()))
         };
         from_items.or_else(|| Some(self.core.thumb_path(hash)).filter(|p| p.exists()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{clock::TestClock, facade::CoreConfig, placement::AppStorage, store, store::test_support::*};
+    use uuid::Uuid;
+
+    fn open_core(dir: &std::path::Path) -> Core {
+        let cfg = CoreConfig { data_dir: dir.join("data"), role: Role::Phone, self_id: f(), device_name: "phone".into(), app_version: "t".into() };
+        let storage = AppStorage::new(dir.join("storage")).unwrap();
+        Core::open(cfg, Arc::new(TestClock::new(T0)), Arc::new(storage)).unwrap().0
+    }
+
+    /// `n` Pending (or Lost) items, ids and hashes from 1..=n, captured oldest first.
+    fn add_items(core: &Core, n: u32, lfs: LocalFileState) -> Vec<(ItemId, BlobHash)> {
+        core.debug_conn(|c| {
+            (1..=n)
+                .map(|i| {
+                    let mut it = item(1, p(), v(1, p()));
+                    it.id = ItemId(Uuid::from_u128(0x10_000 + i as u128));
+                    it.captured_at = T0 + i as i64;
+                    let mut h = [0u8; 32];
+                    h[..4].copy_from_slice(&i.to_le_bytes());
+                    it.content.val.hash = BlobHash(h);
+                    it.location.val.entered_at = T0;
+                    store::insert_item(c, &it, lfs, T0).unwrap();
+                    (it.id, it.content.val.hash)
+                })
+                .collect()
+        })
+    }
+
+    fn pick(core: &Core, f: &Fetcher, slots: usize) -> Vec<(ItemId, BlobHash, bool)> {
+        core.debug_conn(|c| pick_downloads(c, f, &core.inner.fetching, slots, T0, Instant::now()).unwrap())
+    }
+
+    // Review finding 7: the oldest 500 Pending items all in back-off must not hide item 501.
+    #[tokio::test]
+    async fn pending_items_behind_a_block_of_backed_off_ones_are_picked() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = open_core(dir.path());
+        let items = add_items(&core, 600, LocalFileState::Pending);
+        let mut f = Fetcher::default();
+        let later = Instant::now() + Duration::from_secs(3600);
+        for (id, _) in &items[..500] {
+            f.backoff.insert(*id, (1, later));
+        }
+        let got = pick(&core, &f, 2);
+        assert_eq!(got.iter().map(|g| g.0).collect::<Vec<_>>(), vec![items[500].0, items[501].0]);
+        assert!(got.iter().all(|g| !g.2), "Pending picks are not marked Lost");
+        // Every pick claimed its hash core-wide.
+        assert_eq!(lock(&core.inner.fetching).len(), 2);
+    }
+
+    // Same for Lost items: more than one page of them, the first page asked recently.
+    #[tokio::test]
+    async fn lost_items_beyond_the_first_page_are_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = open_core(dir.path());
+        let items = add_items(&core, 600, LocalFileState::Lost);
+        let mut f = Fetcher::default();
+        let later = Instant::now() + Duration::from_secs(3600);
+        for (id, _) in &items[..500] {
+            f.lost_tried.insert(*id, later);
+        }
+        let got = pick(&core, &f, 2);
+        assert_eq!(got.iter().map(|g| g.0).collect::<Vec<_>>(), vec![items[500].0, items[501].0]);
+        assert!(got.iter().all(|g| g.2), "Lost picks are marked so they are not asked in a loop");
+    }
+
+    // Review finding 11: a hash still held by a download task (of an earlier session) is not
+    // picked again; when that task ends the hash is free and the scheduler is woken.
+    #[tokio::test]
+    async fn a_hash_held_by_a_running_download_is_skipped_until_it_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = open_core(dir.path());
+        let items = add_items(&core, 2, LocalFileState::Pending);
+        let (held_id, held_hash) = items[0];
+        lock(&core.inner.fetching).insert(held_hash);
+        let guard = HashGuard { core: core.clone(), hash: held_hash };
+        let f = Fetcher::default();
+        let got = pick(&core, &f, 2);
+        assert_eq!(got.iter().map(|g| g.0).collect::<Vec<_>>(), vec![items[1].0], "the held item is skipped, the other is picked");
+        drop(guard);
+        assert!(!lock(&core.inner.fetching).contains(&held_hash), "freed when the task ends");
+        tokio::time::timeout(Duration::from_millis(200), core.inner.kick.notified()).await.expect("the scheduler was woken");
+        let got = pick(&core, &f, 2);
+        assert!(got.iter().any(|g| g.0 == held_id), "now it is picked");
+    }
+
+    // Review finding 11 (verifier): an error in the middle of a pick must not leave the hashes it
+    // already claimed held for good, with no task to free them.
+    #[tokio::test]
+    async fn an_error_mid_pick_frees_the_hashes_it_claimed() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = open_core(dir.path());
+        let items = add_items(&core, 3, LocalFileState::Pending);
+        // Item 3 cannot be read: its stored hash is not 32 bytes.
+        core.debug_conn(|c| {
+            c.execute_batch("PRAGMA ignore_check_constraints = ON").unwrap();
+            c.execute("UPDATE item SET blob_hash = x'00' WHERE id = ?1", [items[2].0 .0.as_bytes().as_slice()]).unwrap();
+            c.execute_batch("PRAGMA ignore_check_constraints = OFF").unwrap();
+        });
+        let f = Fetcher::default();
+        let r = core.debug_conn(|c| pick_downloads(c, &f, &core.inner.fetching, 3, T0, Instant::now()));
+        assert!(r.is_err(), "the unreadable item fails the pick");
+        assert!(lock(&core.inner.fetching).is_empty(), "nothing stays claimed after the error");
+    }
+
+    // Review finding 9: the unpair-notice task belongs to the network instance. Stopping the network
+    // ends it at once, so a restarted network can start its own (a task that outlived the stop kept
+    // the shut-down node, and its running flag kept the new task from ever starting).
+    #[tokio::test]
+    async fn stopping_the_network_ends_the_notice_task() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let dir = tempfile::tempdir().unwrap();
+        let mut secret = [0u8; 32];
+        getrandom::fill(&mut secret).unwrap();
+        let cfg = CoreConfig {
+            data_dir: dir.path().join("data"),
+            role: Role::Phone,
+            self_id: crate::facade::device_id_from_secret(&secret),
+            device_name: "phone".into(),
+            app_version: "t".into(),
+        };
+        let storage = AppStorage::new(dir.path().join("storage")).unwrap();
+        let core = Core::open(cfg, Arc::new(TestClock::new(T0)), Arc::new(storage)).unwrap().0;
+        core.start_network(NetworkConfig { bind: "127.0.0.1:0".parse().unwrap(), mdns: false, secret_key: secret }).await.unwrap();
+        let mut other = [0u8; 32];
+        getrandom::fill(&mut other).unwrap();
+        // An old PC that nobody answers for: the task dials (5 s) and backs off.
+        let pending = crate::store::PendingUnpair { peer: hex::encode(crate::facade::device_id_from_secret(&other).0), addresses: vec!["127.0.0.1:9".into()] };
+        let node = lock(&core.inner.net).as_ref().unwrap().node.clone();
+        let before = lock(&core.inner.net).as_ref().unwrap().tasks.len();
+        spawn_notice(&core, &node, pending);
+        assert!(core.inner.notice_running.load(SeqCst), "the task is running");
+        assert_eq!(lock(&core.inner.net).as_ref().unwrap().tasks.len(), before + 1, "the task is registered with this network instance, so stop aborts it");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        core.stop_network().await;
+        assert!(!core.inner.notice_running.load(SeqCst), "stopping the network ended the task and freed the flag");
+    }
+
+    // Review finding 6: only a fully acknowledged frame counts as delivered.
+    #[test]
+    fn only_an_acknowledged_frame_is_delivered() {
+        assert!(confirmed(StreamEnd::Acked).is_ok());
+        assert!(confirmed(StreamEnd::Stopped(0)).is_err(), "STOP_SENDING is not delivery");
+        assert!(matches!(confirmed(StreamEnd::TimedOut), Err(NetError::Timeout(_))));
+        assert!(confirmed(StreamEnd::Failed(NetError::Stream("x".into()))).is_err());
+        // The unpair notice also counts as told when the other side closed because it no longer pairs us.
+        assert!(unpair_delivered(&Ok(())));
+        assert!(unpair_delivered(&Err(NetError::ClosedByPeer { code: close::UNPAIRED, reason: String::new() })));
+        assert!(unpair_delivered(&Err(NetError::ClosedByPeer { code: close::NOT_PAIRED, reason: String::new() })));
+        assert!(!unpair_delivered(&Err(NetError::ClosedByPeer { code: close::NORMAL, reason: String::new() })));
+        assert!(!unpair_delivered(&Err(NetError::Timeout("t".into()))));
+        assert!(!unpair_delivered(&Err(NetError::Stream("s".into()))));
     }
 }

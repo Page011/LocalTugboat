@@ -35,10 +35,20 @@ class PagedModel<T>(private val pageSize: Int = 60, private val load: suspend (c
 
     suspend fun reload() = lock.withLock {
         guarded {
-            val p = load(null, rows.size.coerceIn(pageSize, MAX_LIMIT))
-            rows = p.rows
-            next = p.next
-            hasMore = p.next != null
+            // As many rows as are on screen, in pages the core accepts. Nothing is committed until every page came back.
+            val target = rows.size.coerceAtLeast(pageSize)
+            val acc = ArrayList<T>(target)
+            var cursor: String? = null
+            var more: String?
+            do {
+                val p = load(cursor, minOf(target - acc.size, MAX_LIMIT).coerceAtLeast(1))
+                acc += p.rows
+                more = p.next
+                cursor = more
+            } while (acc.size < target && more != null)
+            rows = acc
+            next = more
+            hasMore = more != null
         }
     }
 
