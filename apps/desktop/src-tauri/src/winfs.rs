@@ -17,7 +17,7 @@ use windows::{
     Win32::{
         Foundation::HANDLE,
         Storage::FileSystem::{
-            CopyFileExW, GetFileInformationByHandle, MoveFileExW, MOVEFILE_COPY_ALLOWED, GetFileInformationByHandleEx, GetVolumeInformationW, GetVolumePathNameW, SetFileAttributesW,
+            CopyFileExW, GetFileInformationByHandle, MoveFileExW, GetFileInformationByHandleEx, GetVolumeInformationW, GetVolumePathNameW, SetFileAttributesW,
             BY_HANDLE_FILE_INFORMATION, COPYFILE_FLAGS, COPYPROGRESSROUTINE_PROGRESS, COPY_FILE_FAIL_IF_EXISTS, FILE_ATTRIBUTE_HIDDEN,
             FILE_ATTRIBUTE_NORMAL, FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_INFO, FileIdInfo, LPPROGRESS_ROUTINE_CALLBACK_REASON, MOVE_FILE_FLAGS, PROGRESS_CONTINUE,
         },
@@ -162,15 +162,6 @@ pub fn copy_file(src: &Path, dst: &Path, progress: &mut dyn FnMut(u64, u64)) -> 
         .map_err(|e| io::Error::from_raw_os_error((e.code().0 as u32 & 0xFFFF) as i32))
 }
 
-/// Move `from` to `to` WITHOUT replacing: when `to` exists the call fails with `AlreadyExists`
-/// (`std::fs::rename` replaces on Windows). Across drives it copies and deletes (MOVEFILE_COPY_ALLOWED).
-pub fn move_no_replace(from: &Path, to: &Path) -> io::Result<()> {
-    let (f, t) = (wide(from), wide(to));
-    // SAFETY: both paths are NUL-terminated and outlive the call.
-    unsafe { MoveFileExW(PCWSTR(f.as_ptr()), PCWSTR(t.as_ptr()), MOVEFILE_COPY_ALLOWED) }
-        .map_err(|e| io::Error::from_raw_os_error((e.code().0 as u32 & 0xFFFF) as i32))
-}
-
 /// Rename `from` to `to`, failing with `ErrorKind::AlreadyExists` when `to` exists. `std::fs::rename`
 /// replaces an existing file on Windows, so a file that appears between an `exists()` check and
 /// the rename would be silently overwritten; this call (MoveFileExW without
@@ -308,21 +299,6 @@ mod tests {
         assert!(open_exclusive(&p).is_err());
         drop(writer);
         assert!(open_exclusive(&p).is_ok());
-    }
-
-    #[test]
-    fn move_no_replace_never_overwrites() {
-        let d = tempfile::tempdir().unwrap();
-        let (a, b, c) = (d.path().join("a.txt"), d.path().join("b.txt"), d.path().join("c.txt"));
-        std::fs::write(&a, b"new").unwrap();
-        std::fs::write(&b, b"someone else's").unwrap();
-        let e = move_no_replace(&a, &b).unwrap_err();
-        assert_eq!(e.kind(), io::ErrorKind::AlreadyExists);
-        assert_eq!(std::fs::read(&b).unwrap(), b"someone else's", "the existing file is untouched");
-        assert!(a.exists(), "the source stays after a refused move");
-        move_no_replace(&a, &c).unwrap();
-        assert!(!a.exists());
-        assert_eq!(std::fs::read(&c).unwrap(), b"new");
     }
 
     #[test]

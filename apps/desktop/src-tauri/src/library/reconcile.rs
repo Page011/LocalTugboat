@@ -104,10 +104,10 @@ fn not_synced(path: &Path, name: &str, reason: &str) -> NotSyncedFile {
 }
 
 /// A download or editor lock file that is not the real file yet: Chrome `.crdownload`, `.part`,
-/// Office `~$x.docx`, LibreOffice `.~lock.x.odt#`. (Question 8 to the owner: built as "listed, not synced".)
+/// Office `~$x.docx`, LibreOffice `.~lock.x.odt#`, and this app's own cross-drive move copy. (Question 8 to the owner: built as "listed, not synced".)
 fn is_in_progress(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    lower.starts_with("~$") || lower.starts_with(".~lock.") || ["crdownload", "part", "partial", "download", "opdownload"].contains(&names::ext_of(name).as_str())
+    lower.starts_with("~$") || lower.starts_with(".~lock.") || ["crdownload", "part", "partial", "download", "opdownload", super::placement::MOVE_EXT].contains(&names::ext_of(name).as_str())
 }
 
 fn disk_file(path: PathBuf, dir: Option<String>, name: String, meta: &std::fs::Metadata) -> DiskFile {
@@ -554,7 +554,7 @@ impl Inner {
             if st.pause.is_some() {
                 continue; // paused: nothing new is imported until the user decides
             }
-            if !st.cfg.legacy_done && names::media_family_of_name(&f.name).is_none() {
+            if !st.cfg.legacy_done && !st.legacy_closed && names::media_family_of_name(&f.name).is_none() {
                 st.cfg.legacy.push(LegacyFile { path: key.clone(), volume: ident.map(|i| i.volume_serial), id: ident.map(|i| i.id_hex()) });
                 legacy_changed = true;
                 ns.push(not_synced(&f.path, &f.name, LEGACY_REASON));
@@ -587,7 +587,7 @@ impl Inner {
             }
         }
         st.not_synced = ns;
-        self.settle_legacy(st, legacy_changed);
+        self.settle_legacy(st, legacy_changed, errors);
         if rep.deferred > 0 {
             rep.retry_after = Some(self.opts.stable_for);
         }
@@ -638,17 +638,24 @@ impl Inner {
 
     /// The first complete pass under 0.2.0 closes the pre-0.2.0 list; later passes only drop entries whose
     /// file is gone (a deleted file's name is free again and a new file of that name syncs).
-    fn settle_legacy(&self, st: &mut State, mut changed: bool) {
-        if !st.cfg.legacy_done && st.pause.is_none() {
-            st.cfg.legacy_done = true;
+    fn settle_legacy(&self, st: &mut State, mut changed: bool, errors: &mut Vec<String>) {
+        // The change is made on a copy: the in-memory config takes it only when the file did (as `persist` does).
+        // After a failed save the next pass sees the same difference (`legacy_done` still false, the gone entries
+        // still listed) and tries again, instead of believing it is saved.
+        let mut next = st.cfg.clone();
+        if !next.legacy_done && st.pause.is_none() {
+            next.legacy_done = true;
+            st.legacy_closed = true; // decided now, saved or not: later passes classify nothing new as legacy
             changed = true;
         }
-        let before = st.cfg.legacy.len();
+        let before = next.legacy.len();
         let live_ids: HashSet<(u64, String)> = st.ids.values().map(|(_, _, i)| (i.volume_serial, i.id_hex())).collect();
-        st.cfg.legacy.retain(|e| Path::new(&e.path).exists() || matches!((e.volume, &e.id), (Some(v), Some(id)) if live_ids.contains(&(v, id.clone()))));
-        if changed || st.cfg.legacy.len() != before {
-            if let Err(e) = st.cfg.save(&self.data_dir) {
-                st.last_error = Some(format!("CANNOT SAVE LIBRARY CONFIG - {e}"));
+        next.legacy.retain(|e| Path::new(&e.path).exists() || matches!((e.volume, &e.id), (Some(v), Some(id)) if live_ids.contains(&(v, id.clone()))));
+        if changed || next.legacy.len() != before {
+            match next.save(&self.data_dir) {
+                Ok(()) => st.cfg = next,
+                // Through `errors`: the pass overwrites `last_error` from them, and they also schedule the retry.
+                Err(e) => errors.push(format!("CANNOT SAVE LIBRARY CONFIG - {e}")),
             }
         }
     }

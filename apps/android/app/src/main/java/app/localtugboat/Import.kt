@@ -256,12 +256,27 @@ object Capture {
     fun isCameraTemp(name: String): Boolean = name.endsWith(".tmp", ignoreCase = true)
 
     /**
+     * Delete CameraX temp files a killed process left in [shotsDir]: [recover] skips them, so they would pile up.
+     * One touched within [minAgeMs] may still be being written (the camera keeps touching it): kept.
+     * Returns how many were deleted.
+     */
+    fun sweepCameraTemps(shotsDir: File, nowMs: Long, minAgeMs: Long): Int {
+        var gone = 0
+        for (f in shotsDir.listFiles().orEmpty()) {
+            if (!f.isFile || !isCameraTemp(f.name) || nowMs - f.lastModified() < minAgeMs) continue
+            if (f.delete()) gone++
+        }
+        return gone
+    }
+
+    /**
      * Retry shots left in [shotsDir] by a crash or a failed hand-off. Files younger than [minAgeMs] are
      * skipped (a shot being written right now). Blocking. Returns how many were taken; failures stay in
      * the folder and are logged.
      */
     fun recover(c: Context, nowMs: Long = System.currentTimeMillis(), minAgeMs: Long = 60_000): Int {
         sweepOrphanMetas(shotsDir(c), nowMs, minAgeMs)
+        sweepCameraTemps(shotsDir(c), nowMs, minAgeMs)
         var taken = 0
         val knownFolders by lazy { c.core.phone().folders().map { it.id }.toSet() }
         for (f in shotsDir(c).listFiles().orEmpty()) {

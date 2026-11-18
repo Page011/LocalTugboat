@@ -263,6 +263,28 @@ fn downloads_and_editor_lock_files_are_listed_not_synced_yet_and_sync_once_they_
     assert_eq!(r.item("a.zip").ext, "zip");
 }
 
+/// The copy a cross-drive move makes sits in the visible library folder under `<name>.tugboat-move`: a scan must
+/// never import it (a crash mid-copy leaves it), and the start-up clean-up removes it from the root and the folders.
+#[test]
+fn a_move_copy_left_in_the_library_is_in_progress_never_an_item_and_is_removed_at_start() {
+    let mut r = Rig::new();
+    std::fs::create_dir(r.root.join("Work")).unwrap();
+    std::fs::write(r.root.join("a.tugboat-move"), jpeg(1, 64)).unwrap();
+    std::fs::write(r.root.join("Work").join("B.TUGBOAT-MOVE"), jpeg(2, 64)).unwrap();
+    r.write("keep.jpg", 3);
+    r.settle();
+    r.settle();
+    let s = r.lib.status();
+    for n in ["a.tugboat-move", "B.TUGBOAT-MOVE"] {
+        assert!(s.not_synced.iter().any(|f| f.name == n && f.reason.starts_with("IN PROGRESS")), "{n} is listed: {:?}", s.not_synced);
+    }
+    assert_eq!(r.items().iter().map(|i| i.name.as_str()).collect::<Vec<_>>(), ["keep.jpg"], "no move copy is imported");
+    assert_eq!(crate::drop::clean_stale(&r.root), 2);
+    assert!(!r.root.join("a.tugboat-move").exists() && !r.root.join("Work").join("B.TUGBOAT-MOVE").exists());
+    assert!(r.root.join("keep.jpg").exists(), "nothing else is removed");
+    assert_eq!(crate::drop::clean_stale(&r.root), 0);
+}
+
 /// A 0.1.x library: the config has a path but no `legacy_done`. Its non-photo files were listed
 /// "not synced" and left alone; importing them now would start an expiry clock on files the user
 /// never asked to sync.
@@ -306,6 +328,85 @@ fn files_that_were_there_before_0_2_0_stay_listed_and_are_never_imported() {
     std::fs::write(r.root.join("notes2.txt"), b"fresh").unwrap();
     r.settle();
     assert_eq!(r.item("notes2.txt").kind, tugboat_core::MediaKind::File);
+}
+
+/// Closing the pre-0.2.0 list is written to library.json; when that write fails the in-memory config must not
+/// say "done" while the file does not, or no later pass would ever write it (nothing differs any more).
+#[test]
+fn a_failed_save_of_the_closed_pre_0_2_0_list_is_retried_not_believed() {
+    let mut r = Rig::new();
+    let mut cfg = LibraryConfig::load(&r.data).unwrap();
+    cfg.legacy_done = false;
+    cfg.save(&r.data).unwrap();
+    r.lib = Library::open(r.core.clone(), r.place.clone(), r.data.clone(), cfg, &r.root, LibraryOptions::default(), Box::new(|_| {})).unwrap();
+    std::fs::write(r.root.join("notes.txt"), b"old").unwrap();
+    let blocker = block_config_save(&r.data);
+    r.scan(0);
+    let err = r.lib.status().last_error.expect("the failed save is shown");
+    assert!(err.contains("CANNOT SAVE LIBRARY CONFIG"), "{err}");
+    assert!(!LibraryConfig::load(&r.data).unwrap().legacy_done, "the file was not written");
+    std::fs::remove_dir(&blocker).unwrap();
+    // Nothing changed on disk since: the retry must still happen.
+    r.scan(1);
+    assert_eq!(r.lib.status().last_error, None);
+    let cfg = LibraryConfig::load(&r.data).unwrap();
+    assert!(cfg.legacy_done, "library.json now holds the closed list");
+    assert!(cfg.legacy.iter().any(|e| e.path.to_lowercase().ends_with("notes.txt")), "{cfg:?}");
+}
+
+/// While library.json cannot be saved, a file added AFTER the first complete pass is not a pre-0.2.0 file: it must
+/// sync, and it must never reach the legacy list (in memory or, once the save works, in the file).
+#[test]
+fn a_file_added_while_the_closed_list_cannot_be_saved_is_not_taken_for_old() {
+    let mut r = Rig::new();
+    let mut cfg = LibraryConfig::load(&r.data).unwrap();
+    cfg.legacy_done = false;
+    cfg.save(&r.data).unwrap();
+    r.lib = Library::open(r.core.clone(), r.place.clone(), r.data.clone(), cfg, &r.root, LibraryOptions::default(), Box::new(|_| {})).unwrap();
+    std::fs::write(r.root.join("notes.txt"), b"old").unwrap();
+    let blocker = block_config_save(&r.data);
+    r.scan(0);
+    assert!(r.lib.status().last_error.is_some(), "the save failed");
+    std::fs::write(r.root.join("new.pdf"), b"new").unwrap();
+    r.settle();
+    assert_eq!(r.item("new.pdf").kind, tugboat_core::MediaKind::File, "the new file syncs although the save still fails");
+    assert!(r.lib.status().not_synced.iter().any(|n| n.name == "notes.txt"), "the old file stays listed");
+    std::fs::remove_dir(&blocker).unwrap();
+    r.settle();
+    let cfg = LibraryConfig::load(&r.data).unwrap();
+    assert!(cfg.legacy_done);
+    assert!(cfg.legacy.iter().any(|e| e.path.to_lowercase().ends_with("notes.txt")), "{cfg:?}");
+    assert!(cfg.legacy.iter().all(|e| !e.path.to_lowercase().ends_with("new.pdf")), "{cfg:?}");
+    assert_eq!(r.item("new.pdf").kind, tugboat_core::MediaKind::File);
+}
+
+/// D6: a received file carries `Zone.Identifier` (ZoneId=3). Choosing a new folder reserves each destination
+/// (create_new) and copies over it; the copy must bring the stream along, and Locate must leave it alone.
+#[test]
+fn a_received_files_mark_of_the_web_survives_choose_and_locate() {
+    use crate::winfs::{read_zone_mark, write_zone_mark, ZONE_TEXT};
+    let mut r = Rig::new();
+    for (rel, seed) in [("a.jpg", 1), ("Work/b.jpg", 2)] {
+        let p = r.write(rel, seed);
+        write_zone_mark(&p).unwrap();
+    }
+    r.settle();
+    assert_eq!(r.items().len(), 2);
+    let new_root = r._tmp.path().join("newlib");
+    r.lib.choose(&new_root, false).unwrap();
+    for p in [new_root.join("a.jpg"), new_root.join("Work").join("b.jpg")] {
+        assert_eq!(read_zone_mark(&p).as_deref(), Some(ZONE_TEXT), "Choose kept the mark on {}", p.display());
+    }
+    // Locate: the folder is moved in Explorer, the records follow; no file is rewritten, so the mark stays.
+    let located = r._tmp.path().join("located");
+    std::fs::rename(&new_root, &located).unwrap();
+    r.scan(1);
+    r.lib.locate(&located).unwrap();
+    r.scan(1);
+    assert_eq!(r.items().len(), 2);
+    for p in [located.join("a.jpg"), located.join("Work").join("b.jpg")] {
+        assert_eq!(read_zone_mark(&p).as_deref(), Some(ZONE_TEXT), "Locate kept the mark on {}", p.display());
+    }
 }
 
 /// Explorer rename to a refused name: the record does not change, the file is listed, Tugboat never

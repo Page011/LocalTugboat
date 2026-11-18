@@ -125,6 +125,10 @@ pub(crate) struct Bulk {
 
 pub(crate) struct State {
     pub cfg: LibraryConfig,
+    /// The first complete pass under 0.2.0 has decided the pre-0.2.0 list. Memory only: `cfg.legacy_done` is the
+    /// same fact as saved, and stays false while library.json cannot be written (that difference makes the retry).
+    /// Until the file says so, this alone keeps a file added after the list closed from joining it.
+    pub legacy_closed: bool,
     pub pause: Option<PauseKind>,
     pub pause_reason: Option<String>,
     pub bulk: Option<Bulk>,
@@ -200,6 +204,7 @@ impl Library {
         }
         let st = State {
             cfg,
+            legacy_closed: false,
             pause: None,
             pause_reason: None,
             bulk: None,

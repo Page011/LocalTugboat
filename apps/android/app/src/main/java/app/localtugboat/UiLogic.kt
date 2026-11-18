@@ -87,6 +87,12 @@ object UiLogic {
         PairUi.Idle -> if (rows == null || showPermissionScreen(rows, continued)) OnboardingStep.PERMISSIONS else OnboardingStep.SCAN
     }
 
+    /**
+     * Pairing state once the pairing is gone. The "Paired with X" screen is a success that is over; left in place it
+     * would be the first screen shown. A pairing in progress (Dialing, Code) is a new one and stays.
+     */
+    fun pairingAfterUnpair(p: PairUi): PairUi = if (p is PairUi.Done) PairUi.Idle else p
+
     /** The system permission names to ask for one row. Fine and coarse location are asked together (the user may grant coarse only). */
     fun permissionsFor(kind: PermKind): Array<String> = when (kind) {
         PermKind.CAMERA -> arrayOf("android.permission.CAMERA")

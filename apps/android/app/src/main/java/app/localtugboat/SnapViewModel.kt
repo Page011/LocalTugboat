@@ -16,6 +16,7 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import uniffi.tugboat_ffi.ActivityInfo
@@ -121,6 +122,9 @@ class SnapViewModel(app: Application) : AndroidViewModel(app) {
     @OptIn(ExperimentalCoroutinesApi::class)
     private val refreshDispatcher = Dispatchers.IO.limitedParallelism(1)
 
+    /** Gallery lists kept per folder (see [itemsModel]). Declared before init: the event collector's unpair reset clears it. */
+    private val models = java.util.concurrent.ConcurrentHashMap<Pair<String?, Boolean>, PagedModel<ItemInfo>>()
+
     /** Core events for screens that show lists: re-read what is on screen when one arrives. */
     val events: SharedFlow<FfiEvent> get() = core.events
 
@@ -129,7 +133,8 @@ class SnapViewModel(app: Application) : AndroidViewModel(app) {
             core.events.collect { e ->
                 when (e) {
                     is FfiEvent.PairingCode -> _pairing.value = PairUi.Code(e.code, e.peerName)
-                    is FfiEvent.Unpaired, is FfiEvent.PairingCompleted, is FfiEvent.SettingsChanged, FfiEvent.Resync -> refresh()
+                    is FfiEvent.Unpaired -> { resetAfterUnpair(); refresh() }
+                    is FfiEvent.PairingCompleted, is FfiEvent.SettingsChanged, FfiEvent.Resync -> refresh()
                     else -> {}
                 }
                 when (e) {
@@ -352,8 +357,6 @@ class SnapViewModel(app: Application) : AndroidViewModel(app) {
 
     // ---- gallery ----
 
-    private val models = java.util.concurrent.ConcurrentHashMap<Pair<String?, Boolean>, PagedModel<ItemInfo>>()
-
     /**
      * The rows of one gallery list ([folderId] null = all folders), kept here so coming back from the viewer
      * shows the same rows at once and the grid keeps its scroll position. The screen reloads it on entry.
@@ -428,12 +431,17 @@ class SnapViewModel(app: Application) : AndroidViewModel(app) {
     fun unpair() = act("Unpair") {
         core.phone().unpair()
         SnapService.stop(ctx)
-        _pairing.value = PairUi.Idle
+        resetAfterUnpair()
+        refresh()
+    }
+
+    /** The PC unpaired too (event) or the user did: forget everything that belonged to the pairing. */
+    private fun resetAfterUnpair() {
+        _pairing.update { UiLogic.pairingAfterUnpair(it) }
         _permsContinued.value = false
         _latest.value = null
         models.clear()
         nav.home()
-        refresh()
     }
 
     /** The share sheet intent for the exported log, or null (with a message) if it could not be built. */

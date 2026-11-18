@@ -872,9 +872,6 @@ enum FetchOutcome {
 
 struct Fetcher {
     in_flight: HashSet<ItemId>,
-    /// Running downloads: item -> (hash, declared size). The storage guard counts what they still
-    /// have to write.
-    sizes: HashMap<ItemId, (BlobHash, u64)>,
     /// When `schedule` last ran: a queue blocked by the storage guard looks again after a while.
     last_schedule: Instant,
     backoff: HashMap<ItemId, (u32, Instant)>,
@@ -886,7 +883,6 @@ impl Default for Fetcher {
     fn default() -> Self {
         Fetcher {
             in_flight: HashSet::new(),
-            sizes: HashMap::new(),
             last_schedule: Instant::now(),
             backoff: HashMap::new(),
             lost_tried: HashMap::new(),
@@ -907,7 +903,6 @@ impl Fetcher {
 
     fn finish(&mut self, d: &FetchDone, base_ms: u64) {
         self.in_flight.remove(&d.id);
-        self.sizes.remove(&d.id);
         match &d.outcome {
             FetchOutcome::Retry { .. } => {
                 let tries = self.backoff.get(&d.id).map(|b| b.0).unwrap_or(0) + 1;
@@ -943,13 +938,11 @@ struct GuardPass {
     placement: Arc<dyn crate::placement::Placement>,
     /// Set when the guard held an item back in this pass: why.
     held_back: Option<String>,
-    /// Declared size of every item picked in this pass (the fetcher counts what is still to come).
-    sizes: HashMap<ItemId, u64>,
 }
 
 impl GuardPass {
     fn new(core: &Core) -> GuardPass {
-        GuardPass { phone: core.inner.cfg.role == Role::Phone, placement: core.inner.placement.clone(), held_back: None, sizes: HashMap::new() }
+        GuardPass { phone: core.inner.cfg.role == Role::Phone, placement: core.inner.placement.clone(), held_back: None }
     }
 
     /// No guard (tests that are not about the guard).
@@ -987,7 +980,7 @@ impl Drop for HashGuard {
 fn pick_downloads(
     c: &Connection,
     f: &Fetcher,
-    fetching: &Mutex<HashSet<BlobHash>>,
+    fetching: &Mutex<HashMap<BlobHash, u64>>,
     slots: usize,
     now: i64,
     t: Instant,
@@ -1010,7 +1003,7 @@ fn pick_downloads(
 fn pick_into(
     c: &Connection,
     f: &Fetcher,
-    fetching: &Mutex<HashSet<BlobHash>>,
+    fetching: &Mutex<HashMap<BlobHash, u64>>,
     slots: usize,
     now: i64,
     t: Instant,
@@ -1026,8 +1019,9 @@ fn pick_into(
         let guard = settings.storage_guard_bytes;
         space = match gp.placement.available_space() {
             Ok(free) => {
+                // Every live download task, whichever session started it: `fetching` is core-wide.
                 let still_coming: u64 =
-                    f.sizes.values().map(|(h, size)| size.saturating_sub(part_len(&*gp.placement, h))).fold(0u64, |a, b| a.saturating_add(b));
+                    lock(fetching).iter().map(|(h, size)| size.saturating_sub(part_len(&*gp.placement, h))).fold(0u64, |a, b| a.saturating_add(b));
                 Space::Known { spare: free.saturating_sub(still_coming).saturating_sub(guard), below: free < guard, free, guard }
             }
             Err(e) => Space::Unknown(e.to_string()),
@@ -1064,7 +1058,7 @@ fn pick_into(
                 }
                 // A hash a task already holds is skipped before the guard looks at it, so a
                 // duplicate never turns the storage-low flag on.
-                if lock(fetching).contains(&hash) {
+                if lock(fetching).contains_key(&hash) {
                     continue;
                 }
                 // A record over max_blob_bytes is never stored: fetch_item refuses it once (TOO
@@ -1106,13 +1100,15 @@ fn pick_into(
                 }
                 // Two items with the same file share one part file: one download at a time per
                 // hash, across sessions (a task outlives its session). The last check, the claim.
-                if !lock(fetching).insert(hash) {
-                    continue;
+                match lock(fetching).entry(hash) {
+                    std::collections::hash_map::Entry::Occupied(_) => continue,
+                    std::collections::hash_map::Entry::Vacant(v) => {
+                        v.insert(size);
+                    }
                 }
                 if let Space::Known { spare, .. } = &mut space {
                     *spare -= need_now;
                 }
-                gp.sizes.insert(id, size);
                 out.push((id, hash, lfs == LocalFileState::Lost));
             }
             if page.len() < PICK_PAGE as usize {
@@ -1158,7 +1154,6 @@ fn schedule(core: &Core, conn: &Arc<PeerConn>, peer: DeviceId, f: &mut Fetcher, 
     }
     for (id, hash, was_lost) in picked {
         f.in_flight.insert(id);
-        f.sizes.insert(id, (hash, gp.sizes.get(&id).copied().unwrap_or(0)));
         // Remember when each picked Lost item was asked, so it is not asked in a loop.
         if was_lost {
             f.lost_tried.insert(id, t + LOST_RETRY);
@@ -1471,7 +1466,7 @@ mod tests {
         assert_eq!(picked.len(), 1);
         let (pid, claimed, _) = picked[0];
         assert_eq!((pid, claimed), items[0], "the pick hands out the hash it claimed");
-        assert!(lock(&core.inner.fetching).contains(&claimed));
+        assert!(lock(&core.inner.fetching).contains_key(&claimed));
         assert!(load_for_fetch(&core, id, claimed).unwrap().is_some(), "the claimed hash loads");
 
         // The content changes after the pick: the old claim no longer matches.
@@ -1497,13 +1492,13 @@ mod tests {
         let core = open_core(dir.path());
         let items = add_items(&core, 2, LocalFileState::Pending);
         let (held_id, held_hash) = items[0];
-        lock(&core.inner.fetching).insert(held_hash);
+        lock(&core.inner.fetching).insert(held_hash, 100);
         let guard = HashGuard { core: core.clone(), hash: held_hash };
         let f = Fetcher::default();
         let got = pick(&core, &f, 2);
         assert_eq!(got.iter().map(|g| g.0).collect::<Vec<_>>(), vec![items[1].0], "the held item is skipped, the other is picked");
         drop(guard);
-        assert!(!lock(&core.inner.fetching).contains(&held_hash), "freed when the task ends");
+        assert!(!lock(&core.inner.fetching).contains_key(&held_hash), "freed when the task ends");
         tokio::time::timeout(Duration::from_millis(200), core.inner.kick.notified()).await.expect("the scheduler was woken");
         let got = pick(&core, &f, 2);
         assert!(got.iter().any(|g| g.0 == held_id), "now it is picked");
@@ -1564,7 +1559,7 @@ mod tests {
     /// A phone-side guard pass that sees `free` bytes (the default guard is 2 GB).
     fn low_space_pass(dir: &std::path::Path, free: u64) -> GuardPass {
         let inner = AppStorage::new(dir.join("storage")).unwrap();
-        GuardPass { phone: true, placement: Arc::new(LowSpace { inner, free }), held_back: None, sizes: HashMap::new() }
+        GuardPass { phone: true, placement: Arc::new(LowSpace { inner, free }), held_back: None }
     }
 
     fn pick_with(core: &Core, f: &Fetcher, slots: usize, gp: &mut GuardPass) -> Vec<(ItemId, BlobHash, bool)> {
@@ -1633,12 +1628,38 @@ mod tests {
         lock(&core.inner.fetching).clear();
 
         // (c) The first item's hash is already held by a running task: it is skipped before the
-        // guard, the second fits, and the guard reports nothing.
-        lock(&core.inner.fetching).insert(items[0].1);
-        let mut gp = low_space_pass(dir.path(), guard + 150);
+        // guard, the second fits (the running task's 100 bytes are counted, so room for 250), and the guard
+        // reports nothing.
+        lock(&core.inner.fetching).insert(items[0].1, 100);
+        let mut gp = low_space_pass(dir.path(), guard + 250);
         let got = pick_with(&core, &Fetcher::default(), 2, &mut gp);
         assert_eq!(got.iter().map(|g| g.0).collect::<Vec<_>>(), vec![items[1].0]);
         assert!(gp.held_back.is_none(), "a duplicate held by a task never turns storage_low on");
+    }
+
+    // A download task outlives its session. Right after a reconnect the new session's `Fetcher` is
+    // empty, so the guard must read what the old task still has to write from the core-wide claim,
+    // not from the fetcher: else it over-estimates the free space by that task's remaining bytes.
+    #[tokio::test]
+    async fn guard_counts_the_bytes_an_earlier_sessions_task_still_has_to_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = open_core(dir.path());
+        let guard = crate::model::Settings::default().storage_guard_bytes;
+        let items = add_items(&core, 2, LocalFileState::Pending);
+        // An old task holds item 0's hash and has 100 bytes to go; the new session's fetcher knows
+        // nothing about it. Room above the guard: 150, so item 1 (100 bytes) fits only if the old
+        // task's 100 are ignored.
+        lock(&core.inner.fetching).insert(items[0].1, 100);
+        let mut gp = low_space_pass(dir.path(), guard + 150);
+        let got = pick_with(&core, &Fetcher::default(), 2, &mut gp);
+        assert!(got.is_empty(), "the old task's remaining bytes use the space: {got:?}");
+        assert!(gp.held_back.is_some(), "the hold is reported");
+        // Once that task has written 60 bytes of its part file, only 40 are still to come.
+        let part = core.inner.placement.part_path(&items[0].1).unwrap();
+        std::fs::write(&part, [0u8; 60]).unwrap();
+        let mut gp = low_space_pass(dir.path(), guard + 150);
+        let got = pick_with(&core, &Fetcher::default(), 2, &mut gp);
+        assert_eq!(got.iter().map(|g| g.0).collect::<Vec<_>>(), vec![items[1].0], "bytes already written no longer count");
     }
 
     // Review finding 9: the unpair-notice task belongs to the network instance. Stopping the network

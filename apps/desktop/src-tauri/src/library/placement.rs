@@ -110,6 +110,10 @@ fn remove_if_exists(p: &Path) -> Result<()> {
     }
 }
 
+/// Extension of the copy `move_across` makes next to its destination. It sits in the VISIBLE library folder, so the
+/// scan treats it as in progress (never imported) and the start-up clean-up removes one a crash left.
+pub const MOVE_EXT: &str = "tugboat-move";
+
 /// Move a file; across drives (the Bin is under %LOCALAPPDATA%, the library may be anywhere)
 /// copy next to the destination, then rename, then delete the source. A failure at any step
 /// leaves the source in place (C4). `replace` = an existing `to` may be overwritten (the Bin
@@ -120,7 +124,7 @@ pub fn move_across(from: &Path, to: &Path, replace: bool) -> io::Result<()> {
     match rename(from, to) {
         Ok(()) => Ok(()),
         Err(e) if e.raw_os_error() == Some(ERROR_NOT_SAME_DEVICE) => {
-            let tmp = to.with_extension("tugboat-move");
+            let tmp = to.with_extension(MOVE_EXT);
             if let Err(e) = std::fs::copy(from, &tmp) {
                 let _ = std::fs::remove_file(&tmp);
                 return Err(e);

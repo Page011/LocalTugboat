@@ -24,7 +24,7 @@ To test the build on GitHub without a tag, run the workflow manually (Actions, R
 Needs Bun and Rust (see `RUST_VERSION` and `BUN_VERSION` in the release workflow for the pinned versions).
 
 - Windows: also needs the Visual Studio C++ Build Tools (MSVC Rust target). In `apps/desktop` run `bun install`, then `bun run tauri build`. The installer lands in `target/release/bundle/nsis`.
-- Android: needs the Android SDK with platform 37 (Gradle finds it through `ANDROID_HOME` or `sdk.dir` in `apps/android/local.properties`; Android Studio's SDK Manager installs it), the Rust targets `aarch64-linux-android` and `x86_64-linux-android`, `cargo-ndk`, NDK 30.0.16248370 (`ANDROID_NDK_HOME`, the default used by `build-rust.cmd`) and JDK 17. Run `apps/android/build-rust.cmd`, then `gradlew.bat bundleRelease` in `apps/android`. The bundle is unsigned: sign it before uploading to Google Play.
+- Android: needs the Android SDK with platform 37 (Gradle finds it through `ANDROID_HOME` or `sdk.dir` in `apps/android/local.properties`; Android Studio's SDK Manager installs it), the Rust targets `aarch64-linux-android` and `x86_64-linux-android`, `cargo-ndk`, NDK 30.0.16248370 (`ANDROID_NDK_HOME`, the default used by `build-rust.cmd`) and JDK 17. Run `apps/android/build-rust.cmd` (it builds the Windows host library first, so the Visual Studio C++ Build Tools are needed here too), then `gradlew.bat bundleRelease` in `apps/android`. The bundle is unsigned: sign it before uploading to Google Play.
 
 ## Licence
 

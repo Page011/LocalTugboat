@@ -234,11 +234,12 @@ impl Backend {
             drop_run: Mutex::new(()),
         });
 
-        // A quit during a drop leaves its temp copy in `.tugboat`: remove it.
+        // A quit during a drop leaves its temp copy in `.tugboat`, one during a cross-drive move a `.tugboat-move`
+        // copy in the library: remove them.
         if let Some(root) = library.root() {
             let n = drop::clean_stale(&root);
             if n > 0 {
-                tracing::info!("removed {n} unfinished drop copies");
+                tracing::info!("removed {n} unfinished drop or move copies");
             }
         }
         shared.set_tray(&core.status());

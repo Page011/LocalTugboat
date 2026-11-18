@@ -8,7 +8,7 @@
 import { api, ApiError, onCoreEvent, onDropProgress, onDropResult, onDropState, onFirewallStatus, onLibraryStatus, onResync, pickFolder } from "./api";
 import type { AppInfo, DropProgress, DropReport, FirewallInfo, FolderView, LibraryStatus, PairedDevice, Settings, SyncStatus } from "./api";
 import { dropBanner, dropSummary, type DropEnter } from "./drop";
-import { claimAll } from "./generation";
+import { claimAll, reportRun, startRun, type RunOutcome } from "./generation";
 import { nextPairPhase, type PairInput, type PairPhase } from "./pairing";
 
 export type Screen = "gallery" | "bin" | "activity" | "pair" | "settings";
@@ -122,14 +122,22 @@ async function loadAll(): Promise<void> {
   if (failed) throw failed.reason;
 }
 
+/** Counts reloads: only the newest one reports `ready` / `loadError`. An older reload's fields were voided by the
+ *  newer claim, so it must not declare success while the newer one failed (a field would stay null). */
+const reloads = { n: 0 };
+
 export async function reload(): Promise<void> {
+  const latest = startRun(reloads);
+  let outcome: RunOutcome;
   try {
     await loadAll();
-    app.loadError = null;
-    app.ready = true;
+    outcome = { ok: true };
   } catch (e) {
-    app.loadError = e instanceof Error ? e.message : String(e);
+    outcome = { ok: false, error: e instanceof Error ? e.message : String(e) };
   }
+  const next = reportRun(latest, outcome, app);
+  app.ready = next.ready;
+  app.loadError = next.loadError;
 }
 
 /** Connect to Rust: first load, events, and the 1 s clock (labels and the QR countdown). */

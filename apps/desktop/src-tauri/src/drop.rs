@@ -222,15 +222,35 @@ pub fn copy_dropped(lib: &Library, drop: NativeDrop, target: &DropTarget, progre
     rep
 }
 
-/// Remove copies left behind by a quit or crash during a drop (`.tugboat\drop-*.tmp`). Returns how many.
+/// Remove copies left behind by a quit or crash: a drop's (`.tugboat\drop-*.tmp`) and a cross-drive move's
+/// (`*.tugboat-move` in the library root or one of its folders, see `placement::MOVE_EXT`). Returns how many.
 pub fn clean_stale(root: &Path) -> usize {
-    let dir = root.join(crate::library::config::HIDDEN_DIR);
-    let Ok(rd) = std::fs::read_dir(&dir) else { return 0 };
     let mut n = 0;
-    for e in rd.flatten() {
-        let name = e.file_name().to_string_lossy().to_ascii_lowercase();
-        if name.starts_with("drop-") && name.ends_with(".tmp") && std::fs::remove_file(e.path()).is_ok() {
-            n += 1;
+    if let Ok(rd) = std::fs::read_dir(root.join(crate::library::config::HIDDEN_DIR)) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().to_ascii_lowercase();
+            if name.starts_with("drop-") && name.ends_with(".tmp") && std::fs::remove_file(e.path()).is_ok() {
+                n += 1;
+            }
+        }
+    }
+    let is_move_copy = |p: &Path| p.extension().is_some_and(|x| x.eq_ignore_ascii_case(crate::library::placement::MOVE_EXT));
+    let mut remove_in = |dir: &Path| {
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if e.file_type().is_ok_and(|t| t.is_file()) && is_move_copy(&p) && std::fs::remove_file(&p).is_ok() {
+                    n += 1;
+                }
+            }
+        }
+    };
+    remove_in(root);
+    if let Ok(rd) = std::fs::read_dir(root) {
+        for e in rd.flatten() {
+            if e.file_type().is_ok_and(|t| t.is_dir()) && !e.file_name().to_string_lossy().starts_with('.') {
+                remove_in(&e.path());
+            }
         }
     }
     n

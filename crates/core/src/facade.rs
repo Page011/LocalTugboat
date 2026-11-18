@@ -111,8 +111,9 @@ pub(crate) struct Inner {
     /// assert "zero", or that one hash was never asked for).
     pub blob_requests: Mutex<Vec<String>>,
     /// Content hashes with a download task alive (any session). Two tasks must never write the
-    /// same part file, and a task outlives the session that started it.
-    pub fetching: Mutex<std::collections::HashSet<BlobHash>>,
+    /// same part file, and a task outlives the session that started it. The value is the declared
+    /// size of that download: the phone storage guard counts what it still has to write.
+    pub fetching: Mutex<std::collections::HashMap<BlobHash, u64>>,
 }
 
 #[derive(Clone)]
@@ -162,7 +163,7 @@ impl Core {
                 storage_low: std::sync::atomic::AtomicBool::new(false),
                 guard_recheck_ms: AtomicU64::new(30_000),
                 blob_requests: Mutex::new(Vec::new()),
-                fetching: Mutex::new(std::collections::HashSet::new()),
+                fetching: Mutex::new(std::collections::HashMap::new()),
             }),
         };
         core.sweep_and_emit()?;
