@@ -183,6 +183,19 @@ class UiLogicTest {
         assertNull(UiLogic.syncBanner(null))
     }
 
+    @Test fun alerts_only_for_problems_the_user_must_fix() {
+        for (s in listOf(SyncState.SYNCED, SyncState.SYNCING, SyncState.OFFLINE, SyncState.CONNECTING, SyncState.UNPAIRED)) {
+            assertNull(s.name, UiLogic.alert(status(s, waiting = 3u, downloading = 2u)))
+        }
+        assertEquals("Update Tugboat on the PC", UiLogic.alert(status(SyncState.REFUSED, message = "Update Tugboat on the PC")))
+        assertEquals("PC REFUSED THE CONNECTION", UiLogic.alert(status(SyncState.REFUSED)))
+        assertEquals("SYNC PAUSED", UiLogic.alert(status(SyncState.PAUSED)))
+        // Same words whatever the count, so the alert is not restarted as downloads move.
+        val low = UiLogic.alert(status(SyncState.SYNCED, downloading = 4u, storageLow = true))
+        assertEquals("PHONE STORAGE LOW - downloads stopped", low)
+        assertEquals(low, UiLogic.alert(status(SyncState.OFFLINE, downloading = 9u, storageLow = true)))
+    }
+
     @Test fun sync_dot_is_red_for_unreachable_connecting_paused_refused() {
         assertEquals(UiLogic.Tone.OK, UiLogic.tone(status(SyncState.SYNCED)))
         assertEquals(UiLogic.Tone.BUSY, UiLogic.tone(status(SyncState.SYNCING)))

@@ -11,13 +11,16 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.filterNotNull
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import uniffi.tugboat_ffi.FfiEvent
 
 /**
  * Foreground service (connectedDevice): keeps the network up while the phone is paired, writes the
- * heartbeat and keeps the notification text current. The core itself lives in [Core], not here, so
+ * heartbeat and alerts on sync problems. The core itself lives in [Core], not here, so
  * the activity and the worker share it and a restart of this service never reopens the database.
  */
 class SnapService : Service() {
@@ -28,12 +31,8 @@ class SnapService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         // startForeground first, always: the 5 s rule applies even when we are about to stop again.
-        Notif.ensureChannel(this)
-        startForeground(
-            Notif.ID,
-            Notif.build(this, core.status.value?.let { Texts.notification(it, System.currentTimeMillis()) } ?: "Starting..."),
-            ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE,
-        )
+        Notif.ensureChannels(this)
+        startForeground(Notif.ID, Notif.running(this), ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
         if (job == null) {
             KLog.log(this, "service started")
             core.serviceRunning = true
@@ -58,7 +57,7 @@ class SnapService : Service() {
                     core.serviceRunning = true
                 }
                 launch { while (true) { Heartbeat.beat(this@SnapService); delay(HeartbeatLog.BEAT_MS) } }
-                launch { keepNotificationCurrent() }
+                launch { alertOnProblems() }
                 launch {
                     core.events.collect { if (it is FfiEvent.Unpaired) stop(this@SnapService) }
                 }
@@ -68,13 +67,18 @@ class SnapService : Service() {
         return START_STICKY
     }
 
-    private suspend fun keepNotificationCurrent() {
-        // collectLatest: a new status cancels the old 15 s refresh loop and starts a fresh one.
-        core.status.collectLatest { st ->
-            while (true) {
-                val text = if (st == null) core.errors.value.lastOrNull() ?: "Starting..." else Texts.notification(st, System.currentTimeMillis())
-                Notif.update(this@SnapService, text)
-                delay(NOTIF_REFRESH_MS)
+    /**
+     * Alerts once a problem has lasted [ALERT_HOLD_MS], so one that clears by itself (a storage check right after a
+     * download) never sounds. A new problem cancels the wait for the old one; a solved one takes the alert away.
+     */
+    private suspend fun alertOnProblems() {
+        // No status yet means the core is still opening: not known, so it neither raises nor clears an alert.
+        core.status.filterNotNull().map { UiLogic.alert(it) }.distinctUntilChanged().collectLatest { text ->
+            if (text == null) {
+                Notif.clearProblem(this@SnapService)
+            } else {
+                delay(ALERT_HOLD_MS)
+                Notif.problem(this@SnapService, text)
             }
         }
     }
@@ -103,6 +107,8 @@ class SnapService : Service() {
         job = null
         if (stopWanted) {
             Heartbeat.markStopped(this)
+            // Unpaired or background sync turned off: nothing is watching the problem any more.
+            Notif.clearProblem(this)
             stopWanted = false
         }
         core.serviceRunning = false
@@ -113,7 +119,7 @@ class SnapService : Service() {
 
     companion object {
         private const val HOLD = "service"
-        private const val NOTIF_REFRESH_MS = 15_000L
+        private const val ALERT_HOLD_MS = 30_000L
 
         /** Set by [stop]: the next destroy is on purpose, so its quiet time is not a failure. */
         @Volatile private var stopWanted = false

@@ -48,22 +48,6 @@ object Texts {
         return "STOPPED at ${java.time.Instant.ofEpochMilli(fromMs).atZone(zone).format(hm)} - Tugboat was not running"
     }
 
-    /** The ongoing notification line: "Connected to OFFICE-PC, synced 10s ago" or "PC not found, 3 waiting". */
-    fun notification(s: SyncStatus, nowMs: Long): String {
-        val pc = s.peerName ?: "PC"
-        return when (s.state) {
-            SyncState.UNPAIRED -> "Not paired"
-            SyncState.SYNCING -> "Syncing with $pc"
-            SyncState.SYNCED -> {
-                val at = s.lastSyncedAt
-                if (at == null) "Connected to $pc" else "Connected to $pc, synced ${ago(nowMs - at)}"
-            }
-            SyncState.OFFLINE, SyncState.CONNECTING -> notFound(s)
-            SyncState.PAUSED -> s.message ?: "Sync paused"
-            SyncState.REFUSED -> s.message ?: "PC refused the connection"
-        }
-    }
-
     /** The small sync line on the camera screen: "Synced 10s ago" or "PC not found, 3 waiting". */
     fun cameraSync(s: SyncStatus, nowMs: Long): String = when (s.state) {
         SyncState.UNPAIRED -> "Not paired"
