@@ -23,6 +23,7 @@ use tugboat_desktop_lib::{
     library::LibraryOptions,
     paths::Paths,
     tray::TrayState,
+    updates::{take_show_after_update, Updates, FOUND_KEY, LAST_CHECK_KEY, SETTING_KEY, SHOW_AFTER_KEY},
 };
 
 struct MemKeys(Mutex<Option<[u8; 32]>>);
@@ -531,5 +532,99 @@ async fn delete_forever_of_a_file_still_in_the_library_leaves_nothing_to_import(
     assert!(be.status().message.is_none(), "{:?}", be.status());
 
     ph.stop_network().await;
+    be.shutdown().await;
+}
+
+// The update install stops the library thread and the network first and starts them again when the installer does
+// not run (the user said no to the Windows prompt). The call comes from a blocking thread, as in the app.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stopping_sync_for_an_update_install_is_undone_when_the_installer_does_not_start() {
+    let pc = start_pc().await;
+    let be = pc.be.clone();
+    let tmp = tempfile::tempdir().unwrap();
+    let ph = link_phone(&pc, tmp.path()).await;
+
+    // resume without a quiesce does nothing.
+    let bind = be.app_info().bind;
+    be.resume().await;
+    assert_eq!(be.app_info().bind, bind);
+    assert_eq!(be.status().state, SyncState::Synced);
+
+    let rt = tokio::runtime::Handle::current();
+    let (b, r) = (be.clone(), rt.clone());
+    tokio::task::spawn_blocking(move || {
+        r.block_on(b.quiesce());
+        r.block_on(b.quiesce()); // twice is the same as once
+    })
+    .await
+    .unwrap();
+    until("the phone sees the PC go", 20, || ph.status().state != SyncState::Synced).await;
+
+    let (b, r) = (be.clone(), rt);
+    tokio::task::spawn_blocking(move || r.block_on(b.resume())).await.unwrap();
+    assert_eq!(be.app_info().network_error, None);
+    until("synced again", 40, || be.status().state == SyncState::Synced && ph.status().state == SyncState::Synced).await;
+
+    // The library thread is back too: a file dropped into the folder reaches the phone.
+    std::fs::write(pc.root.join("after_quiesce.jpg"), jpeg(5, 2500)).unwrap();
+    until("the phone received the file", 30, || ph.items(&ItemQuery { limit: 100, ..Default::default() }).unwrap().rows.iter().any(|r| r.name == "after_quiesce.jpg")).await;
+
+    ph.stop_network().await;
+    be.shutdown().await;
+}
+
+// The "Check for updates" switch and the last check time live in Core's local settings (this PC only): they survive
+// a restart, the switch is on until it is turned off, and a stored value that is not "false" keeps it on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_update_switch_and_the_last_check_time_are_kept_on_this_pc() {
+    let pc = start_pc().await;
+    let be = pc.be.clone();
+
+    let up = Updates::new(be.clone(), "0.3.0");
+    assert!(up.enabled(), "on by default");
+    assert_eq!(up.last_check(), None);
+
+    up.set_enabled(false).unwrap();
+    assert_eq!(be.core.get_value(SETTING_KEY).unwrap().as_deref(), Some("false"));
+    assert!(!Updates::new(be.clone(), "0.3.0").enabled(), "still off after a restart");
+    // The Core Settings the phone also knows are untouched by it.
+    assert_eq!(be.settings().unwrap(), Settings { udp_port: be.settings().unwrap().udp_port, ..Settings::default() });
+
+    up.set_enabled(true).unwrap();
+    assert!(Updates::new(be.clone(), "0.3.0").enabled());
+
+    be.core.set_value(SETTING_KEY, "garbage").unwrap();
+    assert!(Updates::new(be.clone(), "0.3.0").enabled(), "only an explicit false turns it off");
+
+    be.core.set_value(LAST_CHECK_KEY, "1800000000").unwrap();
+    assert_eq!(Updates::new(be.clone(), "0.3.0").last_check(), Some(1_800_000_000), "the saved time is read back after a restart");
+    be.core.set_value(LAST_CHECK_KEY, "not a number").unwrap();
+    assert_eq!(Updates::new(be.clone(), "0.3.0").last_check(), None, "an unreadable time means never checked");
+
+    be.shutdown().await;
+}
+
+// A version found and downloaded before a restart is checked again soon after start, but only while it is still newer
+// than the running version; the mark that makes the window show after an install is taken exactly once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_found_update_survives_a_restart_and_the_window_mark_is_taken_once() {
+    let pc = start_pc().await;
+    let be = pc.be.clone();
+
+    assert!(!Updates::new(be.clone(), "0.3.0").found_pending(), "nothing found yet");
+    be.core.set_value(FOUND_KEY, "0.4.0").unwrap();
+    assert!(Updates::new(be.clone(), "0.3.0").found_pending(), "newer than the running version: fetch it again");
+    assert!(Updates::new(be.clone(), "0.3.9").found_pending());
+    // Installed by hand since (same or newer): forgotten, and the stored value is cleared.
+    assert!(!Updates::new(be.clone(), "0.4.0").found_pending());
+    assert_eq!(be.core.get_value(FOUND_KEY).unwrap().as_deref().map(str::trim), Some(""));
+    be.core.set_value(FOUND_KEY, "junk").unwrap();
+    assert!(!Updates::new(be.clone(), "0.3.0").found_pending(), "an unreadable version is never fetched");
+
+    assert!(!take_show_after_update(&be), "no mark: a start with Windows stays in the tray");
+    be.core.set_value(SHOW_AFTER_KEY, "1").unwrap();
+    assert!(take_show_after_update(&be), "the start after an install shows the window");
+    assert!(!take_show_after_update(&be), "only that one start");
+
     be.shutdown().await;
 }

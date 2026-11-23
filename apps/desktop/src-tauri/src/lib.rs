@@ -18,6 +18,7 @@ pub mod qr;
 pub mod shell;
 pub mod thumbs;
 pub mod tray;
+pub mod updates;
 pub mod winfs;
 pub mod zipdrop;
 
@@ -44,6 +45,7 @@ pub fn run() {
         .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, Some(vec![shell::MINIMIZED_FLAG])))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .register_uri_scheme_protocol(shell::THUMB_SCHEME, shell::thumb_response)
         .on_window_event(shell::on_window_event)
         .setup(|app| {
@@ -82,17 +84,20 @@ pub fn run() {
             shell::watch_display(&handle);
             let emitter = Arc::new(shell::TauriEmitter { app: handle.clone() });
             let started = tauri::async_runtime::block_on(Backend::start(opts, &store, emitter));
-            match started {
+            let after_update = match started {
                 Ok(backend) => {
                     first_run_autostart(&handle, &backend);
-                    app.manage(backend);
+                    let after_update = updates::take_show_after_update(&backend);
+                    app.manage(backend.clone());
+                    updates::start(&handle, backend);
+                    after_update
                 }
                 Err(e) => {
                     fatal(&handle, "Tugboat cannot start", format!("{e}\n\nFix the problem, then start Tugboat again."));
                     return Ok(());
                 }
-            }
-            if !std::env::args().any(|a| a == shell::MINIMIZED_FLAG) {
+            };
+            if updates::show_window_at_start(std::env::args().any(|a| a == shell::MINIMIZED_FLAG), after_update) {
                 shell::show_main(&handle);
             }
             Ok(())
@@ -132,6 +137,10 @@ pub fn run() {
             commands::firewall_fix,
             commands::autostart_get,
             commands::autostart_set,
+            commands::update_check_get,
+            commands::update_check_set,
+            commands::update_ready,
+            commands::update_install,
             commands::quit_app,
         ])
         .run(tauri::generate_context!())

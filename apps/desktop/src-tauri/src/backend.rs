@@ -35,6 +35,7 @@ use crate::{
     paths::{self, Paths},
     qr,
     tray::{self, TrayState},
+    updates,
 };
 
 /// Event names the webview listens for (apps/desktop/src/lib/api.ts mirrors these).
@@ -55,6 +56,8 @@ pub mod ev {
     pub const DROP_PROGRESS: &str = "drop-progress";
     /// `DropReport`: what the drop did.
     pub const DROP_RESULT: &str = "drop-result";
+    /// `UpdateReady`: a newer version is downloaded and verified.
+    pub const UPDATE_READY: &str = "update-ready";
 }
 
 /// Where backend events go: the Tauri window, or a list in a test.
@@ -116,6 +119,9 @@ struct Shared {
     worker: Arc<Mutex<Option<Worker>>>,
     tray: Mutex<Option<TrayState>>,
     pairing_open: AtomicBool,
+    /// A linked device refused this PC because it is the older side ("Update Tugboat on the PC"): the update
+    /// check looks for a newer version soon (see `updates::decide`). Cleared when a check starts.
+    update_hint: AtomicBool,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -142,7 +148,12 @@ impl Shared {
 
     fn on_core_event(&self, e: &Event) {
         match e {
-            Event::Sync(s) => self.set_tray(s),
+            Event::Sync(s) => {
+                if updates::needs_pc_update(s) {
+                    self.update_hint.store(true, Ordering::SeqCst);
+                }
+                self.set_tray(s);
+            }
             Event::ItemsChanged { .. } | Event::FoldersChanged => {
                 if let Some(w) = lock(&self.worker).as_ref() {
                     w.poke();
@@ -185,6 +196,8 @@ pub struct Backend {
     drag: Mutex<Drag>,
     /// One drop copies at a time; a second waits its turn.
     drop_run: Mutex<()>,
+    /// The library thread and the network are stopped for an update install (see `quiesce`).
+    quiesced: AtomicBool,
 }
 
 impl Backend {
@@ -209,7 +222,13 @@ impl Backend {
         let (core, rx) = Core::open(core_cfg, Arc::new(SystemClock), place.clone()).map_err(|e| format!("{e}"))?;
 
         let worker: Arc<Mutex<Option<Worker>>> = Arc::new(Mutex::new(None));
-        let shared = Arc::new(Shared { emitter: emitter.clone(), worker: worker.clone(), tray: Mutex::new(None), pairing_open: AtomicBool::new(false) });
+        let shared = Arc::new(Shared {
+            emitter: emitter.clone(),
+            worker: worker.clone(),
+            tray: Mutex::new(None),
+            pairing_open: AtomicBool::new(false),
+            update_hint: AtomicBool::new(false),
+        });
         let notify_shared = shared.clone();
         let library = Library::open(
             core.clone(),
@@ -240,6 +259,7 @@ impl Backend {
             drop_view: Mutex::new(None),
             drag: Mutex::new(Drag::default()),
             drop_run: Mutex::new(()),
+            quiesced: AtomicBool::new(false),
         });
 
         // A quit during a drop leaves its temp copy in `.tugboat`, one during a cross-drive move a `.tugboat-move`
@@ -271,6 +291,39 @@ impl Backend {
         }
         lock(&self.worker).take();
         self.core.stop_network().await;
+    }
+
+    /// Stop the library thread (it finishes the file it is placing) and the network (the phone sees a clean
+    /// disconnect, no transfer is cut half way), right before the update installer takes over. Quitting any other
+    /// way just exits; the installer must not find files or a session in use. Undone by `resume` when the installer
+    /// does not start (the user declined the Windows prompt).
+    pub async fn quiesce(&self) {
+        if self.quiesced.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        lock(&self.worker).take(); // drop joins the thread
+        self.core.stop_network().await;
+        tracing::info!("sync stopped for the update install");
+    }
+
+    /// Start what `quiesce` stopped. Does nothing when `quiesce` did not run.
+    pub async fn resume(&self) {
+        if !self.quiesced.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        self.restart_worker();
+        self.restart_network().await;
+        tracing::info!("sync running again");
+    }
+
+    /// True when a linked device refused this PC as the older side since the last update check began.
+    pub fn update_hint(&self) -> bool {
+        self.shared.update_hint.load(Ordering::SeqCst)
+    }
+
+    /// An update check is starting: the refusal it was waiting for is being answered.
+    pub fn clear_update_hint(&self) {
+        self.shared.update_hint.store(false, Ordering::SeqCst);
     }
 
     /// (Re)start the network from the saved port and the bind override. A failure is stored
@@ -644,5 +697,45 @@ async fn firewall_loop(slot: Arc<Mutex<FirewallInfo>>, shared: Arc<Shared>, core
             Err(_) => return,
         }
         tokio::time::sleep(Duration::from_secs(300)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tugboat_core::events::SyncState;
+
+    struct Quiet;
+    impl Emitter for Quiet {
+        fn emit(&self, _event: &str, _payload: serde_json::Value) {}
+        fn tray(&self, _state: TrayState, _tooltip: &str) {}
+    }
+
+    fn shared() -> Shared {
+        Shared {
+            emitter: Arc::new(Quiet),
+            worker: Arc::new(Mutex::new(None)),
+            tray: Mutex::new(None),
+            pairing_open: AtomicBool::new(false),
+            update_hint: AtomicBool::new(false),
+        }
+    }
+
+    fn sync(state: SyncState, message: Option<&str>) -> Event {
+        Event::Sync(SyncStatus { state, peer_name: None, last_synced_at: None, waiting: 0, downloading: 0, storage_low: false, message: message.map(Into::into), devices: Vec::new() })
+    }
+
+    /// The update check is told when a linked device refused this PC as the older side, and only then.
+    #[test]
+    fn a_refusal_that_names_the_pc_sets_the_update_hint() {
+        let s = shared();
+        s.on_core_event(&sync(SyncState::Synced, None));
+        s.on_core_event(&sync(SyncState::Refused, Some("Update Tugboat on the phone")));
+        assert!(!s.update_hint.load(Ordering::SeqCst), "the phone must update, not this PC");
+        s.on_core_event(&sync(SyncState::Refused, Some("Update Tugboat on the PC")));
+        assert!(s.update_hint.load(Ordering::SeqCst));
+        // A later status does not clear it: only a started check does.
+        s.on_core_event(&sync(SyncState::Offline, None));
+        assert!(s.update_hint.load(Ordering::SeqCst));
     }
 }

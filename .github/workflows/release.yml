@@ -1,8 +1,15 @@
 name: Release
 
-# Tag vX.Y.Z -> checks, build, DRAFT GitHub Release with the Windows installer attached.
+# Tag vX.Y.Z -> checks, build, DRAFT GitHub Release with the Windows installer, its .sha256 and latest.json
+# (the file the app's update check reads) attached.
 # Pull request touching this file and manual runs -> same checks and build, installer kept as a
 # workflow artifact only (no release).
+#
+# On a tag the installer is signed for the app's update check with the key in the repository secrets
+# TAURI_SIGNING_PRIVATE_KEY and TAURI_SIGNING_PRIVATE_KEY_PASSWORD; the matching public key is
+# plugins.updater.pubkey in tauri.conf.json. Only tag runs get the secrets, and only the signing step sees them
+# (the build itself runs without the key). Pull request and manual runs build an unsigned installer and write
+# no latest.json, so no workflow artifact outside a tag run can ever pass the app's update check.
 on:
   push:
     tags: ["v*"]
@@ -37,6 +44,33 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      # Without the key the installer cannot be signed, and an app whose public key is still the
+      # placeholder never checks for updates (and could never be updated later). Fail now, not after the build.
+      - name: Update signing is set up
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -eu
+          if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            echo "::error::SECRET TAURI_SIGNING_PRIVATE_KEY IS EMPTY - add the update signing key under Settings, Secrets and variables, Actions (see 'Make a release' in README.md)"
+            exit 1
+          fi
+          if [ -z "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" ]; then
+            echo "::error::SECRET TAURI_SIGNING_PRIVATE_KEY_PASSWORD IS EMPTY - add the password of the update signing key under Settings, Secrets and variables, Actions"
+            exit 1
+          fi
+          pubkey=$(jq -r '.plugins.updater.pubkey // empty' apps/desktop/src-tauri/tauri.conf.json | tr -d '\r')
+          if [ -z "$pubkey" ] || [ "$pubkey" = "UPDATER_PUBKEY_MISSING" ]; then
+            echo "::error::UPDATE PUBLIC KEY MISSING - plugins.updater.pubkey in apps/desktop/src-tauri/tauri.conf.json is still '${pubkey:-empty}'. Put the contents of the .pub file made by 'bun run tauri signer generate' there (see 'Make a release' in README.md)"
+            exit 1
+          fi
+          if ! printf '%s' "$pubkey" | base64 -d 2>/dev/null | head -n 1 | grep -q '^untrusted comment: minisign public key'; then
+            echo "::error::UPDATE PUBLIC KEY NOT VALID - plugins.updater.pubkey must be the contents of the .pub file made by 'bun run tauri signer generate'"
+            exit 1
+          fi
 
       - name: Install Rust
         run: |
@@ -100,6 +134,9 @@ jobs:
         working-directory: apps/desktop
         run: bun run test
 
+      - name: Release script tests
+        run: bun test ./.github/scripts
+
       - name: Clippy and desktop Rust tests
         working-directory: apps/desktop
         run: bun run check:rust
@@ -108,9 +145,11 @@ jobs:
       - name: Rust workspace tests
         run: cargo test --workspace --exclude tugboat-desktop
 
+      # No signing key in this step: vite, every npm package and every build script runs here. createUpdaterArtifacts
+      # (tauri.conf.json) is switched off for this build; the installer is signed in its own step below.
       - name: Build installer
         working-directory: apps/desktop
-        run: bun run tauri build
+        run: bun run tauri build --config '{"bundle":{"createUpdaterArtifacts":false}}'
 
       - name: Locate installer
         id: installer
@@ -132,7 +171,43 @@ jobs:
           mkdir out
           cp "${files[0]}" "out/LocalTugboat_${ver}_x64-setup.exe"
           (cd out && sha256sum "LocalTugboat_${ver}_x64-setup.exe" > "LocalTugboat_${ver}_x64-setup.exe.sha256")
+          # Same bytes under the published name: the signature covers the bytes, not the file name.
+          cmp "${files[0]}" "out/LocalTugboat_${ver}_x64-setup.exe"
+          echo "nsis=${files[0]}" >> "$GITHUB_OUTPUT"
           ls -la out
+
+      # Tag runs only. The one step that holds the signing key and its password: only the tauri CLI sees them.
+      # --app-version puts the version in the signed comment (the app refuses a manifest that announces another).
+      - name: Sign installer
+        if: startsWith(github.ref, 'refs/tags/v')
+        working-directory: apps/desktop
+        env:
+          NSIS: ${{ steps.installer.outputs.nsis }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -eu
+          ver=$(jq -r .version src-tauri/tauri.conf.json | tr -d '\r')
+          bun run tauri signer sign --app-version "$ver" "../../$NSIS"
+          if [ ! -s "../../$NSIS.sig" ]; then
+            echo "::error::No update signature next to the installer: '$NSIS.sig' is missing or empty"
+            exit 1
+          fi
+
+      # The file the app's update check downloads: version, release link, and the signature of the installer
+      # that is attached to this release. The script verifies the signature against plugins.updater.pubkey and the
+      # installer's bytes, so a key pair that does not match fails the release here, not on every installed PC.
+      - name: Write latest.json
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          NSIS: ${{ steps.installer.outputs.nsis }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -eu
+          ver=$(jq -r .version apps/desktop/src-tauri/tauri.conf.json | tr -d '\r')
+          pubkey=$(jq -r .plugins.updater.pubkey apps/desktop/src-tauri/tauri.conf.json | tr -d '\r')
+          bun .github/scripts/latest-json.ts --version "$ver" --installer "LocalTugboat_${ver}_x64-setup.exe" --installer-file "out/LocalTugboat_${ver}_x64-setup.exe" --sig "$NSIS.sig" --pubkey "$pubkey" --repo "$REPO" --out out/latest.json
+          cat out/latest.json
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -170,8 +245,15 @@ jobs:
           shopt -s nullglob
           files=(installer/*-setup.exe)
           sums=(installer/*.sha256)
-          if [ "${#files[@]}" -ne 1 ] || [ "${#sums[@]}" -ne 1 ]; then
-            echo "::error::Expected exactly one installer and one .sha256, found ${#files[@]} and ${#sums[@]}"
+          manifests=(installer/*.json)
+          if [ "${#files[@]}" -ne 1 ] || [ "${#sums[@]}" -ne 1 ] || [ "${#manifests[@]}" -ne 1 ] || [ "${manifests[0]##*/}" != "latest.json" ]; then
+            echo "::error::Expected exactly one installer, one .sha256 and one latest.json, found ${#files[@]}, ${#sums[@]} and ${#manifests[@]}"
+            exit 1
+          fi
+          # latest.json must announce the version of the tag it is attached to.
+          announced=$(jq -r .version "${manifests[0]}" | tr -d '\r')
+          if [ "$announced" != "${TAG#v}" ]; then
+            echo "::error::latest.json announces '$announced' but the tag is $TAG"
             exit 1
           fi
           st=$(gh api "repos/$GH_REPO/compare/main...$TAG" --jq .status)
@@ -196,6 +278,14 @@ jobs:
 
           SHA-256: see the .sha256 file.
 
+          latest.json is what the app's update check reads: leave it attached.
+
           Android: Google Play (link added when published).
           EOF
-          gh release create "$TAG" "${files[0]}" "${sums[0]}" --draft --verify-tag --title "$TAG" --notes-file notes.md
+          # A tag with a suffix (v0.4.0-rc.1) is a pre-release: GitHub's "latest release" never returns one, so
+          # installed PCs are not offered it unless the pre-release box is unticked on purpose.
+          pre=()
+          case "$TAG" in
+            *-*) pre=(--prerelease) ;;
+          esac
+          gh release create "$TAG" "${files[0]}" "${sums[0]}" "${manifests[0]}" --draft --verify-tag ${pre[@]+"${pre[@]}"} --title "$TAG" --notes-file notes.md

@@ -5,8 +5,8 @@
 // Events carry ids, not rows, so a screen that shows rows watches `app.itemsRev` / `activityRev`
 // and re-reads. If the event stream lags (`resync`) everything is re-read.
 
-import { api, ApiError, onCoreEvent, onDropProgress, onDropResult, onDropState, onFirewallStatus, onLibraryStatus, onResync, pickFolder } from "./api";
-import type { AppInfo, DropProgress, DropReport, FirewallInfo, FolderView, LibraryStatus, PairedDevice, Settings, SyncStatus } from "./api";
+import { api, ApiError, onCoreEvent, onDropProgress, onDropResult, onDropState, onFirewallStatus, onLibraryStatus, onResync, onUpdateReady, pickFolder } from "./api";
+import type { AppInfo, DropProgress, DropReport, FirewallInfo, FolderView, LibraryStatus, PairedDevice, Settings, SyncStatus, UpdateReady } from "./api";
 import { dropBanner, dropSummary, type DropEnter } from "./drop";
 import { claimAll, reportRun, startRun, type RunOutcome } from "./generation";
 import { nextPairPhase, type PairInput, type PairPhase } from "./pairing";
@@ -29,6 +29,10 @@ export const app = $state({
   pairing: { t: "idle" } as PairPhase,
   /** The phone logged this PC out: a banner until dismissed or a phone is linked again. */
   removedByPhone: false,
+  /** A newer version is downloaded and verified: a banner with [Install] until it is installed. */
+  update: null as UpdateReady | null,
+  /** [Install] was clicked and the installer has not started yet: the banner says so and has no button. */
+  installing: false,
   /** Last failure (a rejected command or a core error event), until dismissed. */
   error: null as { kind: string; message: string } | null,
   /** The chosen library folder looks cloud-synced: ask before using it. */
@@ -107,9 +111,9 @@ async function loadPaired(): Promise<void> {
 async function loadAll(): Promise<void> {
   const current = claimAll(gen);
   const all = await Promise.allSettled([
-    api.appInfo(), api.syncStatus(), api.libraryStatus(), api.firewallStatus(), api.folders(), api.pairedDevice(), api.settings(),
+    api.appInfo(), api.syncStatus(), api.libraryStatus(), api.firewallStatus(), api.folders(), api.pairedDevice(), api.settings(), api.updateReady(),
   ] as const);
-  const [info, sync, library, firewall, folders, paired, settings] = all;
+  const [info, sync, library, firewall, folders, paired, settings, update] = all;
   if (info.status === "fulfilled") app.info = info.value;
   // A field an event wrote while these requests ran is newer than what came back: keep it.
   if (sync.status === "fulfilled" && current("sync")) app.sync = sync.value;
@@ -118,6 +122,8 @@ async function loadAll(): Promise<void> {
   if (folders.status === "fulfilled" && current("folders")) app.folders = folders.value;
   if (paired.status === "fulfilled" && current("paired")) app.paired = paired.value;
   if (settings.status === "fulfilled" && current("settings")) app.settings = settings.value;
+  // An update never goes away by itself, so an answer is only ever added to what the event already put there.
+  if (update.status === "fulfilled" && update.value) app.update = update.value;
   app.itemsRev++;
   app.activityRev++;
   const failed = all.find((r) => r.status === "rejected");
@@ -198,6 +204,7 @@ export async function start(): Promise<() => void> {
     }));
     stops.push(await onDropResult(dropFinished));
     stops.push(await onFirewallStatus((s) => { gen.firewall++; app.firewall = s; }));
+    stops.push(await onUpdateReady((u) => (app.update = u)));
     stops.push(await onResync(() => void reload()));
   } catch (e) {
     stops.forEach((s) => s());
@@ -281,6 +288,18 @@ export async function locateLibrary(): Promise<void> {
     if (path !== null) await api.libraryLocate(path);
   } catch (e) {
     fail(e);
+  }
+}
+
+/** [Install] on the update banner. When the installer starts the app closes; when the user says no to the Windows
+ *  prompt nothing changes and the banner stays. */
+export async function installUpdate(): Promise<boolean> {
+  if (app.installing) return false;
+  app.installing = true;
+  try {
+    return await act(() => api.updateInstall());
+  } finally {
+    app.installing = false;
   }
 }
 

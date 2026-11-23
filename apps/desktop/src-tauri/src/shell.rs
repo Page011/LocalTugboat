@@ -15,6 +15,7 @@ use crate::{
     commands::MAIN,
     drop::NativeDrop,
     tray::{self, TrayState},
+    updates,
 };
 
 pub const TRAY_ID: &str = "tugboat";
@@ -155,10 +156,43 @@ pub fn watch_display(app: &AppHandle) {
 #[cfg(not(windows))]
 pub fn watch_display(_app: &AppHandle) {}
 
-pub fn build_tray(app: &AppHandle) -> tauri::Result<()> {
+/// The tray menu: Open, Quit, and "Install update X.Y.Z" between them while a verified update waits.
+fn tray_menu(app: &AppHandle, update: Option<&str>) -> tauri::Result<Menu<tauri::Wry>> {
     let open = MenuItem::with_id(app, "open", "Open Tugboat", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&open, &quit])?;
+    match update {
+        Some(version) => {
+            let install = MenuItem::with_id(app, "install_update", updates::tray_item_text(version), true, None::<&str>)?;
+            Menu::with_items(app, &[&open, &install, &quit])
+        }
+        None => Menu::with_items(app, &[&open, &quit]),
+    }
+}
+
+/// Show (Some) or remove (None) the "Install update" item.
+pub fn set_update_item(app: &AppHandle, version: Option<&str>) {
+    let Some(tray) = app.tray_by_id(TRAY_ID) else { return };
+    match tray_menu(app, version) {
+        Ok(menu) => {
+            if let Err(e) = tray.set_menu(Some(menu)) {
+                tracing::warn!("tray menu not updated: {e}");
+            }
+        }
+        Err(e) => tracing::warn!("tray menu not built: {e}"),
+    }
+}
+
+/// Hide or show the tray icon (hidden for the moment the update installer takes over).
+pub fn set_tray_visible(app: &AppHandle, visible: bool) {
+    if let Some(tray) = app.tray_by_id(TRAY_ID) {
+        if let Err(e) = tray.set_visible(visible) {
+            tracing::warn!("tray icon visibility not changed: {e}");
+        }
+    }
+}
+
+pub fn build_tray(app: &AppHandle) -> tauri::Result<()> {
+    let menu = tray_menu(app, None)?;
     TrayIconBuilder::with_id(TRAY_ID)
         .icon(tray_image(app, TrayState::Offline).ok_or_else(|| tauri::Error::InvalidIcon(std::io::Error::other("tray icon missing")))?)
         .tooltip("Tugboat")
@@ -167,6 +201,7 @@ pub fn build_tray(app: &AppHandle) -> tauri::Result<()> {
         .on_menu_event(|app, e| match e.id.as_ref() {
             "open" => show_main(app),
             "quit" => app.exit(0),
+            "install_update" => updates::install_from_tray(app),
             _ => {}
         })
         .on_tray_icon_event(|tray, e| {

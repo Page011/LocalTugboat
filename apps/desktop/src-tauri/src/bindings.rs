@@ -20,6 +20,7 @@ use crate::{
     firewall::{FirewallInfo, FirewallStatus},
     library::{LibraryHealth, LibraryStatus, NotSyncedFile},
     tray::TrayState,
+    updates::UpdateReady,
 };
 
 fn export_all(dir: &Path) {
@@ -50,6 +51,7 @@ fn export_all(dir: &Path) {
         DropProgress,
         DropLine,
         DropReport,
+        UpdateReady,
     );
 }
 
