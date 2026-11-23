@@ -37,11 +37,14 @@ class InitOrderTest {
         assertEquals(OnboardingStep.SCAN, UiLogic.onboardingStep(rows, true, UiLogic.pairingAfterUnpair(PairUi.Done("Office PC"))))
     }
 
-    @Test fun the_unpaired_event_resets_the_view_model() {
+    @Test fun the_unpaired_event_resets_the_view_model_only_when_no_pc_is_left() {
         val vm = source("SnapViewModel.kt")
-        assertTrue(Regex("""is FfiEvent\.Unpaired\s*->\s*\{\s*resetAfterUnpair\(\)""").containsMatchIn(vm))
-        // the user's own unpair goes through the same reset
-        assertTrue(vm.substringAfter("fun unpair()").substringBefore("fun resetAfterUnpair").contains("resetAfterUnpair()"))
+        assertTrue(Regex("""is FfiEvent\.Unpaired\s*->\s*\{\s*if \(!stillLinked\(\)\) resetAfterUnpair\(\)""").containsMatchIn(vm))
+        // the user's own unlink goes through the same reset, and stops the service only at the same point
+        val own = vm.substringAfter("fun unlink(").substringBefore("fun resetAfterUnpair")
+        assertTrue(Regex("""if \(!stillLinked\(\)\)\s*\{\s*SnapService\.stop\(ctx\)\s*resetAfterUnpair\(\)""").containsMatchIn(own))
+        // "still linked" is read from the core's device list, never from a cached copy
+        assertTrue(vm.substringAfter("fun stillLinked()").substringBefore("catch").contains("core.phone().status().devices"))
     }
 
     // ---- CameraX temp files left by a killed process ----

@@ -27,6 +27,8 @@ export const app = $state({
   paired: null as PairedDevice | null,
   settings: null as Settings | null,
   pairing: { t: "idle" } as PairPhase,
+  /** The phone logged this PC out: a banner until dismissed or a phone is linked again. */
+  removedByPhone: false,
   /** Last failure (a rejected command or a core error event), until dismissed. */
   error: null as { kind: string; message: string } | null,
   /** The chosen library folder looks cloud-synced: ask before using it. */
@@ -177,6 +179,8 @@ export async function start(): Promise<() => void> {
         }
         case "pairing":
           pair({ t: "event", e });
+          if (e.kind === "unpaired") app.removedByPhone = e.by_peer;
+          if (e.kind === "completed") app.removedByPhone = false;
           if (e.kind === "completed" || e.kind === "unpaired") refreshPaired();
           break;
         case "error":

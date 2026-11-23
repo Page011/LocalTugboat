@@ -11,16 +11,15 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
-import uniffi.tugboat_ffi.SyncState
 
-/** The one rule for "should the foreground service run": paired, and the setting is on. */
+/** The one rule for "should the foreground service run": a PC is linked, and the setting is on. */
 object ServiceGate {
-    /** Blocking (opens the core). Paired and the setting on. False when that cannot be read (reported). */
+    /** Blocking (opens the core). A PC linked and the setting on. False when that cannot be read (reported). */
     fun wanted(c: Context, why: String): Boolean {
         val core = c.applicationContext.core
         return try {
             val p = core.phone()
-            p.pairedPc() != null && p.settings().stayConnected
+            UiLogic.linked(p.status().devices) && p.settings().stayConnected
         } catch (e: Exception) {
             core.reportError("start check ($why) failed: ${e.message}")
             false
@@ -71,7 +70,7 @@ class CatchUpWorker(c: Context, p: WorkerParameters) : CoroutineWorker(c, p) {
             val p = core.phone()
             val recovered = Capture.recover(app)
             if (recovered > 0) KLog.log(app, "worker: took $recovered shot(s) left from an earlier failed hand-off")
-            if (p.pairedPc() == null) return Result.success()
+            if (!UiLogic.linked(p.status().devices)) return Result.success()
             if (p.settings().stayConnected && !core.serviceRunning) {
                 if (Perms.batteryExempt(app)) {
                     KLog.log(app, "worker: service not running, restarting it")
@@ -90,10 +89,8 @@ class CatchUpWorker(c: Context, p: WorkerParameters) : CoroutineWorker(c, p) {
             try {
                 p.reconnectNow()
                 val done = withTimeoutOrNull(SYNC_WAIT_MS) {
-                    core.status.first {
-                        // A fresh sync, not the stale status left from the last session.
-                        it != null && it.state == SyncState.SYNCED && it.downloading == 0u && (it.lastSyncedAt ?: 0L) >= startedAt - 1000
-                    }
+                    // A fresh sync, not the stale status left from the last session.
+                    core.status.first { UiLogic.caughtUp(it, startedAt) }
                 }
                 KLog.log(app, "worker: catch-up ${if (done != null) "synced" else "timed out, PC not reachable"}")
             } finally {

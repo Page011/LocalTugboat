@@ -137,11 +137,26 @@ class FixesTest {
         assertTrue(imp.contains("inFlight.add(src.path)"))
     }
 
-    @Test fun the_deep_link_guard_and_the_pair_button_both_ask_the_core() {
+    @Test fun the_deep_link_leaves_the_limit_to_the_core() {
         val vm = source("SnapViewModel.kt")
         val link = vm.substringAfter("fun onDeepLink(").substringBefore("fun dismissDeepLink(")
-        assertEquals(2, Regex("""pairedPc\(\) != null""").findAll(link).count())
-        assertFalse("meta.value.paired decides it", link.contains("meta.value.paired"))
+        assertFalse("a PC that is already listed links again", link.contains("UiLogic.atLimit(") || link.contains("Texts.LIMIT_LINE"))
+        assertFalse("the cached state decides it", link.contains("meta.value") || link.contains("ui.value"))
+    }
+
+    @Test fun the_link_screen_keeps_a_pairing_through_a_rotation() {
+        val onb = source("Onboarding.kt").substringAfter("fun AddDeviceScreen(")
+        assertTrue(onb.contains("activity?.isChangingConfigurations != true"))
+    }
+
+    // Found on the emulator: a deep link re-linked a PC so fast that the pairing finished before the Link a PC screen
+    // was first drawn, and the screen's reset on entry wiped the success, leaving the scanner up.
+    @Test fun the_link_screen_is_cleared_when_opened_not_when_drawn() {
+        val onb = source("Onboarding.kt").substringAfter("fun AddDeviceScreen(").substringBefore("private fun PairSteps(")
+        assertFalse(onb.contains("LaunchedEffect(Unit)"))
+        val open = source("SnapViewModel.kt").substringAfter("fun openAddDevice(").substringBefore("\n    }")
+        assertTrue(open.indexOf("resetPairing()") in 0 until open.indexOf("nav.go(Route.AddDevice)"))
+        assertTrue(source("Settings.kt").contains("onClick = vm::openAddDevice"))
     }
 
     // Found on the emulator while testing Undo: a list reload waited 150 ms after ItemsChanged, but the Sync event

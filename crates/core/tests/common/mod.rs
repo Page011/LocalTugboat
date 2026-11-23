@@ -55,6 +55,7 @@ pub struct Dev {
     pub name: String,
     pub port: u16,
     pub events: Arc<Mutex<Vec<Event>>>,
+    started: AtomicBool,
 }
 
 pub fn random_secret() -> [u8; 32] {
@@ -119,19 +120,39 @@ impl Dev {
                 }
             }
         });
-        Dev { core, clock: clock.clone(), dir, secret, id, role, name: name.to_string(), port: if role == Role::Pc { free_udp_port() } else { 0 }, events }
+        Dev { core, clock: clock.clone(), dir, secret, id, role, name: name.to_string(), port: if role == Role::Pc { free_udp_port() } else { 0 }, events, started: AtomicBool::new(false) }
     }
 
     pub fn bind(&self) -> SocketAddr {
         format!("127.0.0.1:{}", self.port).parse().unwrap()
     }
 
+    /// Start the network. A device that is already running is left alone (a phone linking its
+    /// second PC).
     pub async fn start(&self) {
+        if self.started.swap(true, Ordering::SeqCst) {
+            return;
+        }
         self.core.start_network(NetworkConfig { bind: self.bind(), mdns: false, secret_key: self.secret }).await.expect("start network");
     }
 
     pub async fn stop(&self) {
+        self.started.store(false, Ordering::SeqCst);
         self.core.stop_network().await;
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.started.load(Ordering::SeqCst)
+    }
+
+    /// The same device again from its own directory, as after a crash or a restart. The network
+    /// is not started; the old core is dropped first.
+    pub fn reopen(self) -> Dev {
+        let Dev { core, clock, dir, secret, id: _, role, name, port, events: _, started: _ } = self;
+        drop(core);
+        let mut dev = Dev::open_in(dir, role, &name, &clock, secret);
+        dev.port = port;
+        dev
     }
 
     // ----- events -----
@@ -293,15 +314,20 @@ pub fn jpeg_bytes(seed: u64, len: usize) -> Vec<u8> {
     out
 }
 
-/// Pair a PC and a phone through the real pairing flow. Both end up paired; the phone's connect
-/// loop is running and dials the PC at once. Returns when both report Completed.
+/// Pair a PC and a phone through the real pairing flow. Both end up paired; the phone's dial
+/// task for the PC is running and dials it at once. Returns when both report Completed.
 pub async fn pair(pc: &Dev, phone: &Dev) {
+    link(pc, phone, false).await;
+}
+
+/// `pair`, for a PC that already has a phone (`replace_existing`).
+pub async fn link(pc: &Dev, phone: &Dev, replace_existing: bool) {
     // Count events first: a re-pairing must wait for NEW code/completed events, not old ones.
     let (codes_pc, codes_phone) = (pc.count_events(is_code), phone.count_events(is_code));
     let (done_pc, done_phone) = (pc.count_events(is_completed), phone.count_events(is_completed));
     pc.start().await;
     phone.start().await;
-    let payload = pc.core.begin_pairing(false).expect("begin pairing");
+    let payload = pc.core.begin_pairing(replace_existing).expect("begin pairing");
     let phone_core = phone.core.clone();
     let task = tokio::spawn(async move { phone_core.pair_with(&payload).await });
     until("the PC to show a code", 10, || pc.count_events(is_code) > codes_pc).await;
@@ -408,5 +434,100 @@ impl Placement for SpacePlacement {
             return Err(tugboat_core::CoreError::Io { path: "storage".into(), msg: "free space unknown (test)".into() });
         }
         Ok(self.free.load(Ordering::SeqCst))
+    }
+}
+
+/// A phone with several PCs linked: the star the multi-device tests run on. Every device has its
+/// own clock. A PC that is `apart` is stopped; `settle` waits only for the running ones.
+pub struct StarRig {
+    pub phone: Dev,
+    pub pcs: Vec<Dev>,
+}
+
+impl StarRig {
+    /// A phone with `n` PCs linked and synced.
+    pub async fn new(n: usize) -> StarRig {
+        StarRig::with_phone(Dev::new(Role::Phone, "Test phone", &TestClock::new(T0)), n).await
+    }
+
+    pub async fn with_phone(phone: Dev, n: usize) -> StarRig {
+        let mut rig = StarRig { phone, pcs: Vec::new() };
+        for _ in 0..n {
+            rig.add_pc().await;
+        }
+        rig.settle().await;
+        rig
+    }
+
+    /// Link one more PC (named PC-1, PC-2, ...) and return its place in `pcs`.
+    pub async fn add_pc(&mut self) -> usize {
+        let pc = Dev::new(Role::Pc, &format!("PC-{}", self.pcs.len() + 1), &TestClock::new(T0));
+        pair(&pc, &self.phone).await;
+        self.pcs.push(pc);
+        self.pcs.len() - 1
+    }
+
+    /// The phone's list entry for PC `i`.
+    pub fn row(&self, i: usize) -> tugboat_core::events::DeviceStatus {
+        let id = hex::encode(self.pcs[i].id.0);
+        self.phone.core.status().devices.into_iter().find(|d| d.id == id).unwrap_or_else(|| panic!("the phone lists no device {}", self.pcs[i].name))
+    }
+
+    pub fn row_state(&self, i: usize) -> Option<SyncState> {
+        let id = hex::encode(self.pcs[i].id.0);
+        self.phone.core.status().devices.into_iter().find(|d| d.id == id && !d.unlinking).map(|d| d.state)
+    }
+
+    /// The PCs that are up and still linked to the phone.
+    fn running(&self) -> Vec<usize> {
+        (0..self.pcs.len()).filter(|i| self.pcs[*i].is_running() && self.row_state(*i).is_some()).collect()
+    }
+
+    /// Every running PC Synced, the phone's entry for each Synced, and all digests equal and
+    /// unchanged after a short quiet time (a receipt in flight changes them a moment later).
+    pub async fn settle(&self) {
+        let live = self.running();
+        for i in &live {
+            self.pcs[*i].wait_state(SyncState::Synced).await;
+        }
+        until("the phone to list every running PC as Synced", 20, || live.iter().all(|i| self.row_state(*i) == Some(SyncState::Synced))).await;
+        let equal = || live.iter().all(|i| self.pcs[*i].digest() == self.phone.digest());
+        until("equal digests", 20, equal).await;
+        loop {
+            let seen = self.phone.digest();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            if live.iter().all(|i| self.pcs[*i].digest() == seen) && self.phone.digest() == seen {
+                return;
+            }
+            until("equal digests again", 20, equal).await;
+        }
+    }
+
+    /// Take PC `i` off the network, and wait until the phone lists it as away.
+    pub async fn apart(&self, i: usize) {
+        self.pcs[i].stop().await;
+        until("the phone to list the PC as Offline", 20, || self.row_state(i) == Some(SyncState::Offline)).await;
+    }
+
+    /// Bring PC `i` back; the phone dials it by itself (told to look now, past its back-off).
+    pub async fn together(&self, i: usize) {
+        self.pcs[i].start().await;
+        self.phone.core.reconnect_now();
+    }
+
+    /// The phone as after a crash: same directory, network not running, then started again.
+    pub async fn restart_phone(&mut self) {
+        self.phone.stop().await;
+        let stand_in = Dev::new(Role::Phone, "stand-in", &TestClock::new(T0));
+        let old = std::mem::replace(&mut self.phone, stand_in);
+        self.phone = old.reopen();
+        self.phone.start().await;
+    }
+
+    pub async fn shutdown(&self) {
+        self.phone.stop().await;
+        for pc in &self.pcs {
+            pc.stop().await;
+        }
     }
 }

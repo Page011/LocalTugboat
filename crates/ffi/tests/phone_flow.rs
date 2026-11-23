@@ -124,9 +124,9 @@ fn pair_send_receive_push_and_typed_errors() {
     // Typed errors before any network: junk text and a public address never leave the phone.
     assert!(matches!(phone.pair_with("hello".into()), Err(SnapError::PairBadPayload(_))));
     assert!(matches!(inspect_pairing_payload("hello".into()), Err(SnapError::PairBadPayload(_))));
-    assert!(matches!(phone.unpair(), Err(SnapError::NotPaired(_))), "nothing paired yet");
+    assert!(matches!(phone.unlink("ab".repeat(32)), Err(SnapError::NotPaired(_))), "nothing paired yet");
     assert_eq!(phone.status().state, SyncState::Unpaired);
-    assert!(phone.paired_pc().unwrap().is_none());
+    assert!(phone.status().devices.is_empty());
     // No PC, nothing to expire: the three default folders exist.
     let names: Vec<String> = phone.folders().unwrap().into_iter().map(|f| f.name).collect();
     assert_eq!(names, ["Inbox", "Keep", "Unsorted"]);
@@ -143,8 +143,8 @@ fn pair_send_receive_push_and_typed_errors() {
     pc.rt.block_on(pc.core.confirm_pairing(true)).unwrap();
     let paired = pairing.join().unwrap().expect("pairing completes");
     assert_eq!(paired.name, "TEST-PC");
-    assert_eq!(phone.paired_pc().unwrap().unwrap().id, paired.id);
-    until("PairingCompleted event", 5, || events.0.lock().unwrap().iter().any(|e| matches!(e, FfiEvent::PairingCompleted { peer_name } if peer_name == "TEST-PC")));
+    assert_eq!(phone.status().devices.iter().map(|d| d.id.clone()).collect::<Vec<_>>(), std::slice::from_ref(&paired.id));
+    until("PairingCompleted event", 5, || events.0.lock().unwrap().iter().any(|e| matches!(e, FfiEvent::PairingCompleted { peer_name, .. } if peer_name == "TEST-PC")));
     until("both synced", 20, || phone.status().state == SyncState::Synced && pc.core.status().state == CoreSyncState::Synced);
     assert_eq!(phone.status().peer_name.as_deref(), Some("TEST-PC"));
 
@@ -287,11 +287,11 @@ fn pair_send_receive_push_and_typed_errors() {
     assert_eq!(phone.settings().unwrap().bin_days, 3);
 
     // ---- unpair: the connected PC is told ----
-    phone.unpair().unwrap();
+    phone.unlink(paired.id.clone()).unwrap();
     assert_eq!(phone.status().state, SyncState::Unpaired);
-    assert!(phone.paired_pc().unwrap().is_none());
+    assert!(phone.status().devices.is_empty());
     until("the PC is unpaired too", 15, || pc.core.paired_device().unwrap().is_none());
-    assert!(matches!(phone.unpair(), Err(SnapError::NotPaired(_))));
+    assert!(matches!(phone.unlink(paired.id.clone()), Err(SnapError::NotPaired(_))));
     assert!(all_items(&phone).iter().any(|i| i.id == id), "files stay after unpair");
 
     phone.stop_network();

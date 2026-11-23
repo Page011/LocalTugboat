@@ -40,8 +40,10 @@ async fn s11_version_mismatch_is_refused_visibly_on_both_devices() {
     pair(&r.pc, &r.phone).await;
     r.phone.wait_state(SyncState::Refused).await;
     r.pc.wait_state(SyncState::Refused).await;
+    // One PC linked: both devices say "the PC".
+    assert_eq!(r.pc.core.status().message.as_deref(), Some("Update Tugboat on the PC"), "{}", r.pc.name);
+    assert_eq!(r.phone.core.status().message.as_deref(), Some("Update Tugboat on the PC"), "{}", r.phone.name);
     for d in [&r.pc, &r.phone] {
-        assert_eq!(d.core.status().message.as_deref(), Some("Update Tugboat on the PC"), "{}", d.name);
         assert!(d.has_activity(ActivityAction::SyncError), "{}: {:?}", d.name, d.activity_text());
         assert!(d.errors().iter().any(|(k, m)| k == "version_mismatch" && m.contains("Update Tugboat")), "{}: {:?}", d.name, d.errors());
     }
@@ -138,7 +140,8 @@ async fn s12c_second_use_of_the_secret_cancels_for_both_phones() {
 }
 
 // S12d: an expired window refuses; a wrong secret is refused and the window stays open for the
-// right one; an already paired PC needs replace_existing.
+// right one; an already paired PC needs replace_existing. The phone does not replace a PC: a second
+// PC links beside the first.
 #[tokio::test(flavor = "multi_thread")]
 async fn s12d_expiry_wrong_secret_and_replace_rules() {
     let r = Rig::unconnected();
@@ -174,6 +177,14 @@ async fn s12d_expiry_wrong_secret_and_replace_rules() {
     // A garbage QR is a pairing error, not a crash.
     let err = r.phone.core.pair_with("hello").await.unwrap_err();
     assert_eq!(pairing_code_of(&err), "bad_payload");
+
+    // The phone links a second PC; the first stays linked and is told nothing.
+    let pc2 = Dev::new(Role::Pc, "SECOND-PC", &TestClock::new(T0));
+    pair(&pc2, &r.phone).await;
+    assert_eq!(r.phone.core.status().devices.len(), 2, "both PCs are linked");
+    assert!(r.pc.core.paired_device().unwrap().is_some(), "the first PC is still linked");
+    assert!(!r.pc.has_event(|e| matches!(e, Event::Pairing(PairingEvent::Unpaired { .. }))), "and was not told it was replaced");
+    pc2.stop().await;
     r.shutdown().await;
 }
 
@@ -303,8 +314,13 @@ async fn s14a_unpair_while_connected() {
     r.pc.core.unpair().await.unwrap();
     until("the phone unpaired itself", 10, || r.phone.core.paired_device().unwrap().is_none()).await;
     assert!(r.pc.core.paired_device().unwrap().is_none());
+    // The PC did it; the phone was told by it.
+    until("the Unpaired events", 10, || {
+        r.pc.has_event(|e| matches!(e, Event::Pairing(PairingEvent::Unpaired { by_peer: false, .. })))
+            && r.phone.has_event(|e| matches!(e, Event::Pairing(PairingEvent::Unpaired { by_peer: true, .. })))
+    })
+    .await;
     for d in [&r.pc, &r.phone] {
-        assert!(d.has_event(|e| matches!(e, Event::Pairing(PairingEvent::Unpaired { .. }))), "{}", d.name);
         assert_eq!(d.state(), SyncState::Unpaired, "{}", d.name);
         assert!(d.has_activity(ActivityAction::Unpaired));
         assert_eq!(d.core.debug_conn(|c| c.query_row("SELECT count(*) FROM change_log", [], |r| r.get::<_, i64>(0)).unwrap()), 0, "{}: log cleared", d.name);
@@ -334,6 +350,8 @@ async fn s14b_unpair_while_apart_is_learned_on_the_next_connect() {
     until("the phone learned it was unpaired", 15, || r.phone.core.paired_device().unwrap().is_none()).await;
     assert_eq!(r.phone.state(), SyncState::Unpaired);
     assert!(r.phone.has_activity(ActivityAction::Unpaired));
+    until("the Unpaired event", 10, || r.phone.has_event(|e| matches!(e, Event::Pairing(PairingEvent::Unpaired { by_peer: true, .. })))).await;
+    assert!(r.phone.core.status().devices.is_empty());
     r.shutdown().await;
 }
 

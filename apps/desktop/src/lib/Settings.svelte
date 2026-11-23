@@ -65,7 +65,10 @@
 
   async function unpair() {
     confirmUnpair = false;
-    if (await act(() => api.unpair())) app.paired = await api.pairedDevice().catch(() => null);
+    if (await act(() => api.unpair())) {
+      app.paired = await api.pairedDevice().catch(() => null);
+      app.pairing = { t: "idle" };
+    }
   }
 </script>
 
@@ -109,11 +112,11 @@
     <div class="card block">
       <h2>Phone</h2>
       {#if app.paired}
-        <p><strong>{app.paired.name}</strong></p>
-        <p class="muted">Paired {ago(app.paired.paired_at, app.now)}. {lastSeenText(app.paired, app.sync, app.now)}.</p>
-        <div><button class="btn danger" onclick={() => (confirmUnpair = true)}><Unlink size={16} aria-hidden="true" /> Unpair</button></div>
+        <p><strong>Linked to {app.paired.name}</strong></p>
+        <p class="muted">Linked {ago(app.paired.paired_at, app.now)} - {lastSeenText(app.paired, app.sync, app.now).toLowerCase()}</p>
+        <div><button class="btn danger" onclick={() => (confirmUnpair = true)}><Unlink size={16} aria-hidden="true" /> Log out</button></div>
       {:else}
-        <p class="muted">No phone paired.</p>
+        <p class="muted">Not linked to a phone.</p>
       {/if}
     </div>
 
@@ -126,11 +129,11 @@
   </div>
 </section>
 
-<Dialog bind:open={confirmUnpair} title="Unpair {app.paired?.name ?? 'phone'}?">
-  <p>Photos already synced stay on both devices. Syncing stops until you pair again.</p>
+<Dialog bind:open={confirmUnpair} title="Log out of {app.paired?.name ?? 'phone'}?">
+  <p>Files stay on this PC.</p>
   {#snippet footer()}
     <button class="btn" onclick={() => (confirmUnpair = false)}>Cancel</button>
-    <button class="btn danger" onclick={unpair}>Unpair</button>
+    <button class="btn danger" onclick={unpair}>Log out</button>
   {/snippet}
 </Dialog>
 

@@ -12,9 +12,9 @@ coroutines. `.so` files: `app/src/main/jniLibs/arm64-v8a` and `x86_64`, only `li
 
 1. Every method is a plain blocking call. Call it from `Dispatchers.IO` or a worker thread. Never
    from the main thread, and never from inside `EventListener.onEvent` (the callback runs on a
-   Rust runtime thread; calling `startNetwork`, `stopNetwork`, `pairWith` or `unpair` there
+   Rust runtime thread; calling `startNetwork`, `stopNetwork`, `pairWith` or `unlink` there
    panics).
-2. Slow calls: `startNetwork` (binds the endpoint), `stopNetwork`, `unpair` (up to 3 s while the
+2. Slow calls: `startNetwork` (binds the endpoint), `stopNetwork`, `unlink` (up to 3 s while the
    PC is told), `pairWith` (until the PC owner clicks Pair, about 2 min at most, or the dial
    bound of 8 s on the wrong network), `addFile` (copies and hashes the file: tens of ms for a
    photo, seconds for a long video; it holds the database lock while it copies, so sync stalls
@@ -64,7 +64,6 @@ interface PhoneCoreInterface {
     fun logPath(): kotlin.String
     fun moveItem(id: kotlin.String, folderIdTarget: kotlin.String)
     fun pairWith(payload: kotlin.String): PairedPc
-    fun pairedPc(): PairedPc?
     fun reconnectNow()
     fun restoreItem(id: kotlin.String)
     fun routeCapture(fix: LocationFix?): CaptureRoute
@@ -74,7 +73,7 @@ interface PhoneCoreInterface {
     fun startNetwork(mdns: kotlin.Boolean)
     fun status(): SyncStatus
     fun stopNetwork()
-    fun unpair()
+    fun unlink(deviceId: kotlin.String)
 }
 ```
 Only `deviceId`, `logPath`, `reconnectNow`, `cancelPairing`, `status` and `stopNetwork` cannot
@@ -89,11 +88,10 @@ throw; every other method carries `@Throws(SnapException::class)` in the generat
 | `startNetwork(mdns)` | Starts the endpoint (binds `0.0.0.0`, random UDP port) and the connect loop to the paired PC (cached addresses first, `mdns` = then look it up by name). `Invalid` if already started. |
 | `stopNetwork` | Stops it. |
 | `reconnectNow` | Wi-Fi changed or app came to the front: dial the PC now instead of waiting out the back-off (up to 30 s). Safe any time. |
-| `status` | `SyncStatus`, see below. Events keep it current; call it once on screen start. |
-| `pairWith(payload)` | Blocks until paired. The listener gets `PairingCode` first: show it large ("Check your PC shows 482 913"). On success the phone connects to the PC by itself. |
+| `status` | `SyncStatus`, see below. `devices` lists every linked PC (up to 5), one row each with its own state; there is no separate call for the paired PC. Events keep it current; call it once on screen start. |
+| `pairWith(payload)` | Blocks until linked. Fails with `TooManyDevices` when 5 PCs are linked and the payload is a new one; a PC that is already linked links again. The listener gets `PairingCode` first: show it large ("Check your PC shows 482 913"). On success the phone connects to the PC by itself. |
 | `cancelPairing` | Releases a waiting `pairWith` with `PairCancelled`. No effect when nothing waits. |
-| `pairedPc` | The paired PC or null. |
-| `unpair` | Unpairs. Files stay. If the PC cannot be told now, the phone keeps a notice and delivers it later; `status().message` says "PC NOT TOLD YET ..." meanwhile. `NotPaired` if nothing is paired. |
+| `unlink(deviceId)` | Unlinks one PC (`status().devices[].id`). Files stay. If the PC cannot be told now, the phone keeps a notice and delivers it later; that row shows `unlinking` meanwhile. A malformed id is `InvalidInput`, an unknown one `NotPaired`. |
 | `folders` | Folders with item counts and retention (`retentionSecs == null` is Keep). |
 | `items(folderIdFilter, bin, after, limit)` | Newest first. `folderIdFilter` null = all. `bin` true = only Bin items. `after` = `ItemPage.next` of the previous page. `limit` 0 = 50, max 500. |
 | `item(id)` | One item or null. |
@@ -191,7 +189,21 @@ data class SyncStatus(
     var waiting: kotlin.UInt,          // held here, not in the Bin, no receipt from the PC yet ("3 waiting"); nothing is held back for it: items expire on time
     var downloading: kotlin.UInt,      // items that wait on the PC (Pending here)
     var storageLow: kotlin.Boolean,    // 0.2.0: the storage guard is holding downloads back (red banner: "PHONE STORAGE LOW - 37 items wait on the PC")
-    var message: kotlin.String?        // one line for REFUSED / PAUSED / "PC NOT TOLD YET ..."
+    var message: kotlin.String?,       // one line for REFUSED / PAUSED / "PC NOT TOLD YET ..."
+    var devices: List<DeviceStatus>    // one row per linked PC, oldest link first
+)
+
+data class DeviceStatus(
+    var id: kotlin.String,             // pass to unlink
+    var name: kotlin.String,
+    var state: SyncState,
+    var message: kotlin.String?,
+    var pairedAt: kotlin.Long?,
+    var lastSeenAt: kotlin.Long?,
+    var lastSyncedAt: kotlin.Long?,
+    var waiting: kotlin.UInt,
+    var downloading: kotlin.UInt,
+    var unlinking: kotlin.Boolean      // the PC has not been told yet
 )
 
 data class Settings(
@@ -246,9 +258,9 @@ sealed class FfiEvent {
     object ActivityAdded : FfiEvent()
     object SettingsChanged : FfiEvent()
     data class PairingCode(val code: kotlin.String, val peerName: kotlin.String) : FfiEvent()  // "482 913"
-    data class PairingCompleted(val peerName: kotlin.String) : FfiEvent()
+    data class PairingCompleted(val deviceId: kotlin.String, val peerName: kotlin.String) : FfiEvent()
     data class PairingCancelled(val code: kotlin.String, val message: kotlin.String) : FfiEvent()
-    object Unpaired : FfiEvent()      // the PC was unpaired here or on the PC
+    data class Unpaired(val deviceId: kotlin.String, val byPeer: kotlin.Boolean) : FfiEvent()  // a PC was unlinked here, or logged out on the PC (byPeer)
     data class Error(val kind: kotlin.String, val message: kotlin.String) : FfiEvent()
     object Resync : FfiEvent()        // listener fell behind: re-query everything on screen
 }
@@ -279,6 +291,7 @@ sealed class SnapException(message: String) : kotlin.Exception(message) {
     class FileGone(message: String)
     class NotPaired(message: String)
     class AlreadyPaired(message: String)
+    class TooManyDevices(message: String)      // "LIMIT 5 DEVICES - unlink one first"
     class Paused(message: String)
     class NetTimeout(message: String)          // no answer in time: wrong network or PC asleep
     class NetUnreachable(message: String)      // cannot connect (also: local network permission denied)
@@ -290,7 +303,7 @@ sealed class SnapException(message: String) : kotlin.Exception(message) {
     class PairBadSecret(message: String)
     class PairSecretReused(message: String)    // "Someone else tried to use this pairing code"
     class PairCancelled(message: String)
-    class PairConfirmTimeout(message: String)  // PC owner did not click Pair in time
+    class PairConfirmTimeout(message: String)  // PC owner did not click Link in time
     class PairNotOpen(message: String)
     class PairVersionMismatch(message: String)
     class PairBadPayload(message: String)      // not a Tugboat pairing code
@@ -307,8 +320,8 @@ retry.
 
 Typed checks pinned by `crates/ffi/tests/phone_flow.rs`: `addFile` of a missing file is `Io`
 (message names the file), of an exe renamed `.jpg` is `NotMedia`, of `x.lnk` is `Refused`, into an unknown folder is
-`Invalid`; a malformed id is `InvalidInput`; junk to `pairWith` is `PairBadPayload`; `unpair`
-with nothing paired is `NotPaired`; `saveSettings` with `binDays = 0` is `Invalid`.
+`Invalid`; a malformed id is `InvalidInput`; junk to `pairWith` is `PairBadPayload`; `unlink`
+of an unknown id is `NotPaired`; `saveSettings` with `binDays = 0` is `Invalid`.
 
 ## Name rules (0.2.0)
 

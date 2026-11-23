@@ -13,9 +13,7 @@ import uniffi.tugboat_ffi.ItemInfo
 import uniffi.tugboat_ffi.ItemStateInfo
 import uniffi.tugboat_ffi.LocalFileState
 import uniffi.tugboat_ffi.MediaKind
-import uniffi.tugboat_ffi.PairedPc
 import uniffi.tugboat_ffi.SyncState
-import uniffi.tugboat_ffi.SyncStatus
 
 class UiLogicTest {
     private val hour = 3_600_000L
@@ -24,23 +22,30 @@ class UiLogicTest {
     private fun perms(camera: Boolean = true, mic: Boolean = false, loc: LocationAccess = LocationAccess.NONE, notif: Boolean = true, net: Boolean = true) =
         PermState(camera, mic, loc, notif, net, batteryExempt = false)
 
-    private fun pc() = PairedPc("a".repeat(64), "OFFICE-PC", 1L, 2L, listOf("192.168.1.5:47300"))
+    private fun devs() = listOf(TestData.device())
 
     private fun status(state: SyncState, waiting: UInt = 0u, message: String? = null, downloading: UInt = 0u, storageLow: Boolean = false) =
-        SyncStatus(state, "OFFICE-PC", null, waiting, downloading, storageLow, message)
+        TestData.status(state, waiting, message, downloading, storageLow)
 
     private fun item(
         state: ItemStateInfo = ItemStateInfo.Live(1_000_000L + 5 * hour), local: LocalFileState = LocalFileState.PRESENT,
         pinned: Boolean = false, kind: MediaKind = MediaKind.IMAGE, path: String? = "/x/a.jpg", neverReached: Boolean = false,
-    ) = ItemInfo("i1", "a", "f1", kind, 10uL, "jpg", 0L, pinned, state, local, path, null, neverReached)
+        missingOn: List<String> = emptyList(),
+    ) = ItemInfo("i1", "a", "f1", kind, 10uL, "jpg", 0L, pinned, state, local, path, null, neverReached, missingOn)
 
     // ---- which screen ----
 
     @Test fun root_picks_loading_fatal_onboarding_main_in_that_order() {
-        assertEquals(Root.LOADING, UiLogic.root(UiState(loaded = false, openError = "x", paired = pc())))
-        assertEquals(Root.FATAL, UiLogic.root(UiState(loaded = true, openError = "KEY UNREADABLE", paired = pc())))
+        assertEquals(Root.LOADING, UiLogic.root(UiState(loaded = false, openError = "x", devices = devs())))
+        assertEquals(Root.FATAL, UiLogic.root(UiState(loaded = true, openError = "KEY UNREADABLE", devices = devs())))
         assertEquals(Root.ONBOARDING, UiLogic.root(UiState(loaded = true)))
-        assertEquals(Root.MAIN, UiLogic.root(UiState(loaded = true, paired = pc())))
+        assertEquals(Root.MAIN, UiLogic.root(UiState(loaded = true, devices = devs())))
+    }
+
+    @Test fun a_phone_whose_only_row_is_waiting_to_tell_a_pc_is_back_at_the_scanner() {
+        val told = TestData.device("OLD-PC", state = SyncState.UNPAIRED, unlinking = true)
+        assertEquals(Root.ONBOARDING, UiLogic.root(UiState(loaded = true, devices = listOf(told))))
+        assertEquals(Root.MAIN, UiLogic.root(UiState(loaded = true, devices = listOf(told, TestData.device()))))
     }
 
     // ---- permissions ----
@@ -129,7 +134,7 @@ class UiLogicTest {
 
     @Test fun banners_list_blockers_first_each_group_in_a_fixed_order() {
         val ui = UiState(
-            loaded = true, paired = pc(), perms = perms(notif = false, net = false), stoppedGapFromMs = 1_000L,
+            loaded = true, devices = devs(), perms = perms(notif = false, net = false), stoppedGapFromMs = 1_000L,
             status = status(SyncState.SYNCING, downloading = 37u, storageLow = true), errors = listOf("old", "download failed"),
         )
         val ids = UiLogic.banners(ui, ZoneId.of("UTC")).map { it.id }
@@ -152,16 +157,16 @@ class UiLogicTest {
     @Test fun the_storage_banner_follows_the_core_not_the_free_bytes_guess() {
         val zone = ZoneId.of("UTC")
         // Core holds downloads back: red banner with the count of items that wait on the PC.
-        val low = UiLogic.banners(UiState(loaded = true, paired = pc(), status = status(SyncState.SYNCED, downloading = 1u, storageLow = true)), zone)
+        val low = UiLogic.banners(UiState(loaded = true, devices = devs(), status = status(SyncState.SYNCED, downloading = 1u, storageLow = true)), zone)
         assertEquals("PHONE STORAGE LOW - 1 item waits on the PC", low.single().text)
         assertEquals(UiLogic.Level.BLOCKER, low.single().level)
-        assertEquals("PHONE STORAGE LOW", UiLogic.banners(UiState(loaded = true, paired = pc(), status = status(SyncState.SYNCED, storageLow = true)), zone).single().text)
+        assertEquals("PHONE STORAGE LOW", UiLogic.banners(UiState(loaded = true, devices = devs(), status = status(SyncState.SYNCED, storageLow = true)), zone).single().text)
         // Free space under the setting but the core is not holding anything back (nothing waits): no banner.
-        assertTrue(UiLogic.banners(UiState(loaded = true, paired = pc(), storageLow = true, status = status(SyncState.SYNCED)), zone).isEmpty())
+        assertTrue(UiLogic.banners(UiState(loaded = true, devices = devs(), storageLow = true, status = status(SyncState.SYNCED)), zone).isEmpty())
         // Space is back: the core says storageLow false, banner gone even with items still downloading.
-        assertTrue(UiLogic.banners(UiState(loaded = true, paired = pc(), status = status(SyncState.SYNCING, downloading = 5u)), zone).isEmpty())
+        assertTrue(UiLogic.banners(UiState(loaded = true, devices = devs(), status = status(SyncState.SYNCING, downloading = 5u)), zone).isEmpty())
         // No status yet (app just started): nothing to say.
-        assertTrue(UiLogic.banners(UiState(loaded = true, paired = pc()), zone).isEmpty())
+        assertTrue(UiLogic.banners(UiState(loaded = true, devices = devs()), zone).isEmpty())
     }
 
     @Test fun a_core_that_will_not_open_is_a_blocker() {
@@ -267,12 +272,26 @@ class UiLogicTest {
         assertEquals(UiLogic.ListUi.Empty("Bin is empty."), UiLogic.listUi(0, true, null, null, true))
         assertEquals(UiLogic.ListUi.Empty("Nothing in Work."), UiLogic.listUi(0, true, null, "Work", false))
         assertEquals(UiLogic.ListUi.Empty("Nothing yet. Photos you take here show up on your PC."), UiLogic.listUi(0, true, null, null, false))
+        assertEquals(UiLogic.ListUi.Empty("Nothing yet. Photos you take here go to your linked PCs."), UiLogic.listUi(0, true, null, null, false, several = true))
+        // The other empty states do not depend on the count.
+        assertEquals(UiLogic.ListUi.Empty("Bin is empty."), UiLogic.listUi(0, true, null, null, true, several = true))
+        assertEquals(UiLogic.ListUi.Empty("Nothing in Work."), UiLogic.listUi(0, true, null, "Work", false, several = true))
     }
 
     @Test fun retention_words() {
         assertEquals("Kept", UiLogic.retention(null))
         assertEquals("Expires after 7d", UiLogic.retention(604_800uL))
         assertEquals("Expires after 24h", UiLogic.retention(86_400uL))
+    }
+
+    @Test fun file_notes_drop_the_word_pc_when_several_are_linked() {
+        assertEquals("Downloading", UiLogic.fileNote(LocalFileState.PENDING, false, several = true))
+        assertEquals("REFUSED", UiLogic.fileNote(LocalFileState.REFUSED, false, several = true))
+        assertEquals("Not on this phone", UiLogic.fileNote(LocalFileState.PURGED, false, several = true))
+        assertNull(UiLogic.fileNote(LocalFileState.PURGED, true, several = true))
+        // Unchanged by the count: the storage wait and the missing file.
+        assertEquals("Waiting - phone storage low", UiLogic.fileNote(LocalFileState.PENDING, false, storageLow = true, several = true))
+        assertEquals("FILE MISSING on this phone", UiLogic.fileNote(LocalFileState.LOST, false, several = true))
     }
 
     @Test fun file_notes_explain_a_missing_file_in_words() {
@@ -342,6 +361,19 @@ class UiLogicTest {
         assertEquals("Expires in 1h", UiLogic.cell(item(state = ItemStateInfo.Live(now + hour), neverReached = true), now, 7u, false).label)
     }
 
+    @Test fun a_bin_item_names_the_pcs_it_never_reached_when_several_are_linked() {
+        val now = 100 * day
+        fun gone(vararg names: String) = item(state = ItemStateInfo.Expired(now - day), local = LocalFileState.BINNED, neverReached = true, missingOn = names.toList())
+        assertEquals("In Bin, 6d left - NOT ON WORK-PC", UiLogic.cell(gone("WORK-PC"), now, 7u, true, linked = 3).label)
+        assertEquals("In Bin, 6d left - NOT ON 2 PCS", UiLogic.cell(gone("WORK-PC", "HOME-PC"), now, 7u, true, linked = 3).label)
+        // One linked PC keeps today's words whatever the list holds.
+        assertEquals("In Bin, 6d left - NOT ON PC", UiLogic.cell(gone("OFFICE-PC"), now, 7u, true, linked = 1).label)
+        // A list that came back empty for a several-PC phone still says something.
+        assertEquals("In Bin, 6d left - NOT ON PC", UiLogic.cell(gone(), now, 7u, true, linked = 3).label)
+        // Only the Bin carries it.
+        assertEquals("Expires in 1h", UiLogic.cell(item(state = ItemStateInfo.Live(now + hour), neverReached = true, missingOn = listOf("WORK-PC")), now, 7u, false, linked = 3).label)
+    }
+
     @Test fun open_needs_the_file_here_and_outside_the_bin() {
         assertTrue(UiLogic.canOpen(item(kind = MediaKind.FILE), false))
         assertFalse(UiLogic.canOpen(item(kind = MediaKind.FILE), true)) // the provider serves items/ only: restore first
@@ -379,6 +411,12 @@ class UiLogicTest {
         assertEquals("15 Nov, 10:30", UiLogic.activityTime(now - 2 * day, now, utc, Locale.ENGLISH))
     }
 
+    @Test fun an_unlink_by_the_pc_reads_logged_out() {
+        assertEquals("logged out", UiLogic.activityDetail(ActivityAction.UNPAIRED, "by the other device"))
+        assertEquals("", UiLogic.activityDetail(ActivityAction.UNPAIRED, ""))
+        assertEquals("by the other device", UiLogic.activityDetail(ActivityAction.PAIRED, "by the other device"))
+    }
+
     @Test fun every_activity_action_has_its_own_text_and_problems_are_flagged() {
         val texts = ActivityAction.entries.map { UiLogic.activityText(it) }
         assertTrue(texts.all { it.isNotBlank() })
@@ -386,6 +424,8 @@ class UiLogicTest {
         val problems = ActivityAction.entries.filter { UiLogic.activityIsProblem(it) }.toSet()
         assertEquals(setOf(ActivityAction.REFUSED, ActivityAction.CONFLICT, ActivityAction.LOST, ActivityAction.SYNC_ERROR, ActivityAction.PAUSED), problems)
         assertEquals("SYNC ERROR", UiLogic.activityText(ActivityAction.SYNC_ERROR)) // the key word is capitalised
+        assertEquals("Linked", UiLogic.activityText(ActivityAction.PAIRED))
+        assertEquals("Unlinked", UiLogic.activityText(ActivityAction.UNPAIRED))
     }
 
     @Test fun storage_bytes_text() {

@@ -19,4 +19,9 @@ thumb_path: string | null,
  * In the Bin because it EXPIRED, and the paired device never confirmed holding this file:
  * the item may now exist on this device only (shown as "NOT ON PC" / "NOT ON PHONE").
  */
-never_reached_peer: boolean, };
+never_reached_peer: boolean, 
+/**
+ * For an item in the Bin because it expired: the names of the linked devices that never
+ * confirmed holding the file (empty otherwise; `never_reached_peer` is true when not empty).
+ */
+missing_on: Array<string>, };

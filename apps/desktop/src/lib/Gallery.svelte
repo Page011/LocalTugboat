@@ -84,9 +84,9 @@
         <button class="btn" onclick={() => (folder = null)}>Show all folders</button>
       {:else if app.paired === null}
         <span class="ico"><QrCode size={32} aria-hidden="true" /></span>
-        <h2>Pair your phone</h2>
+        <h2>Link your phone</h2>
         <p>Scan a code with the Tugboat app. Photos and files then show up here.</p>
-        <button class="btn primary" onclick={beginPairing}><QrCode size={16} aria-hidden="true" /> Pair a phone</button>
+        <button class="btn primary" onclick={beginPairing}><QrCode size={16} aria-hidden="true" /> Link a phone</button>
       {:else if offline}
         <span class="ico"><WifiOff size={32} aria-hidden="true" /></span>
         <h2>Phone offline</h2>

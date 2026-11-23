@@ -6,7 +6,7 @@
   import { app } from "./app.svelte";
   import Chip from "./Chip.svelte";
   import { loadActivityPages } from "./activityPages";
-  import { actionLabel, deviceLabel, fmtTime, isProblem } from "./format";
+  import { actionLabel, activityDetail, deviceLabel, fmtTime, isProblem } from "./format";
 
   const PAGE = 100;
   let rows = $state<ActivityEntry[]>([]);
@@ -78,7 +78,7 @@
               <td class="nowrap">
                 {#if isProblem(e.action)}<Chip label={{ text: actionLabel(e.action), tone: "danger", icon: "alert" }} />{:else}{actionLabel(e.action)}{/if}
               </td>
-              <td class="detail" title={e.detail}>{e.detail}</td>
+              <td class="detail" title={activityDetail(e.action, e.detail)}>{activityDetail(e.action, e.detail)}</td>
               <td class="muted nowrap">{who(e)}</td>
             </tr>
           {/each}

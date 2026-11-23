@@ -43,6 +43,9 @@ pub enum SnapError {
     NotPaired(String),
     #[error("{0}")]
     AlreadyPaired(String),
+    /// The phone already has the most PCs it can link.
+    #[error("{0}")]
+    TooManyDevices(String),
     #[error("{0}")]
     Paused(String),
     /// No answer from the PC in time: the usual "wrong network" or PC asleep.
@@ -103,6 +106,7 @@ impl From<CoreError> for SnapError {
             CoreError::FileGone => Self::FileGone(m),
             CoreError::NotPaired => Self::NotPaired(m),
             CoreError::AlreadyPaired => Self::AlreadyPaired(m),
+            CoreError::TooManyDevices => Self::TooManyDevices(m),
             CoreError::Paused(_) => Self::Paused(m),
             CoreError::Net { ref kind, .. } => match kind.as_str() {
                 "timeout" => Self::NetTimeout(m),

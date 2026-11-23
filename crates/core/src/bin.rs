@@ -74,16 +74,24 @@ pub fn derive_state(c: &Connection, rec: &ItemRecord, now: i64) -> Result<ItemSt
     Ok(expiry::item_state(rec, ExpiryCtx { folder: folder.as_ref(), now_ms: now }))
 }
 
-/// Silent-failure rule for the dropped expiry hold: the role ("PC" / "phone") of the paired
-/// device when it has NOT confirmed holding the file with `hash`; None when there is no paired
-/// device or it has the file. An item that expires with `Some(..)` may now exist on this
-/// device only, so the Bin and the activity row say so.
-pub fn missing_at_peer(c: &Connection, hash: BlobHash) -> Result<Option<&'static str>> {
-    let Some(peer) = store::paired_peer(c)? else { return Ok(None) };
-    if store::peer_has_receipt(c, hash, peer.id)? {
-        return Ok(None);
+/// Silent-failure rule for the dropped expiry hold: the names of the linked devices that have NOT
+/// confirmed holding the file with `hash` (empty when nothing is linked or all of them have it).
+/// An item that expires with a non-empty list may now exist on this device only, so the Bin and
+/// the activity row say so.
+pub fn missing_on(c: &Connection, hash: BlobHash) -> Result<Vec<String>> {
+    let mut names = Vec::new();
+    for peer in store::paired_peers(c)? {
+        if !store::peer_has_receipt(c, hash, peer.id)? {
+            names.push(peer.name);
+        }
     }
-    Ok(Some(if peer.role == Role::Pc { "PC" } else { "phone" }))
+    Ok(names)
+}
+
+/// Who an expired file never reached, for the activity row: a PC has one phone, so "the phone";
+/// the phone names each PC.
+fn never_reached(c: &Connection, missing: &[String]) -> Result<String> {
+    Ok(if store::self_device(c)?.role == Role::Pc { "the phone".to_string() } else { missing.join(", ") })
 }
 
 /// What a placement needs to know about an item: effective folder (E2) and current path.
@@ -170,9 +178,11 @@ fn sweep_one(c: &mut Connection, env: &Env<'_>, id: ItemId, quiet: bool, rep: &m
                         ItemState::Expired { .. } => {
                             // Never silent: an item that expires before the other device got it
                             // may now exist only here.
-                            let detail = match missing_at_peer(&tx, rec.content.val.hash)? {
-                                Some(who) => format!("{} - never reached the {who}", target.folder_name),
-                                None => target.folder_name.clone(),
+                            let missing = missing_on(&tx, rec.content.val.hash)?;
+                            let detail = if missing.is_empty() {
+                                target.folder_name.clone()
+                            } else {
+                                format!("{} - never reached {}", target.folder_name, never_reached(&tx, &missing)?)
                             };
                             activity::log(&tx, env.now, Some(env.self_id), Some(id), ActivityAction::Expired, &detail)?;
                         }
@@ -370,7 +380,7 @@ mod tests {
     }
 
     // Silent-failure rule: an item that expires before the paired device confirmed it says so in the
-    // activity row, and missing_at_peer names the device. With a receipt the row stays plain.
+    // activity row, and missing_on names the device. With a receipt the row stays plain.
     #[test]
     fn expiry_before_the_peer_got_the_file_is_never_silent() {
         let mut r = Rig::new();
@@ -378,8 +388,8 @@ mod tests {
         let safe = r.add("safe");
         r.confirm(safe);
         let rec = r.rec(lost);
-        assert_eq!(missing_at_peer(&r.db.conn, rec.content.val.hash).unwrap(), Some("phone"), "the rig's peer is a phone");
-        assert_eq!(missing_at_peer(&r.db.conn, r.rec(safe).content.val.hash).unwrap(), None);
+        assert_eq!(missing_on(&r.db.conn, rec.content.val.hash).unwrap(), vec!["peer".to_string()], "the rig's peer is a phone");
+        assert!(missing_on(&r.db.conn, r.rec(safe).content.val.hash).unwrap().is_empty());
         r.clock.set(T0 + 24 * HOUR_MS);
         r.sweep();
         let rows = activity::list(&r.db.conn, None, 50).unwrap();
@@ -391,7 +401,7 @@ mod tests {
         assert_eq!(safe_row.detail, "Inbox", "confirmed items keep the plain row");
         // No paired device: nothing to say about a peer.
         r.db.conn.execute("UPDATE device SET unpaired_at = 1 WHERE is_self = 0", []).unwrap();
-        assert_eq!(missing_at_peer(&r.db.conn, rec.content.val.hash).unwrap(), None);
+        assert!(missing_on(&r.db.conn, rec.content.val.hash).unwrap().is_empty());
     }
 
     // Upgrade flood: a 0.1.x database holds items that were "Waiting" past
@@ -408,7 +418,7 @@ mod tests {
             let db = Db::open_with(&data, &MIGRATIONS[..1]).unwrap();
             store::ensure_self(&db.conn, p(), "me", Role::Pc).unwrap();
             if paired {
-                let peer = DeviceRow { id: f(), name: "peer".into(), is_self: false, role: Role::Phone, paired_at: None, unpaired_at: None, last_seen_at: None, addresses: vec![] };
+                let peer = DeviceRow { id: f(), name: "peer".into(), is_self: false, role: Role::Phone, paired_at: None, unpaired_at: None, last_seen_at: None, last_synced_at: None, addresses: vec![] };
                 store::set_paired(&db.conn, &peer, T0).unwrap();
             }
             (1..=20u8)
@@ -427,9 +437,9 @@ mod tests {
             let _ = std::fs::remove_dir_all(&data);
             let pl = crate::placement::AppStorage::new(dir.path().join(format!("store-{paired}"))).unwrap();
             let ids = v1(paired, &pl.root.join("items"));
-            // Upgrade: opening migrates v1 -> v2 and writes the .bak-1 copy.
+            // Upgrade: opening migrates v1 to the current schema and writes the .bak-1 copy.
             let db = Db::open(&data).unwrap();
-            assert_eq!(db.user_version().unwrap(), 2);
+            assert_eq!(db.user_version().unwrap(), crate::db::SCHEMA_VERSION);
             assert!(backup_path(&data, 1).exists());
             let mut conn = db.conn;
             let late = T0 + 30 * DAY_MS;
@@ -800,6 +810,6 @@ mod tests {
         r.clock.advance(8 * DAY_MS);
         assert_eq!(r.sweep().purged, vec![old]);
         let again = r.rec(old);
-        assert_eq!(missing_at_peer(&r.db.conn, again.content.val.hash).unwrap(), None, "the old receipt for these bytes counts");
+        assert!(missing_on(&r.db.conn, again.content.val.hash).unwrap().is_empty(), "the old receipt for these bytes counts");
     }
 }

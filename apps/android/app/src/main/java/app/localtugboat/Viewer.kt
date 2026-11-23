@@ -90,6 +90,7 @@ fun ViewerScreen(vm: SnapViewModel, ui: UiState, route: Route.Viewer) {
     val nowMs by rememberNow(30_000)
     val binDays = ui.settings?.binDays ?: 7u
     val storageLow = ui.status?.storageLow == true
+    val linked = Texts.linkedCount(ui.devices)
     ReloadOnEvents(vm, model, ::itemsRelevant)
     var zoomed by remember { mutableStateOf(false) }
     var moving by rememberSaveable { mutableStateOf(false) }
@@ -143,10 +144,10 @@ fun ViewerScreen(vm: SnapViewModel, ui: UiState, route: Route.Viewer) {
         }
         HorizontalPager(pager, Modifier.weight(1f).fillMaxWidth(), userScrollEnabled = !zoomed, key = { model.rows.getOrNull(it)?.id ?: it }) { page ->
             val row = model.rows.getOrNull(page)
-            if (row != null) ViewerPage(row, active = page == pager.currentPage, bin = route.bin, storageLow = storageLow, onOpen = { openFile(row) }) { z -> if (page == pager.currentPage) zoomed = z }
+            if (row != null) ViewerPage(row, active = page == pager.currentPage, bin = route.bin, storageLow = storageLow, several = linked > 1, onOpen = { openFile(row) }) { z -> if (page == pager.currentPage) zoomed = z }
         }
         Column(Modifier.fillMaxWidth().navigationBarsPadding().padding(bottom = 4.dp)) {
-            val cell = UiLogic.cell(item, nowMs, binDays, route.bin, storageLow)
+            val cell = UiLogic.cell(item, nowMs, binDays, route.bin, storageLow, linked)
             val folder = folders.firstOrNull { it.id == item.folderId }?.name
             Text(
                 listOfNotNull(UiLogic.capturedAt(item.capturedAtMs, ZoneId.systemDefault()), folder, if (item.kind == MediaKind.FILE) null else FileRules.sizeText(item.size.toLong()), cell.label).joinToString("  -  "),
@@ -197,8 +198,8 @@ private fun RowScope.ViewerAction(icon: Int, label: String, enabled: Boolean, on
 }
 
 @Composable
-private fun ViewerPage(item: ItemInfo, active: Boolean, bin: Boolean, storageLow: Boolean, onOpen: () -> Unit, onZoomed: (Boolean) -> Unit) {
-    val note = UiLogic.fileNote(item.local, bin, storageLow)
+private fun ViewerPage(item: ItemInfo, active: Boolean, bin: Boolean, storageLow: Boolean, several: Boolean, onOpen: () -> Unit, onZoomed: (Boolean) -> Unit) {
+    val note = UiLogic.fileNote(item.local, bin, storageLow, several)
     val path = item.path
     when {
         item.kind == MediaKind.FILE -> FilePage(item, note ?: if (path == null) "FILE MISSING on this phone" else null, bin, onOpen)

@@ -203,7 +203,7 @@ async fn expiry_is_on_time_while_the_pc_is_away() {
     assert_eq!(bin.len(), 1);
     assert_eq!(bin[0].state, ItemState::Expired { binned_at: T0 + 24 * HOUR }, "binned at the due time");
     assert!(bin[0].never_reached_peer, "the Bin says the PC never got it");
-    assert!(r.phone.activity_text().iter().any(|t| t.starts_with("Expired") && t.contains("never reached the PC")), "{:?}", r.phone.activity_text());
+    assert!(r.phone.activity_text().iter().any(|t| t.starts_with("Expired") && t.contains("never reached TEST-PC")), "{:?}", r.phone.activity_text());
     assert_eq!(r.phone.core.status().waiting, 0, "an expired item is not waiting");
 
     // The PC comes back after the due time: it gets the record already expired and never downloads it.
@@ -338,16 +338,21 @@ async fn s18_status_last_synced_and_offline() {
     let synced_at = s.last_synced_at.expect("last synced time set on an equal digest");
     assert_eq!(synced_at, T0);
     assert_eq!(s.peer_name.as_deref(), Some("TEST-PC"));
+    assert_eq!(s.devices.len(), 1, "one linked device");
+    assert_eq!(s.devices[0].name, "TEST-PC");
+    assert_eq!(s.devices[0].last_synced_at, Some(synced_at), "the aggregate is the one device's time");
 
     r.phone.clock.advance(HOUR);
     r.pc.stop().await;
     r.phone.wait_state(SyncState::Offline).await;
     let s = r.phone.core.status();
     assert_eq!(s.last_synced_at, Some(synced_at), "kept while Offline");
+    assert_eq!(s.devices[0].state, SyncState::Offline, "the device row says the PC is away");
     assert!(r.phone.has_event(|e| matches!(e, tugboat_core::Event::Sync(x) if x.state == SyncState::Offline)));
 
-    // It survives a restart (stored, not only in memory).
-    assert_eq!(r.phone.core.get_value("last_synced_at").unwrap(), Some(synced_at.to_string()));
+    // It survives a restart (stored on the PC's device row, not only in memory).
+    let pc_id = r.pc.id;
+    assert_eq!(r.phone.core.debug_conn(|c| tugboat_core::store::get_device(c, pc_id).unwrap().unwrap().last_synced_at), Some(synced_at));
     r.phone.stop().await;
     let _ = INBOX_ID;
 }

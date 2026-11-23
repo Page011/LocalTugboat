@@ -1,5 +1,6 @@
 package app.localtugboat
 
+import uniffi.tugboat_ffi.DeviceStatus
 import uniffi.tugboat_ffi.ItemStateInfo
 import uniffi.tugboat_ffi.SnapException
 import uniffi.tugboat_ffi.SyncState
@@ -48,9 +49,15 @@ object Texts {
         return "STOPPED at ${java.time.Instant.ofEpochMilli(fromMs).atZone(zone).format(hm)} - Tugboat was not running"
     }
 
+    /** Linked PCs, not counting one that is only waiting to be told it was unlinked. */
+    fun linkedCount(devices: List<DeviceStatus>): Int = devices.count { !it.unlinking }
+
+    /** More than one PC is linked: "PC" alone no longer says which, so some wording changes. */
+    fun several(s: SyncStatus?): Boolean = s != null && linkedCount(s.devices) > 1
+
     /** The small sync line on the camera screen: "Synced 10s ago" or "PC not found, 3 waiting". */
     fun cameraSync(s: SyncStatus, nowMs: Long): String = when (s.state) {
-        SyncState.UNPAIRED -> "Not paired"
+        SyncState.UNPAIRED -> "Not linked"
         SyncState.SYNCING -> "Syncing"
         SyncState.SYNCED -> s.lastSyncedAt?.let { "Synced ${ago(nowMs - it)}" } ?: "Connected"
         SyncState.OFFLINE, SyncState.CONNECTING -> notFound(s)
@@ -67,12 +74,17 @@ object Texts {
         // The core already says "PAIRING CODE EXPIRED - show a new QR": show its words.
         is SnapException.PairExpired -> e.message ?: EXPIRED_QR
         is SnapException.PairBadPayload -> "That is not a Tugboat code"
+        is SnapException.TooManyDevices -> LIMIT_LINE
         is SnapException.NetTimeout, is SnapException.NetUnreachable ->
             if (localNetworkAllowed) "PC NOT FOUND - same Wi-Fi as the PC?" else "LOCAL NETWORK BLOCKED - allow it, then scan again"
         else -> e.message ?: e.javaClass.simpleName
     }
 
     const val EXPIRED_QR = "PAIRING CODE EXPIRED - show a new QR"
+
+    /** Most PCs one phone links. The core enforces it; a test keeps this copy equal to the core's. */
+    const val MAX_LINKED = 5
+    const val LIMIT_LINE = "LIMIT $MAX_LINKED DEVICES - unlink one first"
 
     /** Red banner while the core holds downloads back because free space is under the storage guard. */
     fun storageLow(waitingOnPc: UInt): String = when (waitingOnPc) {
@@ -84,6 +96,19 @@ object Texts {
     /** Bin note for an item that expired before the PC ever confirmed holding it. */
     const val NOT_ON_PC = "NOT ON PC"
 
-    private fun notFound(s: SyncStatus): String =
-        if (s.waiting > 0u) "PC not found, ${s.waiting} waiting" else "PC not found"
+    /**
+     * Bin note naming who never got the item. One linked PC keeps [NOT_ON_PC]; with several, the PC's name when one
+     * is missing it, else the count.
+     */
+    fun notOn(missingOn: List<String>, linked: Int): String = when {
+        linked <= 1 -> NOT_ON_PC
+        missingOn.size == 1 -> "NOT ON ${missingOn[0]}"
+        missingOn.size > 1 -> "NOT ON ${missingOn.size} PCS"
+        else -> NOT_ON_PC
+    }
+
+    private fun notFound(s: SyncStatus): String {
+        val what = if (several(s)) "No PC found" else "PC not found"
+        return if (s.waiting > 0u) "$what, ${s.waiting} waiting" else what
+    }
 }

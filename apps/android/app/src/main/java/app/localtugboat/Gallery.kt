@@ -78,14 +78,14 @@ fun itemsRelevant(e: FfiEvent) = e is FfiEvent.ItemsChanged || e == FfiEvent.Res
 @Composable
 fun ListStates(
     model: PagedModel<*>, folderName: String?, bin: Boolean, onClearFilter: (() -> Unit)?, onRetry: () -> Unit,
-    emptyText: String? = null, content: @Composable () -> Unit,
+    emptyText: String? = null, several: Boolean = false, content: @Composable () -> Unit,
 ) {
-    when (val s = UiLogic.listUi(model.rows.size, model.loaded, model.error, folderName, bin)) {
+    when (val s = UiLogic.listUi(model.rows.size, model.loaded, model.error, folderName, bin, several)) {
         UiLogic.ListUi.Content -> content()
         UiLogic.ListUi.Loading -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
         is UiLogic.ListUi.Failed -> Notice("CANNOT LOAD - ${s.message}", Modifier.fillMaxSize(), "Try again", onRetry, blocker = true)
         is UiLogic.ListUi.Empty -> (emptyText ?: s.text).let { text ->
-            Notice(text, Modifier.fillMaxSize(), if (onClearFilter != null) "Show all folders" else null, { onClearFilter?.invoke() }, art = text == UiLogic.NOTHING_YET)
+            Notice(text, Modifier.fillMaxSize(), if (onClearFilter != null) "Show all folders" else null, { onClearFilter?.invoke() }, art = text == UiLogic.nothingYet(several))
         }
     }
 }
@@ -118,7 +118,7 @@ fun GalleryScreen(vm: SnapViewModel, ui: UiState, banners: List<UiLogic.BannerUi
         BannerStack(all, onBanner, Modifier.padding(horizontal = 12.dp, vertical = 4.dp))
         FolderTabs(folders, route.folderId) { vm.nav.replaceTop(Route.Gallery(it)) }
         Box(Modifier.weight(1f)) {
-            ListStates(model, folderName, false, if (route.folderId != null) ({ vm.nav.replaceTop(Route.Gallery(null)) }) else null, { scope.launch { model.reload() } }) {
+            ListStates(model, folderName, false, if (route.folderId != null) ({ vm.nav.replaceTop(Route.Gallery(null)) }) else null, { scope.launch { model.reload() } }, several = Texts.several(ui.status)) {
                 val bottom = with(LocalDensity.current) { WindowInsets.navigationBars.getBottom(this).toDp() }
                 LazyVerticalGrid(
                     columns = GridCells.Adaptive(112.dp), state = gridState,
@@ -126,7 +126,7 @@ fun GalleryScreen(vm: SnapViewModel, ui: UiState, banners: List<UiLogic.BannerUi
                     horizontalArrangement = Arrangement.spacedBy(4.dp), verticalArrangement = Arrangement.spacedBy(4.dp),
                 ) {
                     itemsIndexed(model.rows, key = { _, it -> it.id }) { _, item ->
-                        ItemCell(item, UiLogic.cell(item, nowMs, binDays, false, ui.status?.storageLow == true)) { vm.nav.go(Route.Viewer(route.folderId, false, item.id)) }
+                        ItemCell(item, UiLogic.cell(item, nowMs, binDays, false, ui.status?.storageLow == true, Texts.linkedCount(ui.devices))) { vm.nav.go(Route.Viewer(route.folderId, false, item.id)) }
                     }
                 }
             }
@@ -200,7 +200,7 @@ fun BinScreen(vm: SnapViewModel, ui: UiState) {
                 val bottom = with(LocalDensity.current) { WindowInsets.navigationBars.getBottom(this).toDp() }
                 LazyColumn(state = listState, contentPadding = PaddingValues(bottom = bottom)) {
                     items(model.rows, key = { it.id }) { item ->
-                        val cell = UiLogic.cell(item, nowMs, binDays, true, ui.status?.storageLow == true)
+                        val cell = UiLogic.cell(item, nowMs, binDays, true, ui.status?.storageLow == true, Texts.linkedCount(ui.devices))
                         Row(
                             Modifier.fillMaxWidth().defaultMinSize(minHeight = 72.dp).clickable(role = Role.Button) { vm.nav.go(Route.Viewer(null, true, item.id)) }.padding(horizontal = 16.dp, vertical = 6.dp),
                             verticalAlignment = Alignment.CenterVertically,

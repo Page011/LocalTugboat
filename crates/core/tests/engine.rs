@@ -49,6 +49,7 @@ fn side(role: Role, me: u8, peer: u8) -> Side {
         paired_at: None,
         unpaired_at: None,
         last_seen_at: None,
+        last_synced_at: None,
         addresses: vec![],
     };
     store::set_paired(&db.conn, &peer_row, T0).unwrap();
@@ -81,6 +82,16 @@ fn pump(phone: &mut Side, pc: &mut Side) {
     pump_with(phone, pc, false);
 }
 
+/// What the runner does after a step that wrote to the log (a delete-vs-keep rewrite, or records
+/// relayed for other devices): the live session sends a Notify with the new head.
+fn live_notify(side: &mut Side, step: &tugboat_core::sync::engine::Step) -> Option<Msg> {
+    if step.relayed || step.wrote_local {
+        side.sess.local_change(&side.db.conn).unwrap()
+    } else {
+        None
+    }
+}
+
 /// `drop_digests`: Digest messages are swallowed, so each side has sent one but compared none.
 fn pump_with(phone: &mut Side, pc: &mut Side, drop_digests: bool) {
     let hello = phone.sess.hello(&phone.db.conn).unwrap();
@@ -94,12 +105,20 @@ fn pump_with(phone: &mut Side, pc: &mut Side, drop_digests: bool) {
             let step = pc.sess.handle(&mut pc.db.conn, m, T0).unwrap();
             pc.sent.extend(step.send.iter().cloned());
             phone.inbox.extend(step.send.iter().filter(|m| !(drop_digests && matches!(m, Msg::Digest { .. }))).cloned());
+            if let Some(n) = live_notify(pc, &step) {
+                pc.sent.push(n.clone());
+                phone.inbox.push_back(n);
+            }
             pc.steps.push(step);
         }
         if let Some(m) = phone.inbox.pop_front() {
             let step = phone.sess.handle(&mut phone.db.conn, m, T0).unwrap();
             phone.sent.extend(step.send.iter().cloned());
             pc.inbox.extend(step.send.iter().filter(|m| !(drop_digests && matches!(m, Msg::Digest { .. }))).cloned());
+            if let Some(n) = live_notify(phone, &step) {
+                phone.sent.push(n.clone());
+                pc.inbox.push_back(n);
+            }
             phone.steps.push(step);
         }
     }
@@ -197,6 +216,119 @@ fn a_cursor_ahead_of_the_senders_log_restarts_from_a_snapshot() {
     assert!(same_state(&phone2, &pc2));
     let restart = pc2.sent.iter().any(|m| matches!(m, Msg::Changes { records, next: PullFrom::Snapshot { after: None }, more: true, .. } if records.is_empty()));
     assert!(restart, "the PC answered the stale cursor with a snapshot restart: {:?}", pc2.sent.iter().take(4).collect::<Vec<_>>());
+}
+
+/// The sender with its Hello handled, so it answers a Pull.
+fn after_hello() -> (Side, Side) {
+    let (phone, mut pc) = pair_up();
+    let hello = phone.sess.hello(&phone.db.conn).unwrap();
+    pc.sess.handle(&mut pc.db.conn, hello, T0).unwrap();
+    (phone, pc)
+}
+
+fn is_snapshot_restart(m: &Msg) -> bool {
+    matches!(m, Msg::Changes { records, next: PullFrom::Snapshot { after: None }, more: true, .. } if records.is_empty())
+}
+
+// A cursor below the log floor means the rows it needs were trimmed: restart from a snapshot, never
+// an incremental page that would skip them. A cursor at the floor is still incremental.
+#[test]
+fn pull_below_floor_restarts_snapshot() {
+    let (_phone, mut pc) = after_hello();
+    for n in 0..4 {
+        pc.folder(&format!("f{n}"));
+    }
+    store::set_log_floor(&pc.db.conn, 3).unwrap();
+    let pull = |since| Msg::Pull { from: PullFrom::Seq { since }, limit: 10 };
+    let step = pc.sess.handle(&mut pc.db.conn, pull(2), T0).unwrap();
+    assert!(matches!(step.send.as_slice(), [m] if is_snapshot_restart(m)), "{:?}", step.send);
+    assert_eq!(store::get_cursor(&pc.db.conn, key(0xBB)).unwrap(), None, "a restart acks nothing");
+    let step = pc.sess.handle(&mut pc.db.conn, pull(3), T0).unwrap();
+    assert!(matches!(step.send.as_slice(), [Msg::Changes { next: PullFrom::Seq { .. }, .. }, ..]), "at the floor the page is incremental: {:?}", step.send);
+}
+
+#[test]
+fn pull_above_head_still_restarts() {
+    let (_phone, mut pc) = after_hello();
+    pc.folder("x");
+    let head = store::head_seq(&pc.db.conn).unwrap();
+    let step = pc.sess.handle(&mut pc.db.conn, Msg::Pull { from: PullFrom::Seq { since: head + 5 }, limit: 10 }, T0).unwrap();
+    assert!(matches!(step.send.as_slice(), [m] if is_snapshot_restart(m)), "{:?}", step.send);
+}
+
+// A phone that was away past the retention converges by a snapshot, with no lost update.
+#[test]
+fn a_cursor_below_the_floor_converges_through_a_snapshot() {
+    let (mut phone, mut pc) = pair_up();
+    let f = pc.folder("A");
+    pump(&mut phone, &mut pc);
+    let (cursor, _) = store::get_cursor(&phone.db.conn, key(0xAA)).unwrap().unwrap();
+    pc.rename(f, "B");
+    let head = store::head_seq(&pc.db.conn).unwrap();
+    assert!(cursor < head);
+    pc.db.conn.execute("DELETE FROM change_log", []).unwrap();
+    store::set_log_floor(&pc.db.conn, head).unwrap();
+    pc.sent.clear();
+    phone.sess = Session::new(key(0xBB), key(0xAA), Role::Phone, "t");
+    pc.sess = Session::new(key(0xAA), key(0xBB), Role::Pc, "t");
+    pump(&mut phone, &mut pc);
+    assert!(pc.sent.iter().any(is_snapshot_restart), "the trimmed range was not skipped");
+    assert_eq!(phone.folder_name(f), "B", "the update made in the trimmed range arrived");
+    assert!(same_state(&phone, &pc));
+    // The next connect is incremental again.
+    pc.sent.clear();
+    phone.sess = Session::new(key(0xBB), key(0xAA), Role::Phone, "t");
+    pc.sess = Session::new(key(0xAA), key(0xBB), Role::Pc, "t");
+    pump(&mut phone, &mut pc);
+    assert!(!pc.sent.iter().any(is_snapshot_restart));
+}
+
+// The phone relays what a PC sent into its own log, tagged with that PC. The PC is not sent its own
+// records back, yet its cursor still ends at the phone's head, so the two digests describe one state.
+#[test]
+fn final_page_cursor_is_head_with_exclusion() {
+    let (mut phone, mut pc) = pair_up();
+    let f = pc.folder("From PC");
+    pump(&mut phone, &mut pc);
+    let head = store::head_seq(&phone.db.conn).unwrap();
+    assert!(head > 0, "the phone relayed the PC's records into its log");
+    assert!(synced(&phone) && synced(&pc));
+    assert_eq!(store::get_cursor(&pc.db.conn, key(0xBB)).unwrap().unwrap().0, head, "the cursor is the head although every row came from this PC");
+    assert_eq!(store::changes_since(&phone.db.conn, 0, 100, key(0xAA)).unwrap().0.len(), 0, "nothing in the log is owed to the PC");
+
+    // A later edit on the PC: the phone takes it, relays it, and sends nothing back.
+    phone.sent.clear();
+    phone.sess = Session::new(key(0xBB), key(0xAA), Role::Phone, "t");
+    pc.sess = Session::new(key(0xAA), key(0xBB), Role::Pc, "t");
+    pc.rename(f, "renamed on the PC");
+    pump(&mut phone, &mut pc);
+    assert_eq!(phone.folder_name(f), "renamed on the PC");
+    assert!(!phone.sent.iter().any(|m| matches!(m, Msg::Changes { records, .. } if !records.is_empty())), "no record went back to its sender");
+    assert!(same_state(&phone, &pc));
+    assert_eq!(store::get_cursor(&pc.db.conn, key(0xBB)).unwrap().unwrap().0, store::head_seq(&phone.db.conn).unwrap());
+}
+
+// The phone names the PC to update; the PC (and a phone that is the one to update) keep the plain text.
+#[test]
+fn refusal_names_the_pc_on_the_phone() {
+    let (mut phone, mut pc) = pair_up();
+    phone.sess.peer_name = Some("WORK-PC".into());
+    phone.sess.proto = 3;
+    let hello = phone.sess.hello(&phone.db.conn).unwrap();
+    let step = pc.sess.handle(&mut pc.db.conn, hello, T0).unwrap();
+    assert_eq!(step.refused.as_deref(), Some("Update Tugboat on the PC"), "the PC keeps its wording");
+    let back = phone.sess.handle(&mut phone.db.conn, step.send[0].clone(), T0).unwrap();
+    assert_eq!(back.refused.as_deref(), Some("Update Tugboat on WORK-PC"));
+
+    // The phone is the old one: it says so about itself, whatever the PC is called.
+    let (mut phone, mut pc) = pair_up();
+    phone.sess.peer_name = Some("WORK-PC".into());
+    pc.sess.proto = 3;
+    let hello = phone.sess.hello(&phone.db.conn).unwrap();
+    let step = pc.sess.handle(&mut pc.db.conn, hello, T0).unwrap();
+    assert_eq!(step.refused.as_deref(), Some("Update Tugboat on the phone"));
+    let back = phone.sess.handle(&mut phone.db.conn, step.send[0].clone(), T0).unwrap();
+    assert_eq!(back.refused.as_deref(), Some("Update Tugboat on the phone"));
 }
 
 // S20: the sender's log is trimmed up to the peer's Pull.since; nothing newer is touched.
@@ -318,7 +450,8 @@ fn the_real_digest_of_an_equal_state_compares_equal() {
     phone.folder("y");
     pump_with(&mut phone, &mut pc, true);
     assert!(!synced(&phone));
-    let theirs = pc.sent.iter().find(|m| matches!(m, Msg::Digest { .. })).cloned().expect("the PC sent a digest");
+    // The newest one: it describes the state the PC reached after the phone's relayed changes.
+    let theirs = pc.sent.iter().rev().find(|m| matches!(m, Msg::Digest { .. })).cloned().expect("the PC sent a digest");
     let step = phone.sess.handle(&mut phone.db.conn, theirs, T0).unwrap();
     assert!(step.synced && step.send.is_empty() && step.errors.is_empty(), "{step:?}");
     assert_eq!(phone.sess.phase, Phase::Live);

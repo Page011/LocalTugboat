@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { actionLabel, ago, binLabel, deviceLabel, duration, fileIcon, fmtSize, isProblem, itemLabel, itemMeta, kindText, lastSeenText, parseBinDays, peerNote, shortPath, syncLabel } from "./format";
+import { actionLabel, activityDetail, ago, binLabel, deviceLabel, duration, fileIcon, fmtSize, isProblem, itemLabel, itemMeta, kindText, lastSeenText, parseBinDays, peerNote, shortPath, syncLabel } from "./format";
 import type { ItemView } from "./bindings/ItemView";
 import type { SyncStatus } from "./bindings/SyncStatus";
 
@@ -11,7 +11,7 @@ const DAY = 24 * HOUR;
 function item(over: Partial<ItemView> = {}): ItemView {
   return {
     id: "i1", name: "IMG_1.jpg", folder: "f1", kind: "image", size: 1000, ext: "jpg", captured_at: NOW, origin: "d1",
-    pinned: false, state: { t: "live", expires_at: NOW + 5 * HOUR + 10 * MIN }, local: "present", path: "C:\\x.jpg", thumb_path: null, never_reached_peer: false,
+    pinned: false, state: { t: "live", expires_at: NOW + 5 * HOUR + 10 * MIN }, local: "present", path: "C:\\x.jpg", thumb_path: null, never_reached_peer: false, missing_on: [],
     ...over,
   };
 }
@@ -69,7 +69,18 @@ describe("binLabel", () => {
 });
 
 describe("syncLabel", () => {
-  const s = (over: Partial<SyncStatus>): SyncStatus => ({ state: "synced", peer_name: "Pixel", last_synced_at: NOW - 2 * MIN, waiting: 0, downloading: 0, storage_low: false, message: null, ...over });
+  test("synced with files still on the way through the phone", () => {
+    expect(syncLabel(s({ downloading: 3 }), NOW)).toEqual({ text: "Synced with Pixel, 3 on the way", tone: "neutral", icon: "refresh" });
+    expect(syncLabel(s({ downloading: 3, waiting: 1 }), NOW).text).toBe("Synced with Pixel, 1 waiting");
+  });
+  test("not linked and logged out wording", () => {
+    expect(syncLabel(s({ state: "unpaired" }), NOW).text).toBe("Not linked to a phone");
+    expect(actionLabel("unpaired")).toBe("Logged out");
+    expect(activityDetail("unpaired", "by the other device")).toBe("removed by phone");
+    expect(activityDetail("unpaired", "")).toBe("");
+    expect(activityDetail("paired", "by the other device")).toBe("by the other device");
+  });
+  const s = (over: Partial<SyncStatus>): SyncStatus => ({ state: "synced", peer_name: "Pixel", last_synced_at: NOW - 2 * MIN, waiting: 0, downloading: 0, storage_low: false, message: null, devices: [], ...over });
   test("synced shows the last synced time", () => {
     expect(syncLabel(s({}), NOW)).toEqual({ text: "Synced with Pixel, 2 min ago", tone: "ok", icon: "check" });
   });
@@ -170,8 +181,8 @@ describe("deviceLabel", () => {
     expect(deviceLabel(null, me, phone)).toBe("System");
     expect(deviceLabel(me, me, phone)).toBe("This PC");
     expect(deviceLabel(phone.id, me, phone)).toBe("Sam's phone");
-    expect(deviceLabel("cc" as never, me, phone)).toBe("Earlier phone");
-    expect(deviceLabel("cc" as never, me, null)).toBe("Earlier phone");
+    expect(deviceLabel("cc" as never, me, phone)).toBe("Another device");
+    expect(deviceLabel("cc" as never, me, null)).toBe("Another device");
   });
 });
 

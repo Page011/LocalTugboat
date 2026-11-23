@@ -50,7 +50,7 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
             <!-- The PC's QR text is localtugboat://pair?..., so a camera app that scans it can open it here.
-                 Always behind a "Pair with this PC?" dialog; extras are never read. -->
+                 Always behind a "Link this PC?" dialog; extras are never read. -->
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />

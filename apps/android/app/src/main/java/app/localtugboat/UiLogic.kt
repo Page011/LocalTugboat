@@ -1,6 +1,7 @@
 package app.localtugboat
 
 import uniffi.tugboat_ffi.ActivityAction
+import uniffi.tugboat_ffi.DeviceStatus
 import uniffi.tugboat_ffi.ItemInfo
 import uniffi.tugboat_ffi.LocalFileState
 import uniffi.tugboat_ffi.MediaKind
@@ -20,6 +21,8 @@ sealed interface Route {
     data object Bin : Route
     data object Activity : Route
     data object Settings : Route
+    /** Scan another PC's QR code from inside the app. */
+    data object AddDevice : Route
     /** [folderId] null = all folders. [bin] true = list is the Bin. */
     data class Viewer(val folderId: String?, val bin: Boolean, val itemId: String) : Route
 }
@@ -36,14 +39,59 @@ enum class FailAction { ALLOW, RETRY }
 
 object UiLogic {
     const val NOTHING_YET = "Nothing yet. Photos you take here show up on your PC."
+    const val NOTHING_YET_SEVERAL = "Nothing yet. Photos you take here go to your linked PCs."
 
-    /** Which top-level screen. The camera opens only once a PC is paired: a shot with nowhere to go is a trap. */
+    fun nothingYet(several: Boolean) = if (several) NOTHING_YET_SEVERAL else NOTHING_YET
+
+    /** Which top-level screen. The camera opens only once a PC is linked: a shot with nowhere to go is a trap. */
     fun root(ui: UiState): Root = when {
         !ui.loaded -> Root.LOADING
         ui.openError != null -> Root.FATAL
-        ui.paired == null -> Root.ONBOARDING
+        !linked(ui.devices) -> Root.ONBOARDING
         else -> Root.MAIN
     }
+
+    // ---- linked devices ----
+
+    /** At least one PC is linked (a row that is only waiting to be told it was unlinked does not count). */
+    fun linked(devices: List<DeviceStatus>) = Texts.linkedCount(devices) > 0
+
+    /** Settings section title: "Linked devices  3 of 5". */
+    fun linkedHeader(devices: List<DeviceStatus>) = "Linked devices  ${Texts.linkedCount(devices)} of ${Texts.MAX_LINKED}"
+
+    class LinkButtonUi(val enabled: Boolean, val limitLine: String?)
+
+    /** "Link a PC" is dimmed at the limit, with the reason under it. */
+    fun linkButton(devices: List<DeviceStatus>): LinkButtonUi =
+        if (atLimit(devices)) LinkButtonUi(false, Texts.LIMIT_LINE) else LinkButtonUi(true, null)
+
+    fun atLimit(devices: List<DeviceStatus>) = Texts.linkedCount(devices) >= Texts.MAX_LINKED
+
+    /** [away] is grey: being away is normal. [problem] is red. A row that is being unlinked has no button. */
+    class DeviceLineUi(val text: String, val problem: Boolean, val away: Boolean, val waitingChip: String?, val canUnlink: Boolean)
+
+    fun deviceLine(d: DeviceStatus, nowMs: Long): DeviceLineUi {
+        if (d.unlinking) return DeviceLineUi("Unlinking - tells it when reachable", problem = false, away = false, waitingChip = null, canUnlink = false)
+        val chip = if (d.waiting > 0u) "${d.waiting} waiting" else null
+        fun line(text: String, problem: Boolean = false, away: Boolean = false) = DeviceLineUi(text, problem, away, chip, canUnlink = true)
+        return when (d.state) {
+            SyncState.REFUSED -> line(d.message ?: "PC REFUSED THE CONNECTION", problem = true)
+            SyncState.SYNCING -> line(if (d.downloading > 0u) "Syncing - ${d.downloading} downloading" else "Syncing")
+            SyncState.SYNCED -> line(d.lastSyncedAt?.let { "Synced ${Texts.ago(nowMs - it)}" } ?: "Connected")
+            SyncState.PAUSED -> line(d.message ?: "Sync paused", problem = true)
+            SyncState.OFFLINE, SyncState.CONNECTING, SyncState.UNPAIRED ->
+                line("Not found - " + (d.lastSeenAt?.let { "last seen ${Texts.ago(nowMs - it)}" } ?: "never seen"), away = true)
+        }
+    }
+
+    /** The core is looking for a linked PC it cannot reach: the radio stays on in bursts for mDNS. Not while paused. */
+    fun searching(s: SyncStatus?): Boolean =
+        s != null && s.state != SyncState.PAUSED && s.devices.any { !it.unlinking && (it.state == SyncState.OFFLINE || it.state == SyncState.CONNECTING) }
+
+    /** A catch-up run is done: some PC synced since [startedAtMs] and no connected PC still has files for us. */
+    fun caughtUp(s: SyncStatus?, startedAtMs: Long): Boolean =
+        s != null && s.state == SyncState.SYNCED && (s.lastSyncedAt ?: 0L) >= startedAtMs - 1000 &&
+            s.devices.none { (it.state == SyncState.SYNCED || it.state == SyncState.SYNCING) && it.downloading > 0u }
 
     // ---- permissions ----
 
@@ -88,7 +136,7 @@ object UiLogic {
     }
 
     /**
-     * Pairing state once the pairing is gone. The "Paired with X" screen is a success that is over; left in place it
+     * Pairing state once the pairing is gone. The "Linked to X" screen is a success that is over; left in place it
      * would be the first screen shown. A pairing in progress (Dialing, Code) is a new one and stays.
      */
     fun pairingAfterUnpair(p: PairUi): PairUi = if (p is PairUi.Done) PairUi.Idle else p
@@ -146,7 +194,7 @@ object UiLogic {
         val out = mutableListOf<BannerUi>()
         ui.openError?.let { out += BannerUi(BannerId.OPEN_ERROR, it, null, Level.BLOCKER) }
         val perms = ui.perms
-        val paired = ui.paired != null
+        val paired = linked(ui.devices)
         if (paired && perms != null && !perms.localNetwork) {
             out += BannerUi(BannerId.LOCAL_NETWORK, "LOCAL NETWORK BLOCKED - sync cannot work", "Allow", Level.BLOCKER)
         }
@@ -164,9 +212,13 @@ object UiLogic {
     /**
      * Banner for a PC that cannot be reached or refuses: lists must not look merely empty then. Red for
      * OFFLINE/CONNECTING/PAUSED/REFUSED (the same "PC not found" the sync text says); none when synced, syncing or unpaired.
+     * With several PCs the aggregate is OFFLINE only when none is reachable, so one PC being away never shows it.
      */
     fun syncBanner(s: SyncStatus?): BannerUi? = when (s?.state) {
-        SyncState.OFFLINE, SyncState.CONNECTING -> BannerUi(BannerId.SYNC, if (s.waiting > 0u) "PC NOT FOUND - ${s.waiting} waiting" else "PC NOT FOUND", null, Level.BLOCKER)
+        SyncState.OFFLINE, SyncState.CONNECTING -> {
+            val what = if (Texts.several(s)) "NO PC FOUND" else "PC NOT FOUND"
+            BannerUi(BannerId.SYNC, if (s.waiting > 0u) "$what - ${s.waiting} waiting" else what, null, Level.BLOCKER)
+        }
         SyncState.PAUSED -> BannerUi(BannerId.SYNC, s.message ?: "SYNC PAUSED", null, Level.BLOCKER)
         SyncState.REFUSED -> BannerUi(BannerId.SYNC, s.message ?: "PC REFUSED THE CONNECTION", null, Level.BLOCKER)
         else -> null
@@ -174,7 +226,8 @@ object UiLogic {
 
     /**
      * The line the phone alerts with, or null. Only problems the user must fix: being away from the PC's Wi-Fi is
-     * normal and never alerts. No counts in the text, so a changing number does not restart the alert.
+     * normal and never alerts, for one PC or several. A refusal alerts with the core's text, which names the PC
+     * ("UPDATE TUGBOAT on LAPTOP"). No counts in the text, so a changing number does not restart the alert.
      */
     fun alert(s: SyncStatus): String? = when {
         s.storageLow -> "PHONE STORAGE LOW - downloads stopped"
@@ -283,13 +336,13 @@ object UiLogic {
     }
 
     /** What a list screen shows. A load error with rows already on screen keeps the rows. */
-    fun listUi(count: Int, loaded: Boolean, error: String?, folderName: String?, bin: Boolean): ListUi = when {
+    fun listUi(count: Int, loaded: Boolean, error: String?, folderName: String?, bin: Boolean, several: Boolean = false): ListUi = when {
         count > 0 -> ListUi.Content
         error != null -> ListUi.Failed(error)
         !loaded -> ListUi.Loading
         bin -> ListUi.Empty("Bin is empty.")
         folderName != null -> ListUi.Empty("Nothing in $folderName.")
-        else -> ListUi.Empty(NOTHING_YET)
+        else -> ListUi.Empty(nothingYet(several))
     }
 
     /** What a folder does to its items: "Kept" or "Expires after 7d". */
@@ -301,11 +354,11 @@ object UiLogic {
      * Why a file is not viewable here, or null when it is held. While the storage guard holds downloads
      * ([storageLow]) a pending file is not downloading, so it says so.
      */
-    fun fileNote(local: LocalFileState, bin: Boolean, storageLow: Boolean = false): String? = when (local) {
-        LocalFileState.PENDING -> if (storageLow) WAITING_STORAGE_LOW else "Downloading from PC"
+    fun fileNote(local: LocalFileState, bin: Boolean, storageLow: Boolean = false, several: Boolean = false): String? = when (local) {
+        LocalFileState.PENDING -> if (storageLow) WAITING_STORAGE_LOW else if (several) "Downloading" else "Downloading from PC"
         LocalFileState.LOST -> "FILE MISSING on this phone"
-        LocalFileState.REFUSED -> "PC refused this file"
-        LocalFileState.PURGED -> if (bin) null else "On PC only"
+        LocalFileState.REFUSED -> if (several) "REFUSED" else "PC refused this file"
+        LocalFileState.PURGED -> if (bin) null else if (several) "Not on this phone" else "On PC only"
         LocalFileState.PRESENT, LocalFileState.BINNED -> null
     }
 
@@ -317,10 +370,10 @@ object UiLogic {
 
     class CellUi(val label: String, val kept: Boolean, val video: Boolean, val file: Boolean)
 
-    /** Label and badges under one thumbnail or file tile. A Bin item that never reached the PC says so. */
-    fun cell(item: ItemInfo, nowMs: Long, binDays: UInt, bin: Boolean, storageLow: Boolean = false): CellUi {
-        val base = fileNote(item.local, bin, storageLow) ?: Texts.expiryLabel(item.state, nowMs, binDays)
-        val label = if (bin && item.neverReachedPeer) "$base - ${Texts.NOT_ON_PC}" else base
+    /** Label and badges under one thumbnail or file tile. A Bin item that never reached a PC says which. [linked] = PCs linked now. */
+    fun cell(item: ItemInfo, nowMs: Long, binDays: UInt, bin: Boolean, storageLow: Boolean = false, linked: Int = 1): CellUi {
+        val base = fileNote(item.local, bin, storageLow, linked > 1) ?: Texts.expiryLabel(item.state, nowMs, binDays)
+        val label = if (bin && item.neverReachedPeer) "$base - ${Texts.notOn(item.missingOn, linked)}" else base
         val kept = item.pinned || item.state is uniffi.tugboat_ffi.ItemStateInfo.Kept || item.state is uniffi.tugboat_ffi.ItemStateInfo.FolderKeep
         return CellUi(label, kept, item.kind == MediaKind.VIDEO, item.kind == MediaKind.FILE)
     }
@@ -367,13 +420,17 @@ object UiLogic {
         ActivityAction.FOLDER_RENAMED -> "Folder renamed"
         ActivityAction.FOLDER_DELETED -> "Folder deleted"
         ActivityAction.RETENTION_CHANGED -> "Expiry changed"
-        ActivityAction.PAIRED -> "Paired"
-        ActivityAction.UNPAIRED -> "Unpaired"
+        ActivityAction.PAIRED -> "Linked"
+        ActivityAction.UNPAIRED -> "Unlinked"
         ActivityAction.PAUSED -> "SYNC PAUSED"
         ActivityAction.RESUMED -> "Sync resumed"
         ActivityAction.SYNC_ERROR -> "SYNC ERROR"
         ActivityAction.UPGRADED -> "Upgraded"
     }
+
+    /** The core words an unlink by the PC as "by the other device"; the phone says what the PC did. */
+    fun activityDetail(a: ActivityAction, detail: String): String =
+        if (a == ActivityAction.UNPAIRED && detail == "by the other device") "logged out" else detail
 
     /** Actions that need the user's attention are shown in the error colour with the word in capitals. */
     fun activityIsProblem(a: ActivityAction) = when (a) {

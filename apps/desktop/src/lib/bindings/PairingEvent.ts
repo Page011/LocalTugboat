@@ -6,4 +6,4 @@ import type { DeviceId } from "./DeviceId";
  * and two internal tags with the same name overwrite each other in the JSON (the UI would never
  * see "pairing", and the generated TS type would be impossible).
  */
-export type PairingEvent = { "kind": "window_open", payload: string, expires_at: number, } | { "kind": "code", code: string, peer_name: string, } | { "kind": "completed", peer: DeviceId, peer_name: string, } | { "kind": "cancelled", code: string, message: string, } | { "kind": "unpaired", peer: DeviceId, };
+export type PairingEvent = { "kind": "window_open", payload: string, expires_at: number, } | { "kind": "code", code: string, peer_name: string, } | { "kind": "completed", peer: DeviceId, peer_name: string, } | { "kind": "cancelled", code: string, message: string, } | { "kind": "unpaired", peer: DeviceId, by_peer: boolean, };

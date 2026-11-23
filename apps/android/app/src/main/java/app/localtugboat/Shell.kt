@@ -71,9 +71,9 @@ fun Shell(vm: SnapViewModel, actions: ShellActions) {
     deepLink?.let { d ->
         AlertDialog(
             onDismissRequest = vm::dismissDeepLink,
-            title = { Text("Pair with this PC?") },
+            title = { Text("Link this PC?") },
             text = { Text("${d.pcName}\n${d.addresses.joinToString()}") },
-            confirmButton = { TextButton(onClick = vm::confirmDeepLink) { Text("Pair") } },
+            confirmButton = { TextButton(onClick = vm::confirmDeepLink) { Text("Link") } },
             dismissButton = { TextButton(onClick = vm::dismissDeepLink) { Text("Cancel") } },
         )
     }
@@ -116,6 +116,7 @@ private fun MainNav(vm: SnapViewModel, ui: UiState, actions: ShellActions) {
             Route.Bin -> BinScreen(vm, ui)
             Route.Activity -> ActivityScreen(vm)
             Route.Settings -> SettingsScreen(vm, ui, banners, onBanner, actions)
+            Route.AddDevice -> AddDeviceScreen(vm, ui, actions)
             is Route.Viewer -> ViewerScreen(vm, ui, route)
         }
     }

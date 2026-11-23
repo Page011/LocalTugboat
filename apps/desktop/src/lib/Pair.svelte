@@ -10,14 +10,13 @@
 </script>
 
 <section class="screen" aria-labelledby="pair-h">
-  <div class="screen-head"><h1 id="pair-h">Pair</h1></div>
+  <div class="screen-head"><h1 id="pair-h">Link to phone</h1></div>
 
   {#if p.t === "qr"}
     <div class="qr-layout">
       <div class="qr" role="img" aria-label="Pairing QR code">{@html p.start.svg}</div>
       <div class="side">
-        <h2>Scan with your phone</h2>
-        <p>Open Tugboat on the phone and scan this code.</p>
+        <h2>Scan with Tugboat on your phone</h2>
         <p aria-live="off"><strong>Expires in {clock}</strong></p>
         <div><button class="btn" onclick={cancelPairing}>Cancel</button></div>
         <details>
@@ -30,16 +29,16 @@
     <div class="empty" role="alert">
       <h2>Phone shows this code?</h2>
       <p class="code">{groupCode(p.code)}</p>
-      <p>{p.peerName}. Pair only if the phone shows the same code.</p>
+      <p>{p.peerName}. Link only if the phone shows the same code.</p>
       <div class="row">
-        <button class="btn primary" onclick={() => confirmPairing(true)}><Check size={16} aria-hidden="true" /> Pair</button>
+        <button class="btn primary" onclick={() => confirmPairing(true)}><Check size={16} aria-hidden="true" /> Link</button>
         <button class="btn" onclick={() => confirmPairing(false)}>Cancel</button>
       </div>
     </div>
   {:else if p.t === "done"}
     <div class="empty" role="status">
       <span class="ico ok"><Check size={32} aria-hidden="true" /></span>
-      <h2>Paired with {p.peerName}</h2>
+      <h2>Linked to {p.peerName}</h2>
       <button class="btn primary" onclick={dismissPairing}>Done</button>
     </div>
   {:else if p.t === "cancelled"}
@@ -56,14 +55,14 @@
       <Smartphone size={28} aria-hidden="true" />
       <div class="grow">
         <h2>{app.paired.name}</h2>
-        <p class="muted">Paired {ago(app.paired.paired_at, app.now)}. {lastSeenText(app.paired, app.sync, app.now)}.</p>
+        <p class="muted">Linked {ago(app.paired.paired_at, app.now)} - {lastSeenText(app.paired, app.sync, app.now).toLowerCase()}</p>
       </div>
-      <button class="btn" onclick={beginPairing}><QrCode size={16} aria-hidden="true" /> Pair a different phone</button>
+      <button class="btn" onclick={beginPairing}><QrCode size={16} aria-hidden="true" /> Link a different phone</button>
     </div>
-    <p class="muted">Pairing a different phone replaces {app.paired.name} once it completes.</p>
+    <p class="muted">Logs out of {app.paired.name}</p>
   {:else}
     <div class="empty">
-      <h2>Pair your phone</h2>
+      <h2>Link your phone</h2>
       <ol>
         <li>Open Tugboat on the phone.</li>
         <li>Scan the code shown here.</li>

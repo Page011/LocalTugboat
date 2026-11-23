@@ -86,7 +86,7 @@ async fn unpair_made_while_apart_is_delivered_when_the_pc_is_reachable() {
     assert_eq!(r.pc.state(), SyncState::Unpaired);
     assert!(r.pc.has_activity(ActivityAction::Unpaired));
     // And the phone does not keep dialing a PC that no longer knows it.
-    assert!(r.phone.core.debug_conn(|c| tugboat_core::store::get_pending_unpair(c).unwrap().is_none()));
+    assert!(r.phone.core.debug_conn(|c| tugboat_core::store::pending_unpairs(c).unwrap().is_empty()));
     r.shutdown().await;
 }
 
@@ -99,9 +99,9 @@ async fn an_unpair_notice_to_a_pc_that_already_forgot_us_is_cleared() {
     r.apart().await;
     r.pc.core.unpair().await.unwrap();
     r.phone.core.unpair().await.unwrap();
-    assert!(r.phone.core.debug_conn(|c| tugboat_core::store::get_pending_unpair(c).unwrap().is_some()));
+    assert!(r.phone.core.debug_conn(|c| !tugboat_core::store::pending_unpairs(c).unwrap().is_empty()));
     r.together().await;
-    until("the notice is cleared", 15, || r.phone.core.debug_conn(|c| tugboat_core::store::get_pending_unpair(c).unwrap().is_none())).await;
+    until("the notice is cleared", 15, || r.phone.core.debug_conn(|c| tugboat_core::store::pending_unpairs(c).unwrap().is_empty())).await;
     assert!(!r.pc.core.debug_conn(|c| tugboat_core::store::is_paired(c, phone_id).unwrap()));
     r.shutdown().await;
 }
@@ -156,8 +156,8 @@ async fn an_unpair_that_fails_locally_is_an_error_and_the_phone_stays_paired() {
 }
 
 // The phone owes an unpair notice to an old PC that is away, and its network restarts meanwhile:
-// the old PC is told once it is back. (The unit test `stopping_the_network_ends_the_notice_task`
-// in sync/net.rs pins the mechanism: the notice task goes with the network it was started for.)
+// the old PC is told once it is back. (The unit test `stopping_the_network_ends_the_device_tasks`
+// in sync/net.rs pins the mechanism: the device tasks go with the network they were started for.)
 #[tokio::test(flavor = "multi_thread")]
 async fn a_pending_unpair_notice_survives_a_network_restart() {
     let r = Rig::new().await;
@@ -169,7 +169,7 @@ async fn a_pending_unpair_notice_survives_a_network_restart() {
     // The phone pairs with a second PC while the first is unreachable: its notice stays owed.
     let pc2 = Dev::new(Role::Pc, "SECOND-PC", &TestClock::new(T0));
     pair(&pc2, &r.phone).await;
-    assert!(r.phone.core.debug_conn(|c| tugboat_core::store::get_pending_unpair(c).unwrap().is_some()), "the first PC has not been told");
+    assert!(r.phone.core.debug_conn(|c| !tugboat_core::store::pending_unpairs(c).unwrap().is_empty()), "the first PC has not been told");
 
     // The notice task is dialing or in back-off; restart the phone's network, and only then bring
     // the old PC back.
@@ -179,7 +179,7 @@ async fn a_pending_unpair_notice_survives_a_network_restart() {
     tokio::time::sleep(Duration::from_secs(3)).await;
     r.pc.start().await;
     until("the old PC was told", 60, || !r.pc.core.debug_conn(|c| tugboat_core::store::is_paired(c, phone_id).unwrap())).await;
-    until("the notice is cleared", 20, || r.phone.core.debug_conn(|c| tugboat_core::store::get_pending_unpair(c).unwrap().is_none())).await;
+    until("the notice is cleared", 20, || r.phone.core.debug_conn(|c| tugboat_core::store::pending_unpairs(c).unwrap().is_empty())).await;
     pc2.stop().await;
     r.shutdown().await;
 }
