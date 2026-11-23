@@ -6,8 +6,10 @@
   import Dialog from "./Dialog.svelte";
   import { ago, lastSeenText, parseBinDays } from "./format";
   import { lastWins } from "./generation";
+  import { UPDATE_CHECK_HELP, UPDATE_CHECK_LABEL } from "./updates";
 
   let autostart = $state<boolean | null>(null);
+  let updateCheck = $state<boolean | null>(null);
   let binText = $state("");
   let binError = $state<string | null>(null);
   /** The user typed since the last save started: the saved value must not overwrite the text. */
@@ -19,6 +21,7 @@
 
   onMount(() => {
     api.autostart().then((v) => (autostart = v)).catch(fail);
+    api.updateCheck().then((v) => (updateCheck = v)).catch(fail);
   });
 
   // Follow the saved value (another save, or the first load), but never overwrite what is being typed.
@@ -29,6 +32,11 @@
   async function setAutostart(on: boolean) {
     await act(() => api.setAutostart(on));
     autostart = await api.autostart().catch(() => on);
+  }
+
+  async function setUpdateCheck(on: boolean) {
+    await act(() => api.setUpdateCheck(on));
+    updateCheck = await api.updateCheck().catch(() => on);
   }
 
   // One save at a time, the LAST submitted value wins: a second submit while a save runs is queued, never skipped
@@ -92,6 +100,13 @@
         <input type="checkbox" checked={autostart ?? false} disabled={autostart === null} onchange={(e) => setAutostart(e.currentTarget.checked)} />
         Start with Windows
       </label>
+      <div class="stack">
+        <label class="field">
+          <input type="checkbox" checked={updateCheck ?? true} disabled={updateCheck === null} aria-describedby="{uid}-update-help" onchange={(e) => setUpdateCheck(e.currentTarget.checked)} />
+          {UPDATE_CHECK_LABEL}
+        </label>
+        <span id="{uid}-update-help" class="muted">{UPDATE_CHECK_HELP}</span>
+      </div>
       <div class="field">
         <label for="{uid}-bin">Bin days</label>
         <input
@@ -156,6 +171,11 @@
     display: flex;
     flex-wrap: wrap;
     gap: 8px;
+  }
+  .stack {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
   }
   .field {
     display: flex;

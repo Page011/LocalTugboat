@@ -13,6 +13,8 @@ const base: BannerInput = {
   error: null,
   drop: null,
   removedByPhone: false,
+  update: null,
+  installing: false,
 };
 const ids = (i: BannerInput) => computeBanners(i).map((b) => b.id);
 
@@ -28,7 +30,7 @@ describe("computeBanners", () => {
     expect(computeBanners(base)).toEqual([]);
   });
   test("nothing loaded yet shows nothing", () => {
-    expect(computeBanners({ info: null, sync: null, library: null, firewall: null, error: null, drop: null, removedByPhone: false })).toEqual([]);
+    expect(computeBanners({ info: null, sync: null, library: null, firewall: null, error: null, drop: null, removedByPhone: false, update: null, installing: false })).toEqual([]);
   });
   test("firewall problem: Fix only when it can help, always a recheck", () => {
     const fw = (can_fix: boolean) => ({ ...base, firewall: { status: { t: "rule_missing" as const }, message: "WINDOWS FIREWALL is blocking Tugboat", can_fix } });
@@ -95,6 +97,25 @@ describe("computeBanners", () => {
     expect(b[0]?.actions.map((a) => a.id)).toEqual(["dismiss-drop"]);
     const failed = computeBanners({ ...base, drop: { ...clean, failed: [{ name: "big.mp4", reason: "COPY FAILED - The device is not ready." }] } });
     expect(failed[0]?.tone).toBe("danger");
+  });
+  test("a waiting update is one warning line with an Install button, and goes with the update", () => {
+    const b = computeBanners({ ...base, update: { version: "0.3.1" } });
+    expect(b).toHaveLength(1);
+    expect(b[0]).toMatchObject({ id: "update", tone: "warn", text: "UPDATE READY - Tugboat 0.3.1" });
+    expect(b[0]?.actions).toEqual([{ id: "update-install", label: "Install" }]);
+    expect(ids({ ...base, update: null })).toEqual([]);
+  });
+  test("while the installer starts the banner says so and has no button; it is back to Install when the call ends", () => {
+    const b = computeBanners({ ...base, update: { version: "0.3.1" }, installing: true });
+    expect(b).toHaveLength(1);
+    expect(b[0]).toMatchObject({ id: "update", tone: "warn", text: "INSTALLING - Windows will ask for permission" });
+    expect(b[0]?.actions).toEqual([]);
+    expect(computeBanners({ ...base, update: { version: "0.3.1" }, installing: false })[0]?.actions).toEqual([{ id: "update-install", label: "Install" }]);
+    expect(ids({ ...base, update: null, installing: true })).toEqual([]);
+  });
+  test("an update never hides a blocker: blockers first", () => {
+    const b = computeBanners({ ...base, update: { version: "0.3.1" }, firewall: { status: { t: "all_inbound_blocked" }, message: null, can_fix: false } });
+    expect(b.map((x) => x.id)).toEqual(["firewall", "update"]);
   });
   test("blockers come before warnings", () => {
     const b = computeBanners({ ...base, library: lib({ cloud_warning: "OneDrive" }), firewall: { status: { t: "all_inbound_blocked" }, message: null, can_fix: false } });

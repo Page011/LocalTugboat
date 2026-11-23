@@ -27,6 +27,12 @@ tauri-plugin-single-instance = "2.4.5"
 tauri-plugin-autostart = "2.5.1"
 tauri-plugin-opener = "2.5.5"
 tauri-plugin-dialog = "2.7.3"
+# native-tls = SChannel on Windows: the HTTPS check trusts the Windows certificate store (so it also works behind a
+# company proxy that re-signs HTTPS with its own root). The default rustls backend ships its own roots and would not.
+# No "zip" feature: the release asset is the plain installer, not an archive.
+tauri-plugin-updater = { version = "2.14.1", default-features = false, features = ["native-tls", "system-proxy"] }
+# Already in the tree through the updater: compares the running version with the offered one.
+semver = "1"
 notify = "8.2.1"
 qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
 # windows-native: Credential Manager through the Win32 API, no extra daemon.

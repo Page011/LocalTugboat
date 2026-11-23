@@ -17,6 +17,7 @@ use crate::{
     error::{CmdError, CmdResult},
     firewall::FirewallInfo,
     library::LibraryStatus,
+    updates::{self, UpdateReady, Updates},
 };
 
 pub const MAIN: &str = "main";
@@ -35,6 +36,7 @@ fn allow(window: &WebviewWindow) -> CmdResult<()> {
 }
 
 type Be<'a> = State<'a, Arc<Backend>>;
+type Upd<'a> = State<'a, Arc<Updates>>;
 
 #[tauri::command(async)]
 pub fn app_info(window: WebviewWindow, be: Be) -> CmdResult<AppInfo> {
@@ -251,6 +253,37 @@ pub fn autostart_set(window: WebviewWindow, app: AppHandle, enabled: bool) -> Cm
     let al = app.autolaunch();
     let r = if enabled { al.enable() } else { al.disable() };
     r.map_err(|e| CmdError::new("autostart", e.to_string()))
+}
+
+/// The "Check for updates" switch (on by default; kept on this PC only).
+#[tauri::command(async)]
+pub fn update_check_get(window: WebviewWindow, up: Upd) -> CmdResult<bool> {
+    allow(&window)?;
+    Ok(up.enabled())
+}
+
+#[tauri::command(async)]
+pub fn update_check_set(window: WebviewWindow, up: Upd, enabled: bool) -> CmdResult<()> {
+    allow(&window)?;
+    up.set_enabled(enabled)
+}
+
+/// The downloaded and verified update waiting to be installed, if any.
+#[tauri::command(async)]
+pub fn update_ready(window: WebviewWindow, up: Upd) -> CmdResult<Option<UpdateReady>> {
+    allow(&window)?;
+    Ok(up.ready())
+}
+
+/// [Install] on the update banner. Resolves to false when the user said no to the Windows prompt (nothing changed,
+/// the banner stays). When the installer starts, this app exits and the installer starts it again.
+#[tauri::command]
+pub async fn update_install(window: WebviewWindow, app: AppHandle, up: Upd<'_>) -> CmdResult<bool> {
+    allow(&window)?;
+    let up: Arc<Updates> = up.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || updates::install(&app, &up))
+        .await
+        .map_err(|e| CmdError::new("update", format!("UPDATE NOT INSTALLED - {e}")))?
 }
 
 /// Quit for real (closing the window only hides it to the tray).

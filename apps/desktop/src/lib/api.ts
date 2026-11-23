@@ -30,10 +30,11 @@ import type { PairingStart } from "./bindings/PairingStart";
 import type { Settings } from "./bindings/Settings";
 import type { SyncStatus } from "./bindings/SyncStatus";
 import type { TrayState } from "./bindings/TrayState";
+import type { UpdateReady } from "./bindings/UpdateReady";
 
 export type {
   ActivityEntry, AppInfo, CmdError, CoreEvent, DropProgress, DropReport, DropState, FirewallInfo, FolderId, FolderView, ItemId, ItemQuery,
-  ItemView, LibraryStatus, Page, PairedDevice, PairingStart, Settings, SyncStatus, TrayState,
+  ItemView, LibraryStatus, Page, PairedDevice, PairingStart, Settings, SyncStatus, TrayState, UpdateReady,
 };
 
 export class ApiError extends Error {
@@ -90,6 +91,13 @@ export const api = {
   saveSettings: (settings: Settings) => call<void>("settings_save", { settings }),
   autostart: () => call<boolean>("autostart_get"),
   setAutostart: (enabled: boolean) => call<void>("autostart_set", { enabled }),
+  /** The "Check for updates" switch (on by default; kept on this PC only). */
+  updateCheck: () => call<boolean>("update_check_get"),
+  setUpdateCheck: (enabled: boolean) => call<void>("update_check_set", { enabled }),
+  /** The verified update waiting to be installed, if any. */
+  updateReady: () => call<UpdateReady | null>("update_ready"),
+  /** [Install]. false = the user said no to the Windows prompt (nothing changed). true = the installer started and the app is closing. */
+  updateInstall: () => call<boolean>("update_install"),
 
   // pairing
   pairedDevice: () => call<PairedDevice | null>("paired_device"),
@@ -128,6 +136,7 @@ export const EVENTS = {
   dropState: "drop-state",
   dropProgress: "drop-progress",
   dropResult: "drop-result",
+  updateReady: "update-ready",
 } as const;
 
 /** Core events: sync status, items/folders changed, pairing steps, errors. */
@@ -139,6 +148,8 @@ export const onTrayState = (cb: (s: TrayState) => void): Promise<UnlistenFn> => 
 export const onDropState = (cb: (s: DropState) => void): Promise<UnlistenFn> => listen<DropState>(EVENTS.dropState, (m) => cb(m.payload));
 export const onDropProgress = (cb: (p: DropProgress) => void): Promise<UnlistenFn> => listen<DropProgress>(EVENTS.dropProgress, (m) => cb(m.payload));
 export const onDropResult = (cb: (r: DropReport) => void): Promise<UnlistenFn> => listen<DropReport>(EVENTS.dropResult, (m) => cb(m.payload));
+/** A newer version was downloaded and its signature checked. */
+export const onUpdateReady = (cb: (u: UpdateReady) => void): Promise<UnlistenFn> => listen<UpdateReady>(EVENTS.updateReady, (m) => cb(m.payload));
 /** The event stream lagged: re-read everything the screen shows. */
 export const onResync = (cb: () => void): Promise<UnlistenFn> => listen(EVENTS.resync, () => cb());
 

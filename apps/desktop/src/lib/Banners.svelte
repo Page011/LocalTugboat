@@ -1,13 +1,14 @@
 <script lang="ts">
   import { OctagonAlert, TriangleAlert } from "@lucide/svelte";
   import { api } from "./api";
-  import { act, app, chooseLibrary, locateLibrary, rescanLibrary, resolveMissing } from "./app.svelte";
+  import { act, app, chooseLibrary, installUpdate, locateLibrary, rescanLibrary, resolveMissing } from "./app.svelte";
   import { computeBanners, type BannerAction } from "./banners";
   import { shortPath } from "./format";
 
-  const banners = $derived(computeBanners({ info: app.info, sync: app.sync, library: app.library, firewall: app.firewall, error: app.error, drop: app.dropReport, removedByPhone: app.removedByPhone }));
+  const banners = $derived(computeBanners({ info: app.info, sync: app.sync, library: app.library, firewall: app.firewall, error: app.error, drop: app.dropReport, removedByPhone: app.removedByPhone, update: app.update, installing: app.installing }));
 
   const run: Record<BannerAction, () => unknown> = {
+    "update-install": installUpdate,
     "fw-fix": () =>
       act(async () => {
         await api.firewallFix();

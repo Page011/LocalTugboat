@@ -6,9 +6,11 @@ import type { DropReport } from "./bindings/DropReport";
 import type { FirewallInfo } from "./bindings/FirewallInfo";
 import type { LibraryStatus } from "./bindings/LibraryStatus";
 import type { SyncStatus } from "./bindings/SyncStatus";
+import type { UpdateReady } from "./bindings/UpdateReady";
 import { dropBanner } from "./drop";
+import { UPDATE_INSTALLING_TEXT, updateBannerText } from "./updates";
 
-export type BannerAction = "fw-fix" | "fw-recheck" | "lib-locate" | "lib-rescan" | "lib-bin" | "lib-wait" | "lib-choose" | "not-synced" | "dismiss-error" | "dismiss-drop" | "dismiss-removed";
+export type BannerAction = "update-install" | "fw-fix" | "fw-recheck" | "lib-locate" | "lib-rescan" | "lib-bin" | "lib-wait" | "lib-choose" | "not-synced" | "dismiss-error" | "dismiss-drop" | "dismiss-removed";
 
 export interface Banner {
   id: string;
@@ -35,6 +37,10 @@ export interface BannerInput {
   drop: DropReport | null;
   /** The phone logged this PC out; until dismissed or linked again. */
   removedByPhone: boolean;
+  /** A newer version is downloaded and verified. */
+  update: UpdateReady | null;
+  /** [Install] was clicked and the call has not come back: the installer is starting. */
+  installing: boolean;
 }
 
 export function computeBanners(i: BannerInput): Banner[] {
@@ -101,6 +107,14 @@ export function computeBanners(i: BannerInput): Banner[] {
   const drop = i.drop ? dropBanner(i.drop) : null;
   if (drop) {
     out.push({ id: "drop", tone: drop.tone, text: drop.text, detail: drop.detail, plain: true, lines: drop.lines, actions: [{ id: "dismiss-drop", label: "Dismiss" }] });
+  }
+  if (i.update) {
+    // While the installer starts (the tray goes, sync stops, Windows asks) there is nothing to click again.
+    out.push(
+      i.installing
+        ? { id: "update", tone: "warn", text: UPDATE_INSTALLING_TEXT, actions: [] }
+        : { id: "update", tone: "warn", text: updateBannerText(i.update.version), actions: [{ id: "update-install", label: "Install" }] },
+    );
   }
   // The same words twice (the core's error event repeats what the SYNC REFUSED banner already says): show once.
   const refusedText = i.sync?.state === "refused" ? i.sync.message : null;
