@@ -50,17 +50,6 @@ class TextsTest {
         assertEquals("In Bin, removing soon", Texts.expiryLabel(ItemStateInfo.Deleted(now - 30 * day), now, 7u))
     }
 
-    @Test fun notification_text() {
-        val now = 10 * hour
-        assertEquals("Connected to OFFICE-PC, synced 10s ago", Texts.notification(status(SyncState.SYNCED, last = now - 10_000), now))
-        assertEquals("Connected to OFFICE-PC", Texts.notification(status(SyncState.SYNCED), now))
-        assertEquals("PC not found, 3 waiting", Texts.notification(status(SyncState.OFFLINE, waiting = 3u), now))
-        assertEquals("PC not found", Texts.notification(status(SyncState.CONNECTING), now))
-        assertEquals("Not paired", Texts.notification(status(SyncState.UNPAIRED, peer = null), now))
-        assertEquals("Update Tugboat on the PC", Texts.notification(status(SyncState.REFUSED, message = "Update Tugboat on the PC"), now))
-        assertEquals("Connected to PC, synced just now", Texts.notification(status(SyncState.SYNCED, peer = null, last = now), now))
-    }
-
     @Test fun camera_sync_text() {
         val now = 10 * hour
         assertEquals("Synced 10s ago", Texts.cameraSync(status(SyncState.SYNCED, last = now - 10_000), now))

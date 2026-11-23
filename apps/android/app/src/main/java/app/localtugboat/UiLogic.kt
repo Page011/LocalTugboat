@@ -66,7 +66,7 @@ object UiLogic {
         return buildList {
             add(PermRow(PermKind.CAMERA, "Camera", "Take photos and scan the QR code", st(p.camera, PermKind.CAMERA), true))
             if (sdk >= 37) add(PermRow(PermKind.LOCAL_NETWORK, "Local network", "Find your PC on Wi-Fi", st(p.localNetwork, PermKind.LOCAL_NETWORK), true))
-            add(PermRow(PermKind.NOTIFICATIONS, "Notifications", "Show sync state while Tugboat runs", st(p.notifications, PermKind.NOTIFICATIONS), false))
+            add(PermRow(PermKind.NOTIFICATIONS, "Notifications", "Alert when sync needs you", st(p.notifications, PermKind.NOTIFICATIONS), false))
             add(PermRow(PermKind.LOCATION, "Location (optional)", "Sort shots into places", st(p.location != LocationAccess.NONE, PermKind.LOCATION), false))
             if (withMic) add(PermRow(PermKind.MICROPHONE, "Microphone (optional)", "Sound in videos", st(p.microphone, PermKind.MICROPHONE), false))
         }
@@ -155,7 +155,7 @@ object UiLogic {
         if (paired && st != null && st.storageLow) out += BannerUi(BannerId.STORAGE, Texts.storageLow(st.downloading), null, Level.BLOCKER)
         ui.stoppedGapFromMs?.let { out += BannerUi(BannerId.STOPPED, Texts.stoppedAt(it, zone), "Fix", Level.WARNING) }
         if (paired && perms != null && !perms.notifications) {
-            out += BannerUi(BannerId.NOTIFICATIONS, "Notifications off: sync state shows only in Tugboat", "Allow", Level.WARNING)
+            out += BannerUi(BannerId.NOTIFICATIONS, "Notifications off: sync problems show only in Tugboat", "Allow", Level.WARNING)
         }
         ui.errors.lastOrNull()?.let { out += BannerUi(BannerId.ERROR, it, "Dismiss", Level.WARNING) }
         return out.sortedBy { it.level.ordinal } // stable: keeps the order above inside a level
@@ -169,6 +169,17 @@ object UiLogic {
         SyncState.OFFLINE, SyncState.CONNECTING -> BannerUi(BannerId.SYNC, if (s.waiting > 0u) "PC NOT FOUND - ${s.waiting} waiting" else "PC NOT FOUND", null, Level.BLOCKER)
         SyncState.PAUSED -> BannerUi(BannerId.SYNC, s.message ?: "SYNC PAUSED", null, Level.BLOCKER)
         SyncState.REFUSED -> BannerUi(BannerId.SYNC, s.message ?: "PC REFUSED THE CONNECTION", null, Level.BLOCKER)
+        else -> null
+    }
+
+    /**
+     * The line the phone alerts with, or null. Only problems the user must fix: being away from the PC's Wi-Fi is
+     * normal and never alerts. No counts in the text, so a changing number does not restart the alert.
+     */
+    fun alert(s: SyncStatus): String? = when {
+        s.storageLow -> "PHONE STORAGE LOW - downloads stopped"
+        s.state == SyncState.REFUSED -> s.message ?: "PC REFUSED THE CONNECTION"
+        s.state == SyncState.PAUSED -> s.message ?: "SYNC PAUSED"
         else -> null
     }
 

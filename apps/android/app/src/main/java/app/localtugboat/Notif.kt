@@ -7,30 +7,49 @@ import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 
-/** The ongoing sync notification. Low importance: no sound, no heads-up. The app never relies on it alone. */
+/**
+ * Two channels. "running" carries the notification Android requires while the sync service runs: silent, no badge,
+ * one fixed line, posted once and never updated. "problems" alerts once when sync needs the user ([UiLogic.alert]).
+ */
 object Notif {
-    private const val CHANNEL = "link"
+    private const val RUNNING = "running"
+    private const val PROBLEMS = "problems"
     const val ID = 1
+    private const val PROBLEM_ID = 2
 
-    fun ensureChannel(c: Context) {
-        c.getSystemService(NotificationManager::class.java)
-            .createNotificationChannel(NotificationChannel(CHANNEL, "Tugboat link", NotificationManager.IMPORTANCE_LOW))
+    fun ensureChannels(c: Context) {
+        val nm = c.getSystemService(NotificationManager::class.java)
+        // 0.2.0 and older posted a live status on "link" every 15 s. A channel's badge setting cannot change after it is
+        // created, so it is replaced. Deleting fails while a foreground service still shows on it; the next start retries.
+        runCatching { nm.deleteNotificationChannel("link") }
+        // LOW, not MIN: for a foreground service on a MIN channel Android posts its own "running in the background" notice.
+        nm.createNotificationChannel(NotificationChannel(RUNNING, "Sync running", NotificationManager.IMPORTANCE_LOW).apply { setShowBadge(false) })
+        nm.createNotificationChannel(NotificationChannel(PROBLEMS, "Sync problems", NotificationManager.IMPORTANCE_DEFAULT))
     }
 
-    fun build(c: Context, text: String): Notification {
-        val open = PendingIntent.getActivity(c, 0, Intent(c, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
-        return Notification.Builder(c, CHANNEL)
+    fun running(c: Context): Notification = Notification.Builder(c, RUNNING)
+        .setSmallIcon(R.drawable.ic_stat_sync)
+        .setContentTitle("Tugboat")
+        .setContentText("Sync on")
+        .setContentIntent(open(c))
+        .setOngoing(true)
+        .setShowWhen(false)
+        .build()
+
+    /** Sounds once; posting the same problem again while it is still shown stays silent. */
+    fun problem(c: Context, text: String) {
+        val n = Notification.Builder(c, PROBLEMS)
             .setSmallIcon(R.drawable.ic_stat_sync)
             .setContentTitle("Tugboat")
             .setContentText(text)
-            .setContentIntent(open)
-            .setOngoing(true)
+            .setContentIntent(open(c))
             .setOnlyAlertOnce(true)
-            .setForegroundServiceBehavior(Notification.FOREGROUND_SERVICE_IMMEDIATE)
+            .setAutoCancel(true)
             .build()
+        c.getSystemService(NotificationManager::class.java).notify(PROBLEM_ID, n)
     }
 
-    fun update(c: Context, text: String) {
-        c.getSystemService(NotificationManager::class.java).notify(ID, build(c, text))
-    }
+    fun clearProblem(c: Context) = c.getSystemService(NotificationManager::class.java).cancel(PROBLEM_ID)
+
+    private fun open(c: Context) = PendingIntent.getActivity(c, 0, Intent(c, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
 }
