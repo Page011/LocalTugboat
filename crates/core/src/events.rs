@@ -60,6 +60,29 @@ pub struct SyncStatus {
     pub storage_low: bool,
     /// One short line for Refused/Paused ("Update Tugboat on the PC").
     pub message: Option<String>,
+    /// Every linked device (by link time), then devices unlinked here that have not been told yet.
+    pub devices: Vec<DeviceStatus>,
+}
+
+/// One linked device as the UI lists it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
+pub struct DeviceStatus {
+    /// 64 hex chars (a plain string so the phone bindings can mirror the record).
+    pub id: String,
+    pub name: String,
+    pub state: SyncState,
+    /// The refusal text naming this device, when `state` is Refused.
+    pub message: Option<String>,
+    pub paired_at: Option<i64>,
+    pub last_seen_at: Option<i64>,
+    pub last_synced_at: Option<i64>,
+    /// Items held here (not in the Bin) with no receipt from this device.
+    pub waiting: u32,
+    /// Pending items here that this device can serve.
+    pub downloading: u32,
+    /// Unlinked here, and that device has not been told yet.
+    pub unlinking: bool,
 }
 
 /// Tagged with "kind", not "t": it is nested inside `Event::Pairing`, which is already tagged "t",
@@ -77,8 +100,8 @@ pub enum PairingEvent {
     /// `code` = PairError code from tugboat-net ("secret_reused", "expired", ...),
     /// `message` the one-line text ("PAIRING BLOCKED - someone else used this code").
     Cancelled { code: String, message: String },
-    /// The peer was unpaired (here, or by the other device).
-    Unpaired { peer: DeviceId },
+    /// The peer was unpaired. `by_peer` = the other device did it (a PC logging out), not this one.
+    Unpaired { peer: DeviceId, by_peer: bool },
 }
 
 #[cfg(test)]

@@ -165,7 +165,7 @@ pub fn next_version(c: &Connection, self_id: DeviceId) -> Result<Version> {
 
 fn device_from_row(r: &Row) -> rusqlite::Result<DeviceRow> {
     let role: String = r.get(3)?;
-    let addrs: String = r.get(7)?;
+    let addrs: String = r.get(8)?;
     Ok(DeviceRow {
         id: DeviceId(b32(r, 0)?),
         name: r.get(1)?,
@@ -174,11 +174,12 @@ fn device_from_row(r: &Row) -> rusqlite::Result<DeviceRow> {
         paired_at: r.get(4)?,
         unpaired_at: r.get(5)?,
         last_seen_at: r.get(6)?,
-        addresses: serde_json::from_str(&addrs).map_err(|_| bad(7, Type::Text, "addresses is not a JSON array"))?,
+        last_synced_at: r.get(7)?,
+        addresses: serde_json::from_str(&addrs).map_err(|_| bad(8, Type::Text, "addresses is not a JSON array"))?,
     })
 }
 
-const DEVICE_COLS: &str = "id, name, is_self, role, paired_at, unpaired_at, last_seen_at, addresses";
+const DEVICE_COLS: &str = "id, name, is_self, role, paired_at, unpaired_at, last_seen_at, last_synced_at, addresses";
 
 /// Insert the self row if missing; update name if changed. Errors if a different self key
 /// is already stored (key changed under an existing db = new identity: caller decides).
@@ -252,6 +253,28 @@ pub fn paired_peer(c: &Connection) -> Result<Option<DeviceRow>> {
     .optional()?)
 }
 
+/// Every currently paired peer, oldest link first (first stored first when linked in the same
+/// millisecond). A phone holds up to `MAX_LINKED`.
+pub fn paired_peers(c: &Connection) -> Result<Vec<DeviceRow>> {
+    let mut st = c.prepare(&format!(
+        "SELECT {DEVICE_COLS} FROM device WHERE is_self = 0 AND paired_at IS NOT NULL AND unpaired_at IS NULL
+         ORDER BY paired_at, rowid"
+    ))?;
+    let rows = st.query_map([], device_from_row)?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// How many peers other than `id` are currently paired (the limit check never counts the
+/// device that is linking again).
+pub fn count_paired_except(c: &Connection, id: DeviceId) -> Result<u32> {
+    let n: i64 = c.query_row(
+        "SELECT count(*) FROM device WHERE id <> ?1 AND is_self = 0 AND paired_at IS NOT NULL AND unpaired_at IS NULL",
+        [&id.0[..]],
+        |r| r.get(0),
+    )?;
+    Ok(n as u32)
+}
+
 /// True if `id` is currently paired (the net AccessGate).
 pub fn is_paired(c: &Connection, id: DeviceId) -> Result<bool> {
     let n: i64 = c.query_row(
@@ -268,6 +291,15 @@ pub fn touch_last_seen(c: &Connection, peer: DeviceId, now: i64) -> Result<()> {
     c.execute(
         "UPDATE device SET last_seen_at = MAX(COALESCE(last_seen_at, 0), ?2) WHERE id = ?1 AND is_self = 0",
         params![&peer.0[..], now],
+    )?;
+    Ok(())
+}
+
+/// Move a peer's `last_synced_at` to `at`, never backwards.
+pub fn set_last_synced(c: &Connection, peer: DeviceId, at: i64) -> Result<()> {
+    c.execute(
+        "UPDATE device SET last_synced_at = MAX(COALESCE(last_synced_at, 0), ?2) WHERE id = ?1 AND is_self = 0",
+        params![&peer.0[..], at],
     )?;
     Ok(())
 }
@@ -326,6 +358,36 @@ fn item_from_row(r: &Row) -> rusqlite::Result<(ItemRecord, LocalFileState)> {
         deleted: Versioned { v: version(r, 25, 26)?, val: r.get(24)? },
     };
     Ok((rec, lfs_parse(27, &lfs)?))
+}
+
+/// Items held here and not deleted that some device in `devices` has no receipt for (for the
+/// item's current hash), each with one flag per device (true = that device has none). One pass
+/// that also reads the whole row, so the caller needs no second lookup per item.
+pub fn items_missing_receipts(c: &Connection, devices: &[DeviceId]) -> Result<Vec<(ItemRecord, Vec<bool>)>> {
+    if devices.is_empty() {
+        return Ok(Vec::new());
+    }
+    // The ids are 32-byte keys from our own table, written as hex literals like the other fixed fragments here.
+    let flags: Vec<String> = devices
+        .iter()
+        .enumerate()
+        .map(|(i, d)| format!("NOT EXISTS (SELECT 1 FROM receipt r WHERE r.blob_hash = item.blob_hash AND r.device_id = x'{}') AS m{i}", hex::encode(d.0)))
+        .collect();
+    let names: Vec<String> = (0..devices.len()).map(|i| format!("m{i}")).collect();
+    let sql = format!(
+        "SELECT * FROM (SELECT {ITEM_COLS}, {} FROM item WHERE local_file_state = 'present' AND deleted_at IS NULL) WHERE {}",
+        flags.join(", "),
+        names.join(" OR ")
+    );
+    let mut st = c.prepare(&sql)?;
+    let rows = st
+        .query_map([], |r| {
+            let (rec, _) = item_from_row(r)?;
+            let missing = (0..devices.len()).map(|i| r.get::<_, bool>(28 + i)).collect::<rusqlite::Result<Vec<bool>>>()?;
+            Ok((rec, missing))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
 }
 
 /// Item record plus its local file state.
@@ -457,26 +519,68 @@ pub fn items_holding(c: &Connection, hash: BlobHash) -> Result<Vec<ItemId>> {
 
 /// Ids of items in the given local states, oldest captured first, at most `limit`.
 pub fn items_in_state(c: &Connection, states: &[LocalFileState], limit: u32) -> Result<Vec<ItemId>> {
-    Ok(items_in_state_after(c, states, None, limit)?.into_iter().map(|(_, id)| id).collect())
+    Ok(items_in_state_after(c, states, None, limit, None)?.into_iter().map(|(_, id)| id).collect())
 }
 
+/// The device `?4` can serve this item's file: it wrote the content, or it has a receipt for the
+/// hash. A `NULL` holder means no filter. The receipt key (blob_hash, device_id) makes the
+/// lookup an index hit.
+const HELD_BY: &str = "(?4 IS NULL OR content_dev = ?4 OR EXISTS (SELECT 1 FROM receipt r WHERE r.blob_hash = item.blob_hash AND r.device_id = ?4))";
+
 /// Same order, as (captured_at, id), starting after `after` (a keyset cursor taken from the last
-/// row of the previous page), so a caller can walk past rows it skips.
-pub fn items_in_state_after(c: &Connection, states: &[LocalFileState], after: Option<(i64, ItemId)>, limit: u32) -> Result<Vec<(i64, ItemId)>> {
+/// row of the previous page), so a caller can walk past rows it skips. With `holder`, only items
+/// whose file that device holds.
+pub fn items_in_state_after(
+    c: &Connection,
+    states: &[LocalFileState],
+    after: Option<(i64, ItemId)>,
+    limit: u32,
+    holder: Option<DeviceId>,
+) -> Result<Vec<(i64, ItemId)>> {
     if states.is_empty() {
         return Ok(Vec::new());
     }
     // The strings come from lfs_str (fixed set), never from outside, so inlining is safe.
     let list = states.iter().map(|s| format!("'{}'", lfs_str(*s))).collect::<Vec<_>>().join(", ");
     let mut st = c.prepare(&format!(
-        "SELECT captured_at, id FROM item WHERE local_file_state IN ({list})          AND (?2 IS NULL OR captured_at > ?2 OR (captured_at = ?2 AND id > ?3)) ORDER BY captured_at, id LIMIT ?1"
+        "SELECT captured_at, id FROM item WHERE local_file_state IN ({list}) AND {HELD_BY}
+           AND (?2 IS NULL OR captured_at > ?2 OR (captured_at = ?2 AND id > ?3)) ORDER BY captured_at, id LIMIT ?1"
     ))?;
     let (cap, id): (Option<i64>, Option<Vec<u8>>) = match after {
         Some((cap, id)) => (Some(cap), Some(id.0.as_bytes().to_vec())),
         None => (None, None),
     };
-    let rows = st.query_map(params![limit as i64, cap, id], |r| Ok((r.get::<_, i64>(0)?, ItemId(Uuid::from_bytes(b16(r, 1)?)))))?;
+    let holder = holder.map(|d| d.0.to_vec());
+    let rows = st.query_map(params![limit as i64, cap, id, holder], |r| Ok((r.get::<_, i64>(0)?, ItemId(Uuid::from_bytes(b16(r, 1)?)))))?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// True if any Pending item here is one `peer` can serve (a download still waiting on that device).
+pub fn pending_held_by(c: &Connection, peer: DeviceId) -> Result<bool> {
+    let n: i64 = c.query_row(
+        &format!("SELECT count(*) FROM (SELECT 1 FROM item WHERE local_file_state = 'pending' AND {HELD_BY} LIMIT 1)"),
+        params![0, 0, 0, &peer.0[..]],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+/// Pending items here, and how many of them each of `peers` can serve (in the order given).
+/// One scan for all devices: the status reads it after every session message.
+pub fn pending_counts(c: &Connection, peers: &[DeviceId]) -> Result<(u32, Vec<u32>)> {
+    let sums: String = peers
+        .iter()
+        .map(|d| {
+            let h = hex::encode(d.0);
+            format!(", COALESCE(SUM(content_dev = x'{h}' OR EXISTS (SELECT 1 FROM receipt r WHERE r.blob_hash = item.blob_hash AND r.device_id = x'{h}')), 0)")
+        })
+        .collect();
+    let sql = format!("SELECT count(*){sums} FROM item WHERE local_file_state = 'pending'");
+    Ok(c.query_row(&sql, [], |r| {
+        let all: i64 = r.get(0)?;
+        let per = (0..peers.len()).map(|i| r.get::<_, i64>(i + 1).map(|n| n as u32)).collect::<rusqlite::Result<Vec<u32>>>()?;
+        Ok((all as u32, per))
+    })?)
 }
 
 /// Ids of items matching a raw WHERE fragment of fixed text (no user input), for the sweep
@@ -766,7 +870,7 @@ fn key_from_parts(idx: usize, entity: &str, id: &[u8]) -> rusqlite::Result<Entit
     })
 }
 
-/// Append one change_log row; returns its seq.
+/// Append one change_log row written on this device (src NULL); returns its seq.
 pub fn log_change(c: &Connection, key: &EntityKey, field_group: &str, lamport: u64) -> Result<u64> {
     let (entity, id) = key_parts(key);
     c.execute(
@@ -776,17 +880,29 @@ pub fn log_change(c: &Connection, key: &EntityKey, field_group: &str, lamport: u
     Ok(to_u(c.last_insert_rowid()))
 }
 
-/// Distinct keys changed after `since`, in seq order, at most `limit`, with the highest seq
-/// covered (the next `since`). Returns (keys, last_seq).
+/// Append one change_log row for a change taken from `src` (the phone relaying one PC's change
+/// to the others). That device never gets the row back.
+pub fn log_change_from(c: &Connection, key: &EntityKey, field_group: &str, lamport: u64, src: DeviceId) -> Result<u64> {
+    let (entity, id) = key_parts(key);
+    c.execute(
+        "INSERT INTO change_log (entity, entity_id, field_group, lamport, src) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![entity, id, field_group, to_i(lamport), &src.0[..]],
+    )?;
+    Ok(to_u(c.last_insert_rowid()))
+}
+
+/// Distinct keys changed after `since` that were not taken from `exclude`, in seq order, at most
+/// `limit`, with the highest seq covered (the next `since`). Returns (keys, last_seq).
 ///
 /// A key is ordered by its LAST change, so a key changed again after the page ends is
 /// returned by a later page, never lost. Empty result: last_seq = since.
-pub fn changes_since(c: &Connection, since: u64, limit: u32) -> Result<(Vec<EntityKey>, u64)> {
+pub fn changes_since(c: &Connection, since: u64, limit: u32, exclude: DeviceId) -> Result<(Vec<EntityKey>, u64)> {
     let mut st = c.prepare(
-        "SELECT entity, entity_id, MAX(seq) AS m FROM change_log WHERE seq > ?1
-         GROUP BY entity, entity_id ORDER BY m LIMIT ?2",
+        "SELECT entity, entity_id, MAX(seq) AS m FROM change_log
+          WHERE seq > ?1 AND (src IS NULL OR src <> ?3)
+          GROUP BY entity, entity_id ORDER BY m LIMIT ?2",
     )?;
-    let rows = st.query_map(params![to_i(since), limit as i64], |r| {
+    let rows = st.query_map(params![to_i(since), limit as i64, &exclude.0[..]], |r| {
         let e: String = r.get(0)?;
         let id: Vec<u8> = r.get(1)?;
         let m: i64 = r.get(2)?;
@@ -810,27 +926,81 @@ pub fn head_seq(c: &Connection) -> Result<u64> {
     Ok(v.map(to_u).unwrap_or(0))
 }
 
-/// Highest seq of a local change to (key, group) that is above `after`, if any. Used by
-/// merge conflict detection: a local change the peer has not acked = concurrent.
-pub fn unacked_local_change(c: &Connection, key: &EntityKey, field_group: &str, after: u64) -> Result<Option<u64>> {
+/// Highest seq of a change to (key, group) above `after` that the peer has not seen, if any.
+/// Used by merge conflict detection: a change the peer has not acked = concurrent. Rows taken
+/// from the peer itself are its own writes coming back, never concurrent with it.
+pub fn unacked_local_change(c: &Connection, key: &EntityKey, field_group: &str, after: u64, peer: DeviceId) -> Result<Option<u64>> {
     let (entity, id) = key_parts(key);
     let v: Option<i64> = c.query_row(
-        "SELECT MAX(seq) FROM change_log WHERE entity = ?1 AND entity_id = ?2 AND field_group = ?3 AND seq > ?4",
-        params![entity, id, field_group, to_i(after)],
+        "SELECT MAX(seq) FROM change_log
+          WHERE entity = ?1 AND entity_id = ?2 AND field_group = ?3 AND seq > ?4 AND (src IS NULL OR src <> ?5)",
+        params![entity, id, field_group, to_i(after), &peer.0[..]],
         |r| r.get(0),
     )?;
     Ok(v.map(to_u))
 }
 
-/// Delete change_log rows with seq <= upto (trimmed once the peer's cursor passes it).
-pub fn trim_log(c: &Connection, upto: u64) -> Result<usize> {
-    Ok(c.execute("DELETE FROM change_log WHERE seq <= ?1", [to_i(upto)])?)
+const LOG_FLOOR: &str = "log_floor";
+
+/// Every change_log row with seq <= this may be gone. A peer whose cursor is below it must
+/// restart from a snapshot. Missing = 0 (a database that never trimmed).
+pub fn log_floor(c: &Connection) -> Result<u64> {
+    match get_value(c, LOG_FLOOR)? {
+        None => Ok(0),
+        Some(v) => v.parse::<u64>().map_err(|e| CoreError::Invalid(format!("setting '{LOG_FLOOR}' has a bad value: {e}"))),
+    }
 }
 
-/// Delete every change_log row (unpair: a new peer starts with a full snapshot).
-pub fn clear_log(c: &Connection) -> Result<()> {
-    c.execute("DELETE FROM change_log", [])?;
-    Ok(())
+/// Raise the floor. It never moves back, so a stale caller cannot make a trimmed range look held.
+pub fn set_log_floor(c: &Connection, floor: u64) -> Result<()> {
+    let floor = floor.max(log_floor(c)?);
+    set_value(c, LOG_FLOOR, &floor.to_string())
+}
+
+/// A linked peer unseen this long stops holding the log back; it starts over from a snapshot
+/// when it returns.
+pub const STALE_PEER_MS: i64 = 60 * crate::clock::DAY_MS;
+
+/// Beyond this many rows the oldest go, whoever still needs them (they start over from a snapshot).
+pub const MAX_LOG_ROWS: i64 = 200_000;
+
+/// Drop the change_log rows every live linked peer has acked, and move the floor up to match.
+/// Returns the new floor.
+///
+/// A peer with no cursor row counts as acked 0: it is still on its first snapshot and will pull
+/// from the head that snapshot started at, so every row above that must stay. Time (not
+/// distance) retires a peer, so one that is linking now is never dropped. With no live peer
+/// the whole log goes.
+pub fn trim_log_for_peers(c: &Connection, now: i64) -> Result<u64> {
+    trim_log_capped(c, now, MAX_LOG_ROWS)
+}
+
+fn trim_log_capped(c: &Connection, now: i64, max_rows: i64) -> Result<u64> {
+    let floor = log_floor(c)?;
+    let head = head_seq(c)?;
+    let min: Option<i64> = c.query_row(
+        "SELECT MIN(COALESCE(pc.our_seq_acked, 0)) FROM device d
+           LEFT JOIN peer_cursor pc ON pc.peer_id = d.id
+          WHERE d.is_self = 0 AND d.paired_at IS NOT NULL AND d.unpaired_at IS NULL
+            AND COALESCE(d.last_seen_at, d.paired_at) >= ?1",
+        [now - STALE_PEER_MS],
+        |r| r.get(0),
+    )?;
+    let mut target = min.map(to_u).unwrap_or(head);
+    let cap: Option<i64> = c
+        .query_row("SELECT seq FROM change_log ORDER BY seq DESC LIMIT 1 OFFSET ?1", [max_rows], |r| r.get(0))
+        .optional()?;
+    if let Some(s) = cap {
+        target = target.max(to_u(s));
+    }
+    let target = target.max(floor).min(head);
+    if target > floor {
+        // Floor first: if we stop between the two, the floor is too high (a stale peer costs a
+        // snapshot), never too low (an incremental pull that silently skips the deleted rows).
+        set_log_floor(c, target)?;
+        c.execute("DELETE FROM change_log WHERE seq <= ?1", [to_i(target)])?;
+    }
+    Ok(target)
 }
 
 /// (last_seq_pulled, our_seq_acked) for the peer; None = new peer (full snapshot).
@@ -1121,23 +1291,50 @@ impl PendingUnpair {
     }
 }
 
-pub fn get_pending_unpair(c: &Connection) -> Result<Option<PendingUnpair>> {
-    match get_value(c, PENDING_UNPAIR)? {
-        None => Ok(None),
-        Some(text) => serde_json::from_str(&text)
-            .map(Some)
-            .map_err(|e| CoreError::Invalid(format!("setting '{PENDING_UNPAIR}' has a bad value: {e}"))),
+/// Every notice still owed, oldest first. The value is a JSON list; a 0.2.x database holds one
+/// bare object, which reads as a list of one.
+pub fn pending_unpairs(c: &Connection) -> Result<Vec<PendingUnpair>> {
+    let Some(text) = get_value(c, PENDING_UNPAIR)? else { return Ok(Vec::new()) };
+    let bad = |e: serde_json::Error| CoreError::Invalid(format!("setting '{PENDING_UNPAIR}' has a bad value: {e}"));
+    let v: serde_json::Value = serde_json::from_str(&text).map_err(bad)?;
+    match v {
+        serde_json::Value::Array(_) => serde_json::from_value(v).map_err(bad),
+        _ => Ok(vec![serde_json::from_value(v).map_err(bad)?]),
     }
 }
 
-pub fn set_pending_unpair(c: &Connection, p: &PendingUnpair) -> Result<()> {
-    let text = serde_json::to_string(p).map_err(|e| CoreError::Invalid(format!("pending unpair: {e}")))?;
+fn save_pending_unpairs(c: &Connection, list: &[PendingUnpair]) -> Result<()> {
+    if list.is_empty() {
+        c.execute("DELETE FROM setting WHERE key = ?1", [PENDING_UNPAIR])?;
+        return Ok(());
+    }
+    let text = serde_json::to_string(list).map_err(|e| CoreError::Invalid(format!("pending unpair: {e}")))?;
     set_value(c, PENDING_UNPAIR, &text)
 }
 
-pub fn clear_pending_unpair(c: &Connection) -> Result<()> {
-    c.execute("DELETE FROM setting WHERE key = ?1", [PENDING_UNPAIR])?;
+/// Owe `p.peer` a notice. A second notice for the same peer replaces the first (new addresses).
+pub fn add_pending_unpair(c: &Connection, p: &PendingUnpair) -> Result<()> {
+    let mut list = pending_unpairs(c)?;
+    match list.iter_mut().find(|x| x.peer == p.peer) {
+        Some(x) => *x = p.clone(),
+        None => list.push(p.clone()),
+    }
+    save_pending_unpairs(c, &list)
+}
+
+/// The notice for `peer` is delivered or void. Other notices stay.
+pub fn remove_pending_unpair(c: &Connection, peer: DeviceId) -> Result<()> {
+    let mut list = pending_unpairs(c)?;
+    let before = list.len();
+    list.retain(|x| !x.peer_id().is_ok_and(|id| id == peer));
+    if list.len() != before {
+        save_pending_unpairs(c, &list)?;
+    }
     Ok(())
+}
+
+pub fn is_pending_unpair(c: &Connection, peer: DeviceId) -> Result<bool> {
+    Ok(pending_unpairs(c)?.iter().any(|x| x.peer_id().is_ok_and(|id| id == peer)))
 }
 
 // ---------- test support (shared by the logic modules' tests) ----------
@@ -1176,7 +1373,7 @@ pub(crate) mod test_support {
         ensure_self(&db.conn, me, "me", my_role).unwrap();
         set_paired(
             &db.conn,
-            &DeviceRow { id: peer, name: "peer".into(), is_self: false, role: peer_role, paired_at: None, unpaired_at: None, last_seen_at: None, addresses: vec![] },
+            &DeviceRow { id: peer, name: "peer".into(), is_self: false, role: peer_role, paired_at: None, unpaired_at: None, last_seen_at: None, last_synced_at: None, addresses: vec![] },
             T0,
         )
         .unwrap();
@@ -1321,7 +1518,7 @@ mod tests {
         ensure_self(&db.conn, p(), "PC renamed", Role::Pc).unwrap();
         assert_eq!(self_device(&db.conn).unwrap().name, "PC renamed");
         assert!(ensure_self(&db.conn, f(), "x", Role::Phone).is_err(), "other key under same db is refused");
-        let me = DeviceRow { id: p(), name: "me".into(), is_self: true, role: Role::Pc, paired_at: None, unpaired_at: None, last_seen_at: None, addresses: vec![] };
+        let me = DeviceRow { id: p(), name: "me".into(), is_self: true, role: Role::Pc, paired_at: None, unpaired_at: None, last_seen_at: None, last_synced_at: None, addresses: vec![] };
         assert!(set_paired(&db.conn, &me, T0).is_err(), "cannot pair with self");
     }
 
@@ -1330,7 +1527,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         ensure_self(&db.conn, p(), "PC", Role::Pc).unwrap();
         assert!(paired_peer(&db.conn).unwrap().is_none());
-        let peer = DeviceRow { id: f(), name: "Phone".into(), is_self: false, role: Role::Phone, paired_at: None, unpaired_at: None, last_seen_at: None, addresses: vec!["10.0.0.2:5000".into()] };
+        let peer = DeviceRow { id: f(), name: "Phone".into(), is_self: false, role: Role::Phone, paired_at: None, unpaired_at: None, last_seen_at: None, last_synced_at: None, addresses: vec!["10.0.0.2:5000".into()] };
         set_paired(&db.conn, &peer, T0).unwrap();
         assert!(is_paired(&db.conn, f()).unwrap());
         assert!(!is_paired(&db.conn, dev(1)).unwrap());
@@ -1475,7 +1672,7 @@ mod tests {
     // Change_log rows, dedupe, paging, trim, head, unacked.
     #[test]
     fn change_log_dedupes_pages_and_trims() {
-        let db = Db::open_in_memory().unwrap();
+        let db = db_with_peer(p(), f());
         let a = EntityKey::Item { id: ItemId(Uuid::from_u128(1)) };
         let b = EntityKey::Folder { id: FolderId(Uuid::from_u128(2)) };
         let r = EntityKey::Receipt { hash: hash(1), device: f() };
@@ -1485,27 +1682,289 @@ mod tests {
         assert_eq!(log_change(&db.conn, &a, group::PINNED, 3).unwrap(), 3);
         assert_eq!(log_change(&db.conn, &r, group::ALL, 4).unwrap(), 4);
         assert_eq!(head_seq(&db.conn).unwrap(), 4);
-        let (keys, last) = changes_since(&db.conn, 0, 100).unwrap();
+        let (keys, last) = changes_since(&db.conn, 0, 100, f()).unwrap();
         assert_eq!(keys, vec![b, a, r], "ordered by last change, one entry per key");
         assert_eq!(last, 4);
         // Paged: the page ends after b; `a` (last change seq 3) comes on the next page.
-        let (keys, last) = changes_since(&db.conn, 0, 1).unwrap();
+        let (keys, last) = changes_since(&db.conn, 0, 1, f()).unwrap();
         assert_eq!((keys, last), (vec![b], 2));
-        let (keys, last) = changes_since(&db.conn, 2, 10).unwrap();
+        let (keys, last) = changes_since(&db.conn, 2, 10, f()).unwrap();
         assert_eq!((keys, last), (vec![a, r], 4));
-        let (keys, last) = changes_since(&db.conn, 4, 10).unwrap();
+        let (keys, last) = changes_since(&db.conn, 4, 10, f()).unwrap();
         assert!(keys.is_empty());
         assert_eq!(last, 4, "nothing new: since is returned");
         // unacked
-        assert_eq!(unacked_local_change(&db.conn, &a, group::PINNED, 0).unwrap(), Some(3));
-        assert_eq!(unacked_local_change(&db.conn, &a, group::PINNED, 3).unwrap(), None);
-        assert_eq!(unacked_local_change(&db.conn, &a, group::DELETED, 0).unwrap(), None);
+        assert_eq!(unacked_local_change(&db.conn, &a, group::PINNED, 0, f()).unwrap(), Some(3));
+        assert_eq!(unacked_local_change(&db.conn, &a, group::PINNED, 3, f()).unwrap(), None);
+        assert_eq!(unacked_local_change(&db.conn, &a, group::DELETED, 0, f()).unwrap(), None);
         // trim keeps the sequence monotonic.
-        assert_eq!(trim_log(&db.conn, 3).unwrap(), 3);
-        assert_eq!(changes_since(&db.conn, 0, 10).unwrap().0, vec![r]);
-        clear_log(&db.conn).unwrap();
+        set_pulled(&db.conn, f(), 0).unwrap();
+        set_acked(&db.conn, f(), 3).unwrap();
+        assert_eq!(trim_log_for_peers(&db.conn, T0).unwrap(), 3);
+        assert_eq!(changes_since(&db.conn, 0, 10, f()).unwrap().0, vec![r]);
+        set_unpaired(&db.conn, f(), T0).unwrap();
+        trim_log_for_peers(&db.conn, T0).unwrap();
         assert_eq!(head_seq(&db.conn).unwrap(), 4, "head survives a trim");
+        assert_eq!(log_floor(&db.conn).unwrap(), 4);
         assert_eq!(log_change(&db.conn, &a, group::NAME, 5).unwrap(), 5);
+    }
+
+    fn key_n(n: u128) -> EntityKey {
+        EntityKey::Item { id: ItemId(Uuid::from_u128(n)) }
+    }
+
+    /// `n` change_log rows for distinct items, written here.
+    fn log_rows(c: &Connection, n: u128) {
+        for i in 1..=n {
+            log_change(c, &key_n(i), group::NAME, i as u64).unwrap();
+        }
+    }
+
+    /// A paired PC row with a cursor acked up to `acked`, last seen at `seen`.
+    fn peer_acked(c: &Connection, id: DeviceId, acked: u64, seen: i64) {
+        let row = DeviceRow { id, name: "pc".into(), is_self: false, role: Role::Pc, paired_at: None, unpaired_at: None, last_seen_at: None, last_synced_at: None, addresses: vec![] };
+        set_paired(c, &row, T0).unwrap();
+        set_last_seen(c, id, seen, &[]).unwrap();
+        set_pulled(c, id, 0).unwrap();
+        set_acked(c, id, acked).unwrap();
+    }
+
+    #[test]
+    fn changes_since_excludes_the_puller() {
+        let db = Db::open_in_memory().unwrap();
+        let (a, b, c) = (key_n(1), key_n(2), key_n(3));
+        log_change(&db.conn, &a, group::NAME, 1).unwrap(); // 1, written here
+        log_change_from(&db.conn, &b, group::NAME, 2, f()).unwrap(); // 2, taken from f
+        log_change_from(&db.conn, &c, group::NAME, 3, dev(3)).unwrap(); // 3, taken from dev 3
+        log_change_from(&db.conn, &a, group::PINNED, 4, f()).unwrap(); // 4, a again, from f
+        // f never gets its own changes back; a is still owed to it through the row written here.
+        assert_eq!(changes_since(&db.conn, 0, 10, f()).unwrap(), (vec![a, c], 3));
+        // dev 3 gets everything except what it sent; a's newest row is from f, so it is owed.
+        assert_eq!(changes_since(&db.conn, 0, 10, dev(3)).unwrap(), (vec![b, a], 4));
+        // Somebody else gets all of it, in order of last change.
+        assert_eq!(changes_since(&db.conn, 0, 10, dev(9)).unwrap(), (vec![b, c, a], 4));
+        // A cursor past the only row not from f: nothing for f.
+        assert_eq!(changes_since(&db.conn, 3, 10, f()).unwrap(), (vec![], 3));
+    }
+
+    #[test]
+    fn changes_since_more_probe_uses_exclusion() {
+        let db = Db::open_in_memory().unwrap();
+        log_change(&db.conn, &key_n(1), group::NAME, 1).unwrap();
+        log_change_from(&db.conn, &key_n(2), group::NAME, 2, f()).unwrap();
+        let (keys, last) = changes_since(&db.conn, 0, 1, f()).unwrap();
+        assert_eq!((keys.len(), last), (1, 1));
+        assert!(changes_since(&db.conn, last, 1, f()).unwrap().0.is_empty(), "nothing more for f, so the page is final");
+        assert_eq!(changes_since(&db.conn, last, 1, dev(9)).unwrap().0, vec![key_n(2)], "another puller has more");
+    }
+
+    #[test]
+    fn unacked_local_change_ignores_rows_from_that_peer() {
+        let db = Db::open_in_memory().unwrap();
+        let a = key_n(1);
+        log_change_from(&db.conn, &a, group::NAME, 1, f()).unwrap(); // 1: f's own write relayed
+        assert_eq!(unacked_local_change(&db.conn, &a, group::NAME, 0, f()).unwrap(), None, "f's write is not concurrent with f");
+        assert_eq!(unacked_local_change(&db.conn, &a, group::NAME, 0, dev(3)).unwrap(), Some(1), "but it is a change dev 3 has not seen");
+        log_change(&db.conn, &a, group::NAME, 2).unwrap(); // 2: written here
+        assert_eq!(unacked_local_change(&db.conn, &a, group::NAME, 0, f()).unwrap(), Some(2));
+        assert_eq!(unacked_local_change(&db.conn, &a, group::NAME, 2, f()).unwrap(), None);
+    }
+
+    #[test]
+    fn trim_keeps_rows_a_live_peer_has_not_acked() {
+        let db = Db::open_in_memory().unwrap();
+        ensure_self(&db.conn, p(), "me", Role::Phone).unwrap();
+        log_rows(&db.conn, 10);
+        peer_acked(&db.conn, dev(1), 8, T0);
+        peer_acked(&db.conn, dev(2), 4, T0);
+        assert_eq!(trim_log_for_peers(&db.conn, T0).unwrap(), 4);
+        assert_eq!(log_floor(&db.conn).unwrap(), 4);
+        assert_eq!(changes_since(&db.conn, 0, 100, dev(9)).unwrap().0.len(), 6, "rows 5..=10 stay for the slower peer");
+        set_acked(&db.conn, dev(2), 9).unwrap();
+        assert_eq!(trim_log_for_peers(&db.conn, T0).unwrap(), 8, "now the other peer is the slowest");
+        assert_eq!(changes_since(&db.conn, 0, 100, dev(9)).unwrap().0.len(), 2);
+    }
+
+    #[test]
+    fn cursorless_peer_pins_the_log() {
+        let db = Db::open_in_memory().unwrap();
+        log_rows(&db.conn, 10);
+        peer_acked(&db.conn, dev(1), 10, T0);
+        // A PC that is linking now: paired, no cursor yet. Its first snapshot is still running.
+        set_paired(&db.conn, &DeviceRow { id: dev(2), name: "new".into(), is_self: false, role: Role::Pc, paired_at: None, unpaired_at: None, last_seen_at: None, last_synced_at: None, addresses: vec![] }, T0).unwrap();
+        assert_eq!(trim_log_for_peers(&db.conn, T0).unwrap(), 0);
+        assert_eq!(log_floor(&db.conn).unwrap(), 0);
+        assert_eq!(changes_since(&db.conn, 0, 100, dev(9)).unwrap().0.len(), 10, "nothing trimmed");
+        // Once it has a cursor the log can follow its acks again.
+        set_pulled(&db.conn, dev(2), 0).unwrap();
+        set_acked(&db.conn, dev(2), 6).unwrap();
+        assert_eq!(trim_log_for_peers(&db.conn, T0).unwrap(), 6);
+    }
+
+    #[test]
+    fn trim_ignores_peer_unseen_60_days() {
+        let db = Db::open_in_memory().unwrap();
+        log_rows(&db.conn, 10);
+        peer_acked(&db.conn, dev(1), 10, T0);
+        peer_acked(&db.conn, dev(2), 0, T0 - 61 * crate::clock::DAY_MS);
+        assert_eq!(trim_log_for_peers(&db.conn, T0).unwrap(), 10, "the long-absent peer no longer holds the log back");
+        // Seen 59 days ago it still counts.
+        let db = Db::open_in_memory().unwrap();
+        log_rows(&db.conn, 10);
+        peer_acked(&db.conn, dev(1), 10, T0);
+        peer_acked(&db.conn, dev(2), 0, T0 - 59 * crate::clock::DAY_MS);
+        assert_eq!(trim_log_for_peers(&db.conn, T0).unwrap(), 0);
+        // Every linked peer long gone: nobody to keep rows for.
+        let db = Db::open_in_memory().unwrap();
+        log_rows(&db.conn, 10);
+        peer_acked(&db.conn, dev(1), 3, T0 - 90 * crate::clock::DAY_MS);
+        assert_eq!(trim_log_for_peers(&db.conn, T0).unwrap(), 10);
+    }
+
+    #[test]
+    fn trim_cap_at_max_rows() {
+        let db = Db::open_in_memory().unwrap();
+        log_rows(&db.conn, 10);
+        peer_acked(&db.conn, dev(1), 0, T0);
+        assert_eq!(trim_log_capped(&db.conn, T0, 3).unwrap(), 7, "the newest 3 rows stay whoever still needs the rest");
+        assert_eq!(log_floor(&db.conn).unwrap(), 7);
+        assert_eq!(changes_since(&db.conn, 0, 100, dev(9)).unwrap().0.len(), 3);
+        // Under the cap nothing extra goes.
+        assert_eq!(trim_log_capped(&db.conn, T0, 3).unwrap(), 7);
+    }
+
+    #[test]
+    fn trim_never_moves_floor_back() {
+        let db = Db::open_in_memory().unwrap();
+        log_rows(&db.conn, 10);
+        peer_acked(&db.conn, dev(1), 2, T0);
+        set_log_floor(&db.conn, 8).unwrap();
+        set_log_floor(&db.conn, 3).unwrap();
+        assert_eq!(log_floor(&db.conn).unwrap(), 8, "a lower floor is ignored");
+        assert_eq!(trim_log_for_peers(&db.conn, T0).unwrap(), 8, "an old ack does not lower it either");
+        assert_eq!(log_floor(&db.conn).unwrap(), 8);
+    }
+
+    #[test]
+    fn trim_raises_the_floor_even_when_the_delete_fails() {
+        let db = Db::open_in_memory().unwrap();
+        log_rows(&db.conn, 10);
+        peer_acked(&db.conn, dev(1), 6, T0);
+        db.conn
+            .execute_batch("CREATE TEMP TRIGGER no_trim BEFORE DELETE ON change_log BEGIN SELECT RAISE(ABORT, 'disk full'); END")
+            .unwrap();
+        assert!(trim_log_for_peers(&db.conn, T0).is_err());
+        // Rows may still be there, but the floor must not be below any row that went.
+        assert_eq!(log_floor(&db.conn).unwrap(), 6, "an interrupted trim leaves the floor high, never low");
+    }
+
+    #[test]
+    fn trim_with_no_peer_empties_log_floor_head() {
+        let db = Db::open_in_memory().unwrap();
+        log_rows(&db.conn, 5);
+        assert_eq!(trim_log_for_peers(&db.conn, T0).unwrap(), 5);
+        assert!(changes_since(&db.conn, 0, 100, dev(9)).unwrap().0.is_empty());
+        assert_eq!((log_floor(&db.conn).unwrap(), head_seq(&db.conn).unwrap()), (5, 5));
+        assert_eq!(log_change(&db.conn, &key_n(1), group::NAME, 9).unwrap(), 6, "seqs keep counting");
+        // Nothing logged and nothing linked: nothing to do.
+        let db = Db::open_in_memory().unwrap();
+        assert_eq!(trim_log_for_peers(&db.conn, T0).unwrap(), 0);
+        assert_eq!(log_floor(&db.conn).unwrap(), 0);
+    }
+
+    #[test]
+    fn pending_unpairs_reads_legacy_object() {
+        let db = Db::open_in_memory().unwrap();
+        assert!(pending_unpairs(&db.conn).unwrap().is_empty());
+        assert!(!is_pending_unpair(&db.conn, f()).unwrap());
+        // A 0.2.x database holds one bare object under the same key.
+        set_value(&db.conn, "pending_unpair", &format!("{{\"peer\":\"{}\",\"addresses\":[\"10.0.0.9:4000\"]}}", hex::encode(f().0))).unwrap();
+        let list = pending_unpairs(&db.conn).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].peer_id().unwrap(), f());
+        assert_eq!(list[0].addresses, vec!["10.0.0.9:4000".to_string()]);
+        assert!(is_pending_unpair(&db.conn, f()).unwrap());
+        // The next write turns it into a list and keeps the old entry.
+        add_pending_unpair(&db.conn, &PendingUnpair { peer: hex::encode(dev(3).0), addresses: vec![] }).unwrap();
+        let list = pending_unpairs(&db.conn).unwrap();
+        assert_eq!(list.iter().map(|x| x.peer_id().unwrap()).collect::<Vec<_>>(), vec![f(), dev(3)]);
+        // Garbage is an error naming the key, never silently empty.
+        set_value(&db.conn, "pending_unpair", "{not json").unwrap();
+        assert!(pending_unpairs(&db.conn).unwrap_err().to_string().contains("pending_unpair"));
+    }
+
+    #[test]
+    fn pending_unpairs_add_replace_remove() {
+        let db = Db::open_in_memory().unwrap();
+        let note = |d: DeviceId, addr: &str| PendingUnpair { peer: hex::encode(d.0), addresses: vec![addr.to_string()] };
+        add_pending_unpair(&db.conn, &note(f(), "10.0.0.1:1")).unwrap();
+        add_pending_unpair(&db.conn, &note(dev(3), "10.0.0.3:3")).unwrap();
+        add_pending_unpair(&db.conn, &note(f(), "10.0.0.2:2")).unwrap();
+        let list = pending_unpairs(&db.conn).unwrap();
+        assert_eq!(list.len(), 2, "the same peer is replaced, not added twice");
+        assert_eq!(list[0].addresses, vec!["10.0.0.2:2".to_string()]);
+        assert!(is_pending_unpair(&db.conn, f()).unwrap() && is_pending_unpair(&db.conn, dev(3)).unwrap());
+        remove_pending_unpair(&db.conn, f()).unwrap();
+        assert!(!is_pending_unpair(&db.conn, f()).unwrap());
+        assert!(is_pending_unpair(&db.conn, dev(3)).unwrap(), "the other notice stays");
+        remove_pending_unpair(&db.conn, dev(9)).unwrap();
+        assert_eq!(pending_unpairs(&db.conn).unwrap().len(), 1, "removing an unknown peer changes nothing");
+        remove_pending_unpair(&db.conn, dev(3)).unwrap();
+        assert!(pending_unpairs(&db.conn).unwrap().is_empty());
+        assert_eq!(get_value(&db.conn, "pending_unpair").unwrap(), None, "an empty list leaves no row");
+    }
+
+    #[test]
+    fn items_in_state_after_holder_filter() {
+        let db = db_with_peer(p(), f());
+        // 1: written by f. 2: written here, f has a receipt. 3: written here, no receipt.
+        // 4: written by dev 3, f has a receipt for the same bytes as 2.
+        let it1 = item(1, f(), v(1, f()));
+        let it2 = item(2, p(), v(1, p()));
+        let it3 = item(3, p(), v(1, p()));
+        let mut it4 = item(4, dev(3), v(1, dev(3)));
+        it4.content.val.hash = hash(2);
+        for it in [&it1, &it2, &it3, &it4] {
+            insert_item(&db.conn, it, LocalFileState::Pending, T0).unwrap();
+        }
+        insert_receipt(&db.conn, &ReceiptRecord { hash: hash(2), device: f(), received_at: 1 }, 1).unwrap();
+        let ids = |holder| items_in_state_after(&db.conn, &[LocalFileState::Pending], None, 100, holder).unwrap().into_iter().map(|(_, i)| i).collect::<Vec<_>>();
+        assert_eq!(ids(None), vec![it1.id, it2.id, it3.id, it4.id], "no holder: no filter");
+        assert_eq!(ids(Some(f())), vec![it1.id, it2.id, it4.id], "content from f, or a receipt from f");
+        assert_eq!(ids(Some(dev(3))), vec![it4.id], "only what dev 3 wrote");
+        assert_eq!(ids(Some(dev(9))), Vec::<ItemId>::new());
+        // The cursor still pages through the filtered rows.
+        let after = Some((it1.captured_at, it1.id));
+        let page = items_in_state_after(&db.conn, &[LocalFileState::Pending], after, 1, Some(f())).unwrap();
+        assert_eq!(page.into_iter().map(|(_, i)| i).collect::<Vec<_>>(), vec![it2.id]);
+        // pending_held_by is the same test, one answer.
+        assert!(pending_held_by(&db.conn, f()).unwrap());
+        assert!(!pending_held_by(&db.conn, dev(9)).unwrap());
+        set_local_state(&db.conn, it1.id, LocalFileState::Present, T0).unwrap();
+        set_local_state(&db.conn, it2.id, LocalFileState::Present, T0).unwrap();
+        set_local_state(&db.conn, it4.id, LocalFileState::Present, T0).unwrap();
+        assert!(!pending_held_by(&db.conn, f()).unwrap(), "only Pending items count");
+    }
+
+    #[test]
+    fn paired_peers_and_the_link_count() {
+        let db = Db::open_in_memory().unwrap();
+        ensure_self(&db.conn, p(), "me", Role::Phone).unwrap();
+        assert!(paired_peers(&db.conn).unwrap().is_empty());
+        let row = |d: DeviceId| DeviceRow { id: d, name: format!("pc {}", d.0[0]), is_self: false, role: Role::Pc, paired_at: None, unpaired_at: None, last_seen_at: None, last_synced_at: None, addresses: vec![] };
+        set_paired(&db.conn, &row(dev(2)), T0 + 5).unwrap();
+        set_paired(&db.conn, &row(dev(1)), T0).unwrap();
+        set_paired(&db.conn, &row(dev(3)), T0 + 9).unwrap();
+        assert_eq!(paired_peers(&db.conn).unwrap().iter().map(|d| d.id).collect::<Vec<_>>(), vec![dev(1), dev(2), dev(3)], "oldest link first");
+        assert_eq!(count_paired_except(&db.conn, dev(9)).unwrap(), 3);
+        assert_eq!(count_paired_except(&db.conn, dev(2)).unwrap(), 2, "a peer linking again is not counted against itself");
+        set_unpaired(&db.conn, dev(1), T0 + 10).unwrap();
+        assert_eq!(paired_peers(&db.conn).unwrap().len(), 2);
+        assert_eq!(count_paired_except(&db.conn, dev(9)).unwrap(), 2);
+        // last synced only moves forward
+        set_last_synced(&db.conn, dev(2), 50).unwrap();
+        set_last_synced(&db.conn, dev(2), 40).unwrap();
+        assert_eq!(get_device(&db.conn, dev(2)).unwrap().unwrap().last_synced_at, Some(50));
     }
 
     #[test]

@@ -25,6 +25,7 @@ fn confirm_by_paired_phone(d: &Dev, hash: tugboat_core::BlobHash) {
                 paired_at: None,
                 unpaired_at: None,
                 last_seen_at: None,
+                last_synced_at: None,
                 addresses: Vec::new(),
             },
             T0,

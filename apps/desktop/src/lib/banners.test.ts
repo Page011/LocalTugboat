@@ -7,20 +7,28 @@ const lib = (over: Partial<LibraryStatus> = {}): LibraryStatus => ({
 });
 const base: BannerInput = {
   info: { version: "0.1.0", device_name: "PC", device_id: "aa", bind: "127.0.0.1:47300", network_error: null, data_dir: "C:\\d" },
-  sync: { state: "synced", peer_name: "Pixel", last_synced_at: 1, waiting: 0, downloading: 0, storage_low: false, message: null },
+  sync: { state: "synced", peer_name: "Pixel", last_synced_at: 1, waiting: 0, downloading: 0, storage_low: false, message: null, devices: [] },
   library: lib(),
   firewall: { status: { t: "ok" }, message: null, can_fix: false },
   error: null,
   drop: null,
+  removedByPhone: false,
 };
 const ids = (i: BannerInput) => computeBanners(i).map((b) => b.id);
 
 describe("computeBanners", () => {
+  test("removed by phone shows one dismissible line and goes with the flag", () => {
+    const b = computeBanners({ ...base, removedByPhone: true });
+    expect(b).toHaveLength(1);
+    expect(b[0]).toMatchObject({ id: "removed", text: "REMOVED BY PHONE - link again to sync" });
+    expect(b[0]?.actions.map((a) => a.id)).toEqual(["dismiss-removed"]);
+    expect(ids({ ...base, removedByPhone: false })).toEqual([]);
+  });
   test("a healthy app shows nothing", () => {
     expect(computeBanners(base)).toEqual([]);
   });
   test("nothing loaded yet shows nothing", () => {
-    expect(computeBanners({ info: null, sync: null, library: null, firewall: null, error: null, drop: null })).toEqual([]);
+    expect(computeBanners({ info: null, sync: null, library: null, firewall: null, error: null, drop: null, removedByPhone: false })).toEqual([]);
   });
   test("firewall problem: Fix only when it can help, always a recheck", () => {
     const fw = (can_fix: boolean) => ({ ...base, firewall: { status: { t: "rule_missing" as const }, message: "WINDOWS FIREWALL is blocking Tugboat", can_fix } });

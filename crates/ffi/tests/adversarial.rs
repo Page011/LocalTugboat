@@ -91,13 +91,11 @@ fn pair(phone: &Arc<PhoneCore>, pc: &Pc) -> Result<PairedPc, SnapError> {
     t.join().unwrap()
 }
 
-/// A phone already paired to PC A scans PC B's code (the Android deep-link guard
-/// "Already paired. Unpair in Settings first" is skipped on a cold start because the
-/// paired state is not loaded yet). Today the phone silently re-pairs: PC A is never told
-/// and keeps a pairing with a phone that will never dial it again. Expected: either the
-/// phone refuses with AlreadyPaired, or PC A is told (as `unpair()` does).
+/// A phone already paired to PC A scans PC B's code. The phone links up to five PCs, so it adds
+/// B beside A: A is not told anything and stays linked (the old behaviour replaced A and had to
+/// tell it). Neither PC may be left believing a pairing the phone does not keep.
 #[test]
-fn repair_while_paired_tells_old_pc_or_is_refused() {
+fn second_pc_is_linked_beside_the_first() {
     let dir = tempfile::tempdir().unwrap();
     let events = Arc::new(Events(Mutex::new(Vec::new())));
     let phone = PhoneCore::open(
@@ -119,17 +117,12 @@ fn repair_while_paired_tells_old_pc_or_is_refused() {
     assert!(until(20, || phone.status().state == SyncState::Synced), "phone synced with A");
     assert!(a.core.paired_device().unwrap().is_some());
 
-    match pair(&phone, &b) {
-        Err(SnapError::AlreadyPaired(_)) => {} // refused: fine
-        Err(other) => panic!("unexpected error {other:?}"),
-        Ok(_) => {
-            // Re-paired: the old PC must hear about it, like an explicit unpair.
-            assert!(
-                until(20, || a.core.paired_device().unwrap().is_none()),
-                "phone switched to PC-B but PC-A still believes it is paired (never told)"
-            );
-        }
-    }
+    pair(&phone, &b).expect("a second PC links beside the first");
+    assert!(b.core.paired_device().unwrap().is_some(), "B lists the phone");
+    // Nothing tells A it was dropped: give a wrong notice time to arrive.
+    thread::sleep(Duration::from_secs(2));
+    assert!(a.core.paired_device().unwrap().is_some(), "PC-A is still linked to the phone");
+    assert!(!phone.status().devices.iter().any(|d| d.unlinking), "no unlink notice is owed to anybody");
 }
 
 fn open_phone(dir: &Path) -> Arc<PhoneCore> {
@@ -148,12 +141,11 @@ fn open_phone(dir: &Path) -> Arc<PhoneCore> {
     phone
 }
 
-/// Same as above, but PC A is switched off when the phone re-pairs with PC B (the usual case:
-/// the user is at a different desk). An explicit `unpair()` keeps a pending notice and tells
-/// the PC once it is reachable; a re-pair does not (ops::pairing_completed calls unpair_in_tx
-/// with no pending notice). PC A, back on the same address, never learns it lost the phone.
+/// Same as above, but PC A is switched off when the phone links PC B (the usual case: the user is
+/// at a different desk). A is still linked: back on the same address it keeps its pairing, and
+/// nothing is owed to it.
 #[test]
-fn repair_while_old_pc_offline_still_tells_old_pc() {
+fn second_pc_while_first_is_offline_leaves_the_first_linked() {
     let dir = tempfile::tempdir().unwrap();
     let phone = open_phone(dir.path());
     let a = open_pc(dir.path(), "PC-A");
@@ -163,19 +155,18 @@ fn repair_while_old_pc_offline_still_tells_old_pc() {
     assert!(until(20, || phone.status().state == SyncState::Synced), "phone synced with A");
 
     a.rt.block_on(a.core.stop_network());
-    pair(&phone, &b).expect("re-pair with B while A is off");
+    pair(&phone, &b).expect("link B while A is off");
     a.restart_network();
 
-    assert!(
-        until(30, || a.core.paired_device().unwrap().is_none()),
-        "PC-A came back but still believes the phone is paired: the re-pair left no unpair notice for it"
-    );
+    thread::sleep(Duration::from_secs(3));
+    assert!(a.core.paired_device().unwrap().is_some(), "PC-A came back and is still linked to the phone");
+    assert!(!phone.status().devices.iter().any(|d| d.unlinking), "no unlink notice is owed to PC-A");
 }
 
-/// The notice for a switched-off old PC must not hold up the new one: the phone has to reach
-/// Synced with PC B while A is still off.
+/// A switched-off PC must not hold up the one just linked: the phone has to reach Synced with
+/// PC B while A is still off.
 #[test]
-fn old_pc_notice_does_not_block_syncing_with_the_new_pc() {
+fn an_offline_pc_does_not_block_syncing_with_the_new_pc() {
     let dir = tempfile::tempdir().unwrap();
     let phone = open_phone(dir.path());
     let a = open_pc(dir.path(), "PC-A");
@@ -184,7 +175,9 @@ fn old_pc_notice_does_not_block_syncing_with_the_new_pc() {
     pair(&phone, &a).expect("first pairing");
     assert!(until(20, || phone.status().state == SyncState::Synced), "phone synced with A");
     a.rt.block_on(a.core.stop_network());
-    pair(&phone, &b).expect("re-pair with B while A is off");
+    pair(&phone, &b).expect("link B while A is off");
     assert!(until(30, || b.core.paired_device().unwrap().is_some()), "B lists the phone");
-    assert!(until(30, || phone.status().state == SyncState::Synced), "phone synced with B while A is still off");
+    let b_id = hex::encode(device_id_from_secret(&b.secret).0);
+    let b_synced = || phone.status().devices.iter().any(|d| d.id == b_id && d.state == SyncState::Synced);
+    assert!(until(30, b_synced), "phone synced with B while A is still off");
 }

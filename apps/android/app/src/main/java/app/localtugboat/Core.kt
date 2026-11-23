@@ -25,7 +25,6 @@ import uniffi.tugboat_ffi.FfiEvent
 import uniffi.tugboat_ffi.PhoneConfig
 import uniffi.tugboat_ffi.PhoneCore
 import uniffi.tugboat_ffi.SnapException
-import uniffi.tugboat_ffi.SyncState
 import uniffi.tugboat_ffi.SyncStatus
 
 /** The process-wide core. One per process: the database and the log file are per data dir. */
@@ -171,9 +170,9 @@ class Core(private val app: Application) {
 
     init {
         // The multicast lock keeps the Wi-Fi radio awake for every multicast packet, so it is held only
-        // while the PC cannot be reached (that is when mDNS lookups run), in bursts: 30 s on, 2 min off.
+        // while a linked PC cannot be reached (that is when mDNS lookups run), in bursts: 30 s on, 2 min off.
         scope.launch {
-            combine(netUp, status) { up, st -> up && (st?.state == SyncState.OFFLINE || st?.state == SyncState.CONNECTING) }
+            combine(netUp, status) { up, st -> up && UiLogic.searching(st) }
                 .distinctUntilChanged()
                 .collectLatest { searching -> if (searching) multicastBursts() }
         }

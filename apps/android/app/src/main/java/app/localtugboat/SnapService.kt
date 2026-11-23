@@ -19,7 +19,7 @@ import kotlinx.coroutines.runBlocking
 import uniffi.tugboat_ffi.FfiEvent
 
 /**
- * Foreground service (connectedDevice): keeps the network up while the phone is paired, writes the
+ * Foreground service (connectedDevice): keeps the network up while a PC is linked, writes the
  * heartbeat and alerts on sync problems. The core itself lives in [Core], not here, so
  * the activity and the worker share it and a restart of this service never reopens the database.
  */
@@ -59,12 +59,21 @@ class SnapService : Service() {
                 launch { while (true) { Heartbeat.beat(this@SnapService); delay(HeartbeatLog.BEAT_MS) } }
                 launch { alertOnProblems() }
                 launch {
-                    core.events.collect { if (it is FfiEvent.Unpaired) stop(this@SnapService) }
+                    // One PC unlinked while others stay: the service keeps running for them.
+                    core.events.collect { if (it is FfiEvent.Unpaired && !stillLinked()) stop(this@SnapService) }
                 }
             }
         }
         // After a system kill the system restarts us; a force-stop is only undone by opening the app.
         return START_STICKY
+    }
+
+    /** Asked of the core after an unlink. A failed read keeps the service up; the error is reported. */
+    private fun stillLinked(): Boolean = try {
+        UiLogic.linked(core.phone().status().devices)
+    } catch (e: Exception) {
+        core.reportError("unlink check: ${e.message}")
+        true
     }
 
     /**
@@ -143,7 +152,7 @@ class SnapService : Service() {
             m
         }
 
-        /** Deliberate stop: setting turned off, or unpaired. */
+        /** Deliberate stop: setting turned off, or the last PC unlinked. */
         fun stop(c: Context) {
             if (!c.core.serviceRunning) return
             stopWanted = true

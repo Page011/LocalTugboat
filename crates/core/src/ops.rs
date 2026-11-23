@@ -46,9 +46,12 @@
 //!    target folder live.
 //! O10 pairing_completed(peer): store::set_paired; if another peer was paired, it is
 //!    unpaired first (one phone per PC); delete any stale cursor for the new key (new peer =
-//!    full snapshot). Activity Paired. Phone side (pairing_completed_phone): the replaced PC
-//!    is also recorded as a pending unpair notice, delivered when it is reachable.
-//! O11 unpair: set_unpaired, delete_cursor, clear_log. Synced files stay. Activity Unpaired.
+//!    full snapshot). Activity Paired. Phone side (pairing_completed_phone): never replaces; it
+//!    links up to MAX_LINKED PCs, counted inside the transaction (the same PC linking again is
+//!    not counted). Over the limit the PC, which already saved the link, is stored as unpaired
+//!    and owed an unpair notice, and the call fails with TooManyDevices.
+//! O11 unpair: set_unpaired, delete_cursor, trim the change log to what the remaining peers have
+//!    not acked yet. Synced files stay. Activity Unpaired.
 //! O12 blob_committed (sync fetch flow, after placement.commit): local = Present, file_ref,
 //!    own receipt (logged change), activity Received. blob_refused: local = Refused, activity
 //!    Refused. blob_lost (peer said not found): local = Lost (soft: asked again on every connect), activity Lost.
@@ -721,12 +724,13 @@ pub fn delete_place(c: &mut Connection, ctx: &Ctx<'_>, id: PlaceId) -> Result<()
 
 // ---------- O10 / O11 pairing ----------
 
-/// Unpair steps shared by O10 and O11, inside a transaction.
-fn unpair_in_tx(tx: &Connection, ctx: &Ctx<'_>, peer: DeviceId) -> Result<()> {
+/// Unpair steps shared by O10 and O11, inside a transaction. The log is trimmed, not emptied:
+/// the other linked PCs may still need rows this peer has already had.
+fn unpair_in_tx(tx: &Connection, ctx: &Ctx<'_>, peer: DeviceId, by_peer: bool) -> Result<()> {
     store::set_unpaired(tx, peer, ctx.now)?;
     store::delete_cursor(tx, peer)?;
-    store::clear_log(tx)?;
-    activity::log(tx, ctx.now, Some(peer), None, ActivityAction::Unpaired, "")?;
+    store::trim_log_for_peers(tx, ctx.now)?;
+    activity::log(tx, ctx.now, Some(peer), None, ActivityAction::Unpaired, if by_peer { "by the other device" } else { "" })?;
     Ok(())
 }
 
@@ -735,28 +739,30 @@ pub fn pairing_completed(c: &mut Connection, ctx: &Ctx<'_>, peer: &DeviceRow) ->
     pairing_completed_in(c, ctx, peer, false)
 }
 
-/// O10 (phone side). The phone never gets dialled, so when it replaces a paired PC it keeps an
-/// unpair notice for the old PC (same record as an explicit unpair made while apart) and
-/// delivers it when that PC is reachable. Only one notice is kept: a notice still owed to a
-/// third PC is replaced.
+/// O10 (phone side). Links one more PC beside the others; fails with `TooManyDevices` when
+/// `MAX_LINKED` other PCs are linked already.
 pub fn pairing_completed_phone(c: &mut Connection, ctx: &Ctx<'_>, peer: &DeviceRow) -> Result<()> {
     pairing_completed_in(c, ctx, peer, true)
 }
 
-fn pairing_completed_in(c: &mut Connection, ctx: &Ctx<'_>, peer: &DeviceRow, owe_notice: bool) -> Result<()> {
+fn pairing_completed_in(c: &mut Connection, ctx: &Ctx<'_>, peer: &DeviceRow, phone: bool) -> Result<()> {
     let tx = begin(c)?;
-    let replaced = store::paired_peer(&tx)?.filter(|old| old.id != peer.id);
-    if let Some(old) = &replaced {
-        unpair_in_tx(&tx, ctx, old.id)?;
+    if phone {
+        if store::count_paired_except(&tx, peer.id)? >= MAX_LINKED {
+            // The PC saved the link before this device was asked: keep it as removed and tell it.
+            store::set_paired(&tx, peer, ctx.now)?;
+            store::set_unpaired(&tx, peer.id, ctx.now)?;
+            store::add_pending_unpair(&tx, &store::PendingUnpair { peer: hex::encode(peer.id.0), addresses: peer.addresses.clone() })?;
+            tx.commit()?;
+            return Err(CoreError::TooManyDevices);
+        }
+    } else if let Some(old) = store::paired_peer(&tx)?.filter(|old| old.id != peer.id) {
+        // A PC has one phone: linking another logs out of the old one.
+        unpair_in_tx(&tx, ctx, old.id, false)?;
     }
     store::set_paired(&tx, peer, ctx.now)?;
     // Paired again with a device we still owed an unpair notice: the notice is void.
-    if store::get_pending_unpair(&tx)?.is_some_and(|p| p.peer_id().is_ok_and(|id| id == peer.id)) {
-        store::clear_pending_unpair(&tx)?;
-    }
-    if let (true, Some(old)) = (owe_notice, &replaced) {
-        store::set_pending_unpair(&tx, &store::PendingUnpair { peer: hex::encode(old.id.0), addresses: old.addresses.clone() })?;
-    }
+    store::remove_pending_unpair(&tx, peer.id)?;
     // A new (or returning) peer starts with a full snapshot.
     store::delete_cursor(&tx, peer.id)?;
     activity::log(&tx, ctx.now, Some(peer.id), None, ActivityAction::Paired, &peer.name)?;
@@ -764,10 +770,10 @@ fn pairing_completed_in(c: &mut Connection, ctx: &Ctx<'_>, peer: &DeviceRow, owe
     Ok(())
 }
 
-/// O11.
-pub fn unpair(c: &mut Connection, ctx: &Ctx<'_>, peer: DeviceId) -> Result<()> {
+/// O11. `by_peer`: the other device did it (it logged out, or no longer knows this one).
+pub fn unpair(c: &mut Connection, ctx: &Ctx<'_>, peer: DeviceId, by_peer: bool) -> Result<()> {
     let tx = begin(c)?;
-    unpair_in_tx(&tx, ctx, peer)?;
+    unpair_in_tx(&tx, ctx, peer, by_peer)?;
     tx.commit()?;
     Ok(())
 }
@@ -1200,7 +1206,7 @@ mod tests {
         store::insert_receipt(&db.conn, &ReceiptRecord { hash, device: f(), received_at: 1 }, t).unwrap();
         assert_eq!(state(&db, t + 24 * HOUR_MS), ItemState::Expired { binned_at: t + 24 * HOUR_MS });
         // Paired: still the same state, receipt or not.
-        let peer = DeviceRow { id: f(), name: "Phone".into(), is_self: false, role: Role::Phone, paired_at: None, unpaired_at: None, last_seen_at: None, addresses: vec![] };
+        let peer = DeviceRow { id: f(), name: "Phone".into(), is_self: false, role: Role::Phone, paired_at: None, unpaired_at: None, last_seen_at: None, last_synced_at: None, addresses: vec![] };
         pairing_completed(&mut db.conn, &Ctx { now: t, ..ctx }, &peer).unwrap();
         assert_eq!(state(&db, t + 24 * HOUR_MS), ItemState::Expired { binned_at: t + 24 * HOUR_MS });
         // A year late: the sweep bins it at once; the Bin clock starts then.
@@ -1212,7 +1218,7 @@ mod tests {
         // "waiting" and "never reached" logic that notices, not the expiry.
         let new_phone = DeviceRow { id: dev(0xCC), ..peer.clone() };
         pairing_completed(&mut db.conn, &Ctx { now: late, ..ctx }, &new_phone).unwrap();
-        assert_eq!(bin::missing_at_peer(&db.conn, hash).unwrap(), Some("phone"));
+        assert_eq!(bin::missing_on(&db.conn, hash).unwrap(), vec!["Phone".to_string()]);
     }
 
     // O1/O4/O7 for a file that is not a photo or video.
@@ -1404,20 +1410,21 @@ mod tests {
         assert!(matches!(r.run(|c, x| delete_place(c, x, PlaceId(Uuid::from_u128(1)))), Err(CoreError::NotFound { .. })));
     }
 
-    // O10/O11: one phone per PC, new peer = snapshot, unpair clears log and cursor, files stay.
+    // O10/O11: one phone per PC, new peer = snapshot, unpair trims log and cursor, files stay.
     #[test]
     fn pairing_and_unpairing() {
         let mut r = Rig::new(); // f() is already paired
         let id = r.add("a");
         store::set_pulled(&r.db.conn, f(), 5).unwrap();
         assert!(store::head_seq(&r.db.conn).unwrap() > 0);
-        let new_phone = DeviceRow { id: dev(0xCC), name: "New phone".into(), is_self: false, role: Role::Phone, paired_at: None, unpaired_at: None, last_seen_at: None, addresses: vec!["10.0.0.5:5000".into()] };
+        let new_phone = DeviceRow { id: dev(0xCC), name: "New phone".into(), is_self: false, role: Role::Phone, paired_at: None, unpaired_at: None, last_seen_at: None, last_synced_at: None, addresses: vec!["10.0.0.5:5000".into()] };
         r.run(|c, x| pairing_completed(c, x, &new_phone)).unwrap();
         assert!(!store::is_paired(&r.db.conn, f()).unwrap(), "previous phone unpaired first");
         assert!(store::is_paired(&r.db.conn, dev(0xCC)).unwrap());
         assert_eq!(store::get_cursor(&r.db.conn, f()).unwrap(), None);
         assert_eq!(store::get_cursor(&r.db.conn, dev(0xCC)).unwrap(), None, "new peer starts with a full snapshot");
-        assert!(store::changes_since(&r.db.conn, 0, 100).unwrap().0.is_empty(), "log cleared");
+        assert!(store::changes_since(&r.db.conn, 0, 100, dev(9)).unwrap().0.is_empty(), "no peer left to keep rows for: log cleared");
+        assert_eq!(store::log_floor(&r.db.conn).unwrap(), store::head_seq(&r.db.conn).unwrap());
         let acts = r.actions();
         assert!(acts.contains(&ActivityAction::Paired) && acts.contains(&ActivityAction::Unpaired));
         assert_eq!(r.lfs(id), LocalFileState::Present, "files stay");
@@ -1426,35 +1433,110 @@ mod tests {
         r.run(|c, x| pairing_completed(c, x, &new_phone)).unwrap();
         assert_eq!(store::get_cursor(&r.db.conn, dev(0xCC)).unwrap(), None);
         // Explicit unpair.
-        r.run(|c, x| unpair(c, x, dev(0xCC))).unwrap();
+        r.run(|c, x| unpair(c, x, dev(0xCC), false)).unwrap();
         assert!(store::paired_peer(&r.db.conn).unwrap().is_none());
-        assert!(matches!(r.run(|c, x| unpair(c, x, dev(0xDD))), Err(CoreError::NotFound { .. })));
+        assert!(matches!(r.run(|c, x| unpair(c, x, dev(0xDD), false)), Err(CoreError::NotFound { .. })));
         assert_eq!(r.lfs(id), LocalFileState::Present);
     }
 
-    // O10 phone side: replacing a paired PC leaves a notice for the old one; the PC side does not.
+    fn pc_row(id: DeviceId, name: &str) -> DeviceRow {
+        DeviceRow { id, name: name.into(), is_self: false, role: Role::Pc, paired_at: None, unpaired_at: None, last_seen_at: None, last_synced_at: None, addresses: vec![format!("10.0.0.{}:4000", id.0[0])] }
+    }
+
+    // O10 phone side: a second PC is linked beside the first. Nothing is unpaired, nothing owed.
     #[test]
-    fn phone_repair_keeps_an_unpair_notice_for_the_old_pc() {
+    fn phone_links_second_pc_keeps_first() {
         let mut r = Rig::new(); // f() is already paired
-        store::set_last_seen(&r.db.conn, f(), 1, &["10.0.0.9:4000".to_string()]).unwrap();
-        let other = DeviceRow { id: dev(0xCC), name: "Other PC".into(), is_self: false, role: Role::Pc, paired_at: None, unpaired_at: None, last_seen_at: None, addresses: vec![] };
-        // PC side: no notice.
+        store::set_pulled(&r.db.conn, f(), 5).unwrap();
+        let other = pc_row(dev(0xCC), "Other PC");
+        r.run(|c, x| pairing_completed_phone(c, x, &other)).unwrap();
+        assert!(store::is_paired(&r.db.conn, f()).unwrap(), "the first PC stays linked");
+        assert!(store::is_paired(&r.db.conn, dev(0xCC)).unwrap());
+        assert_eq!(store::paired_peers(&r.db.conn).unwrap().len(), 2);
+        assert_eq!(store::get_cursor(&r.db.conn, f()).unwrap(), Some((5, 0)), "its position is untouched");
+        assert_eq!(store::get_cursor(&r.db.conn, dev(0xCC)).unwrap(), None, "the new PC starts with a full snapshot");
+        assert!(store::pending_unpairs(&r.db.conn).unwrap().is_empty(), "no notice: nobody was replaced");
+        assert!(!r.actions().contains(&ActivityAction::Unpaired));
+        // The PC side keeps its one-phone rule.
         let mut pc = Rig::new();
         pc.run(|c, x| pairing_completed(c, x, &other)).unwrap();
-        assert!(store::get_pending_unpair(&pc.db.conn).unwrap().is_none());
-        // Phone side: notice names the old PC with its last known address.
+        assert!(!store::is_paired(&pc.db.conn, f()).unwrap());
+    }
+
+    // O10 phone side: the limit is checked inside the transaction. The PC that was turned away
+    // already saved its link, so it is stored as removed and owed a notice.
+    #[test]
+    fn over_limit_in_tx_owes_notice() {
+        let mut r = Rig::new(); // f() is the first of MAX_LINKED
+        for n in 1..MAX_LINKED as u8 {
+            r.run(|c, x| pairing_completed_phone(c, x, &pc_row(dev(0xC0 + n), "PC"))).unwrap();
+        }
+        assert_eq!(store::paired_peers(&r.db.conn).unwrap().len(), MAX_LINKED as usize);
+        let extra = pc_row(dev(0xEE), "One too many");
+        let paired_events = r.actions().iter().filter(|a| **a == ActivityAction::Paired).count();
+        assert!(matches!(r.run(|c, x| pairing_completed_phone(c, x, &extra)), Err(CoreError::TooManyDevices)));
+        assert!(!store::is_paired(&r.db.conn, extra.id).unwrap());
+        assert_eq!(store::paired_peers(&r.db.conn).unwrap().len(), MAX_LINKED as usize, "the others are untouched");
+        let row = store::get_device(&r.db.conn, extra.id).unwrap().expect("kept as a removed device");
+        assert!(row.paired_at.is_some() && row.unpaired_at.is_some());
+        let owed = store::pending_unpairs(&r.db.conn).unwrap();
+        assert_eq!(owed.len(), 1);
+        assert_eq!(owed[0].peer_id().unwrap(), extra.id);
+        assert_eq!(owed[0].addresses, extra.addresses);
+        assert_eq!(r.actions().iter().filter(|a| **a == ActivityAction::Paired).count(), paired_events, "no Linked row for it");
+        // Room again after one is unlinked, and linking the owed PC then voids its notice.
+        r.run(|c, x| unpair(c, x, f(), false)).unwrap();
+        r.run(|c, x| pairing_completed_phone(c, x, &extra)).unwrap();
+        assert!(store::is_paired(&r.db.conn, extra.id).unwrap());
+        assert!(store::pending_unpairs(&r.db.conn).unwrap().is_empty(), "linked again: the notice is void");
+    }
+
+    // A PC that is linked already links again (new scan after a reinstall): not counted twice,
+    // name and addresses refreshed, a fresh snapshot.
+    #[test]
+    fn relink_same_pc_not_counted() {
+        let mut r = Rig::new();
+        for n in 1..MAX_LINKED as u8 {
+            r.run(|c, x| pairing_completed_phone(c, x, &pc_row(dev(0xC0 + n), "PC"))).unwrap();
+        }
+        assert_eq!(store::paired_peers(&r.db.conn).unwrap().len(), MAX_LINKED as usize);
+        store::set_pulled(&r.db.conn, dev(0xC1), 7).unwrap();
+        let again = DeviceRow { name: "Renamed".into(), addresses: vec!["10.9.9.9:1".into()], ..pc_row(dev(0xC1), "PC") };
+        r.run(|c, x| pairing_completed_phone(c, x, &again)).unwrap();
+        let list = store::paired_peers(&r.db.conn).unwrap();
+        assert_eq!(list.len(), MAX_LINKED as usize);
+        let row = list.iter().find(|d| d.id == dev(0xC1)).unwrap();
+        assert_eq!((row.name.as_str(), row.addresses.clone()), ("Renamed", vec!["10.9.9.9:1".to_string()]));
+        assert_eq!(store::get_cursor(&r.db.conn, dev(0xC1)).unwrap(), None, "starts over with a snapshot");
+        assert!(store::pending_unpairs(&r.db.conn).unwrap().is_empty());
+    }
+
+    // O11: unlinking one PC leaves the log rows another PC has not had yet; the last one out empties it.
+    #[test]
+    fn unpair_keeps_rows_other_pc_needs() {
+        let mut r = Rig::new(); // f() is already paired
+        let other = pc_row(dev(0xCC), "Other PC");
         r.run(|c, x| pairing_completed_phone(c, x, &other)).unwrap();
-        let n = store::get_pending_unpair(&r.db.conn).unwrap().expect("notice owed to the old PC");
-        assert_eq!(n.peer_id().unwrap(), f());
-        assert_eq!(n.addresses, vec!["10.0.0.9:4000".to_string()]);
-        // Pairing again with the same PC (no replacement) leaves the notice alone.
-        r.run(|c, x| pairing_completed_phone(c, x, &other)).unwrap();
-        assert_eq!(store::get_pending_unpair(&r.db.conn).unwrap().unwrap().peer_id().unwrap(), f());
-        // Going back to the old PC voids its notice and owes one to the other PC.
-        let back = DeviceRow { id: f(), ..other.clone() };
-        r.run(|c, x| pairing_completed_phone(c, x, &back)).unwrap();
-        let n = store::get_pending_unpair(&r.db.conn).unwrap().expect("now owed to the other PC");
-        assert_eq!(n.peer_id().unwrap(), dev(0xCC));
+        for n in ["a", "b", "c"] {
+            r.add(n);
+        }
+        let head = store::head_seq(&r.db.conn).unwrap();
+        assert!(head > 2);
+        store::set_pulled(&r.db.conn, f(), 0).unwrap();
+        store::set_acked(&r.db.conn, f(), head).unwrap();
+        store::set_pulled(&r.db.conn, other.id, 0).unwrap();
+        store::set_acked(&r.db.conn, other.id, 1).unwrap();
+        r.run(|c, x| unpair(c, x, f(), true)).unwrap();
+        assert_eq!(store::log_floor(&r.db.conn).unwrap(), 1, "only what the other PC has acked is trimmed");
+        let (keys, _) = store::changes_since(&r.db.conn, 1, 100, dev(9)).unwrap();
+        assert!(!keys.is_empty(), "the rows the other PC still needs are there");
+        let unpaired = crate::activity::list(&r.db.conn, None, 500).unwrap().into_iter().find(|a| a.action == ActivityAction::Unpaired).unwrap();
+        assert_eq!(unpaired.detail, "by the other device");
+        r.run(|c, x| unpair(c, x, other.id, false)).unwrap();
+        assert!(store::changes_since(&r.db.conn, 0, 100, dev(9)).unwrap().0.is_empty());
+        assert_eq!(store::log_floor(&r.db.conn).unwrap(), head);
+        let last = crate::activity::list(&r.db.conn, None, 500).unwrap().into_iter().find(|a| a.action == ActivityAction::Unpaired && a.device == Some(other.id)).unwrap();
+        assert_eq!(last.detail, "");
     }
 
     // O12.

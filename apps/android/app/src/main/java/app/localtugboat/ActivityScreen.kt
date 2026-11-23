@@ -68,7 +68,8 @@ fun ActivityScreen(vm: SnapViewModel) {
                             Spacer(Modifier.width(12.dp))
                             Column(Modifier.weight(1f)) {
                                 Text(UiLogic.activityText(a.action), style = MaterialTheme.typography.bodyLarge, color = if (problem) cs.error else cs.onSurface)
-                                if (a.detail.isNotBlank()) Text(a.detail, style = MaterialTheme.typography.bodySmall, color = cs.onSurfaceVariant, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                                val detail = UiLogic.activityDetail(a.action, a.detail)
+                                if (detail.isNotBlank()) Text(detail, style = MaterialTheme.typography.bodySmall, color = cs.onSurfaceVariant, maxLines = 2, overflow = TextOverflow.Ellipsis)
                             }
                             Spacer(Modifier.width(8.dp))
                             Text(UiLogic.activityTime(a.atMs, nowMs, zone), style = MaterialTheme.typography.labelMedium, color = cs.onSurfaceVariant)

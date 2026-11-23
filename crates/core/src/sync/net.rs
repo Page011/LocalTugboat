@@ -1,9 +1,9 @@
-//! Network driver: endpoint start/stop, the accept and connect loops, and the per-connection
-//! run loop that feeds `engine::Session` and runs the blob fetch queue.
+//! Network driver: endpoint start/stop, the accept loop (PC), one dial task per linked PC (phone),
+//! and the per-connection run loop that feeds `engine::Session` and runs the blob fetch queue.
 //!
 //! One control stream per connection (opened by the phone). A reader task turns frames into
 //! channel messages (frame reads are not cancel safe), so the single control task can select
-//! over: incoming message, local change (Notify), download kick, download result, command
+//! over: incoming message, local change, download kick, download result, command
 //! (unpair), a 500 ms ticker for back-off retries, and the 10 s hello deadline.
 //! Blob streams are separate: the stream task serves the peer's requests, `fetch_item`
 //! downloads ours (two at a time, resumable, retried with back-off).
@@ -51,8 +51,11 @@ use crate::{
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 /// One dial attempt (cached addresses, then mDNS).
 const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
-/// Downloads running at once.
+/// Downloads running at once in one session.
 const MAX_PARALLEL_FETCH: usize = 2;
+/// Downloads running at once on the whole device, whatever the sessions: with five PCs linked
+/// the phone would otherwise run ten.
+const MAX_TOTAL_FETCH: usize = 3;
 /// Longest wait between two tries of one download.
 const MAX_FETCH_BACKOFF: Duration = Duration::from_secs(60);
 /// A Lost item (the peer said "not found") is asked for again this long after the last try, and
@@ -66,6 +69,8 @@ const STABLE_SESSION: Duration = Duration::from_secs(5);
 pub(crate) struct NetState {
     pub node: Node,
     pub tasks: Vec<JoinHandle<()>>,
+    /// Phone: the dial task of each device.
+    pub devices: DeviceTasks,
 }
 
 pub(crate) struct Active {
@@ -105,7 +110,7 @@ impl AccessGate for Gate {
                 if p {
                     return Ok(true);
                 }
-                Ok(crate::store::get_pending_unpair(&db.conn)?.is_some_and(|u| u.peer_id().is_ok_and(|id| id.0 == *peer)))
+                crate::store::is_pending_unpair(&db.conn, DeviceId(*peer))
             })
         };
         match r {
@@ -162,12 +167,15 @@ pub(crate) async fn start(core: &Core, cfg: NetworkConfig) -> Result<()> {
             }
         }));
     }
+    let devices: DeviceTasks = Arc::new(Mutex::new(HashMap::new()));
     let mut tasks = vec![tokio::spawn(accept_loop(core.clone(), node.clone()))];
     if role == Role::Phone {
-        tasks.push(tokio::spawn(connect_loop(core.clone(), node.clone())));
+        tasks.push(tokio::spawn(dial_supervisor(core.clone(), node.clone(), devices.clone())));
     }
-    *lock(&core.inner.net) = Some(NetState { node, tasks });
-    core.set_state(SyncState::Offline, None);
+    *lock(&core.inner.net) = Some(NetState { node, tasks, devices });
+    core.reset_states();
+    // The supervisor may have looked before the state above was in place.
+    core.inner.wake.fire();
     Ok(())
 }
 
@@ -177,13 +185,16 @@ pub(crate) async fn stop(core: &Core) {
     for t in &ns.tasks {
         t.abort();
     }
-    // An aborted notice task cannot reset its own flag.
-    core.inner.notice_running.store(false, std::sync::atomic::Ordering::SeqCst);
-    if let Some(a) = lock(&core.inner.active).take() {
+    // `net` is already empty, so the supervisor starts nothing new while these are aborted.
+    for (_, t) in lock(&ns.devices).drain() {
+        t.abort();
+    }
+    let live: Vec<Active> = lock(&core.inner.active).drain().map(|(_, a)| a).collect();
+    for a in live {
         a.conn.close(close::NORMAL, "network stopped");
     }
     ns.node.shutdown().await;
-    core.set_state(SyncState::Offline, None);
+    core.reset_states();
 }
 
 // ---------- accept (PC) and connect (phone) loops ----------
@@ -219,99 +230,161 @@ async fn dispatch(core: Core, acc: Accepted) {
     }
 }
 
-/// Phone: keep a connection to the paired PC. Back-off 1 s doubling to 30 s between tries.
-async fn connect_loop(core: Core, node: Node) {
+/// Device tasks of one network instance, by device. A task removes its own entry when it has
+/// nothing left to do; `stop` aborts the rest.
+pub(crate) type DeviceTasks = Arc<Mutex<HashMap<DeviceId, JoinHandle<()>>>>;
+
+/// What one device needs from the phone.
+enum Job {
+    /// Tell it we unlinked it.
+    Notice(crate::store::PendingUnpair),
+    /// Keep a connection to it.
+    Link(DeviceRow),
+    Nothing,
+}
+
+fn read_job(c: &Connection, id: DeviceId) -> Result<Job> {
+    if let Some(n) = crate::store::pending_unpairs(c)?.into_iter().find(|n| n.peer_id().is_ok_and(|p| p == id)) {
+        return Ok(Job::Notice(n));
+    }
+    Ok(match crate::store::get_device(c, id)?.filter(|d| d.paired_at.is_some() && d.unpaired_at.is_none()) {
+        Some(d) => Job::Link(d),
+        None => Job::Nothing,
+    })
+}
+
+/// Every device with something to do: the linked ones and the ones still owed a notice.
+fn wanted_ids(c: &Connection) -> Result<Vec<DeviceId>> {
+    let mut ids: Vec<DeviceId> = crate::store::paired_peers(c)?.into_iter().map(|d| d.id).collect();
+    for n in crate::store::pending_unpairs(c)? {
+        let id = n.peer_id()?;
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    Ok(ids)
+}
+
+/// Phone: start a task for every device that has none. Checked under the map's lock together with
+/// the "network still running" test, so a stop cannot miss a task started at the same moment.
+fn ensure_device_tasks(core: &Core, node: &Node, tasks: &DeviceTasks) {
+    let mut map = lock(tasks);
+    if lock(&core.inner.net).is_none() {
+        return;
+    }
+    let ids = { wanted_ids(&lock(&core.inner.db).conn) };
+    match ids {
+        Ok(ids) => {
+            for id in ids {
+                map.entry(id).or_insert_with(|| tokio::spawn(device_task(core.clone(), node.clone(), id, tasks.clone())));
+            }
+        }
+        Err(e) => core.emit_error(e.kind(), &format!("could not read the linked devices: {e}")),
+    }
+}
+
+/// Phone: one task per linked PC and per PC still owed a notice, so a PC that is off never holds
+/// up another.
+async fn dial_supervisor(core: Core, node: Node, tasks: DeviceTasks) {
+    let mut wake = core.inner.wake.subscribe();
+    loop {
+        ensure_device_tasks(&core, &node, &tasks);
+        wake.fired().await;
+    }
+}
+
+/// Back-off between two dials of one PC: 1 s doubling to 30 s, to 120 s once it has been away for
+/// this long (a PC at home overnight is not worth a dial every 30 s).
+const DIAL_BACKOFF: Duration = Duration::from_secs(30);
+const AWAY_DIAL_BACKOFF: Duration = Duration::from_secs(120);
+const AWAY_AFTER: Duration = Duration::from_secs(600);
+
+/// One device: deliver its unlink notice, or keep a connection to it, until it is neither linked nor
+/// owed a notice. Only `stop` aborts it: ending a task because its device left the list would drop
+/// the live session while `unpair_peer` is still sending the notice through it.
+async fn device_task(core: Core, node: Node, id: DeviceId, tasks: DeviceTasks) {
+    let mut wake = core.inner.wake.subscribe();
     let mut backoff = Duration::from_secs(1);
+    let mut away_since: Option<Instant> = None;
     // The last blocked address reported, so a retry loop does not repeat the same error.
     let mut reported_not_local: Option<String> = None;
     loop {
-        let target = loop {
-            let found = {
-                let db = lock(&core.inner.db);
-                crate::store::get_pending_unpair(&db.conn).and_then(|pending| Ok((pending, crate::store::paired_peer(&db.conn)?)))
-            };
-            match found {
-                // Unpaired with nobody to sync with: delivering the notice is the only job.
-                Ok((Some(u), None)) => break Target::Unpair(u),
-                Ok((pending, Some(p))) => {
-                    // Re-paired while the old PC was away: its notice goes out on its own task,
-                    // so a PC that stays off never holds up the new one.
-                    if let Some(u) = pending {
-                        spawn_notice(&core, &node, u);
-                    }
-                    if lock(&core.inner.paused).is_none() {
-                        break Target::Pc(p);
-                    }
-                }
-                Ok((None, None)) => {}
-                Err(e) => core.emit_error(e.kind(), &format!("could not read the paired device: {e}")),
-            }
-            core.inner.wake.notified().await;
-        };
-        let pc = match target {
-            Target::Pc(p) => p,
-            Target::Unpair(u) => {
-                match deliver_unpair(&core, &node, &u).await {
-                    Ok(()) => backoff = Duration::from_secs(1),
-                    Err(e) => {
-                        tracing::debug!("could not tell the PC about the unpair yet: {e}");
-                        tokio::select! {
-                            _ = tokio::time::sleep(backoff) => {}
-                            _ = core.inner.wake.notified() => { backoff = Duration::from_secs(1); }
-                        }
-                        backoff = (backoff * 2).min(Duration::from_secs(30));
-                    }
+        let job = { read_job(&lock(&core.inner.db).conn, id) };
+        match job {
+            Err(e) => core.emit_error(e.kind(), &format!("could not read the linked device: {e}")),
+            Ok(Job::Nothing) => {
+                // Decide under the map's lock: a notice added after the read above must not be
+                // missed by a task that is about to end (the spawner takes the same lock).
+                let mut map = lock(&tasks);
+                if matches!(read_job(&lock(&core.inner.db).conn, id), Ok(Job::Nothing)) {
+                    map.remove(&id);
+                    return;
                 }
                 continue;
             }
-        };
-        // A refusal stays on screen until a handshake succeeds; do not flip it to Connecting on every retry.
-        if lock(&core.inner.status).state != Some(SyncState::Refused) {
-            core.set_state(SyncState::Connecting, None);
-        }
-        let addrs: Vec<SocketAddr> = pc.addresses.iter().filter_map(|a| a.parse().ok()).collect();
-        match node.dial(pc.id.0, &addrs, ALPN_SYNC, DIAL_TIMEOUT).await {
-            Ok(conn) => {
-                reported_not_local = None;
-                let started = Instant::now();
-                run_session(core.clone(), Arc::new(conn), true).await;
-                if started.elapsed() >= STABLE_SESSION {
+            Ok(Job::Notice(u)) => match deliver_unpair(&core, &node, &u).await {
+                Ok(()) => {
                     backoff = Duration::from_secs(1);
+                    away_since = None;
+                    continue;
                 }
+                Err(e) => {
+                    tracing::debug!("could not tell the PC about the unlink yet: {e}");
+                    away_since.get_or_insert_with(Instant::now);
+                }
+            },
+            Ok(Job::Link(_)) if lock(&core.inner.paused).is_some() => {
+                wake.fired().await;
+                continue;
             }
-            Err(NetError::NotLocal(addr)) => {
-                // The stored address is not on the local network: no retry can fix that.
-                if reported_not_local.as_deref() != Some(addr.as_str()) {
-                    report_not_local(&core, &addr, "not connecting, address");
-                    reported_not_local = Some(addr);
+            Ok(Job::Link(pc)) => {
+                // A refusal stays on screen until a handshake succeeds; do not flip it to Connecting on every retry.
+                if core.peer_state(id) != Some(SyncState::Refused) {
+                    core.set_state(id, SyncState::Connecting, None);
                 }
-                if lock(&core.inner.status).state != Some(SyncState::Refused) {
-                    core.set_state(SyncState::Offline, None);
-                }
-            }
-            Err(e) => {
-                tracing::debug!("PC not reachable: {e}");
-                // The status says so ("PC not found"); a log line per retry is not an error event.
-                let keep = lock(&core.inner.status).state == Some(SyncState::Refused);
-                if !keep {
-                    core.set_state(SyncState::Offline, None);
+                let addrs: Vec<SocketAddr> = pc.addresses.iter().filter_map(|a| a.parse().ok()).collect();
+                match node.dial(id.0, &addrs, ALPN_SYNC, DIAL_TIMEOUT).await {
+                    Ok(conn) => {
+                        reported_not_local = None;
+                        away_since = None;
+                        let started = Instant::now();
+                        run_session(core.clone(), Arc::new(conn), true).await;
+                        if started.elapsed() >= STABLE_SESSION {
+                            backoff = Duration::from_secs(1);
+                        }
+                    }
+                    Err(NetError::NotLocal(addr)) => {
+                        // The stored address is not on the local network: no retry can fix that.
+                        if reported_not_local.as_deref() != Some(addr.as_str()) {
+                            report_not_local(&core, &addr, "not connecting, address");
+                            reported_not_local = Some(addr);
+                        }
+                        away_since.get_or_insert_with(Instant::now);
+                        if core.peer_state(id) != Some(SyncState::Refused) {
+                            core.set_state(id, SyncState::Offline, None);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!("PC not reachable: {e}");
+                        away_since.get_or_insert_with(Instant::now);
+                        // The status says so ("PC not found"); a log line per retry is not an error event.
+                        if core.peer_state(id) != Some(SyncState::Refused) {
+                            core.set_state(id, SyncState::Offline, None);
+                        }
+                    }
                 }
             }
         }
         tokio::select! {
             _ = tokio::time::sleep(backoff) => {}
-            _ = core.inner.wake.notified() => { backoff = Duration::from_secs(1); }
+            _ = wake.fired() => { backoff = Duration::from_secs(1); }
         }
-        backoff = (backoff * 2).min(Duration::from_secs(30));
+        let cap = if away_since.is_some_and(|t| t.elapsed() >= AWAY_AFTER) { AWAY_DIAL_BACKOFF } else { DIAL_BACKOFF };
+        backoff = (backoff * 2).min(cap);
     }
 }
 
 // ---------- unpair ----------
-
-enum Target {
-    Pc(DeviceRow),
-    Unpair(crate::store::PendingUnpair),
-}
 
 /// Phone: dial the PC we unpaired from while apart and tell it (one Unpair frame, no sync).
 /// Delivered also when the PC refuses us as unknown: it no longer pairs this phone, which is
@@ -333,72 +406,21 @@ async fn deliver_unpair(core: &Core, node: &Node, pending: &crate::store::Pendin
         return sent;
     }
     // Clear only the notice just delivered: a newer one for another PC stays.
-    match core.with_ctx(|c, _| match crate::store::get_pending_unpair(c)? {
-        Some(p) if p.peer == pending.peer => crate::store::clear_pending_unpair(c),
-        _ => Ok(()),
-    }) {
+    match core.with_ctx(|c, _| crate::store::remove_pending_unpair(c, pending.peer_id()?)) {
         Ok(()) => core.emit_status(),
         Err(e) => core.emit_error(e.kind(), &format!("could not clear the unpair notice: {e}")),
     }
     Ok(())
 }
 
-/// Phone: keep trying to tell a replaced PC about the unpair, beside the live link to the new one.
-/// Ends when the notice is delivered or void (cleared, replaced) or the network stops.
-fn spawn_notice(core: &Core, node: &Node, first: crate::store::PendingUnpair) {
-    use std::sync::atomic::Ordering::SeqCst;
-    if core.inner.notice_running.swap(true, SeqCst) {
-        return;
-    }
-    let (task_core, node) = (core.clone(), node.clone());
-    let handle = tokio::spawn(async move {
-        let core = task_core;
-        let mut pending = first;
-        let mut backoff = Duration::from_secs(1);
-        loop {
-            if lock(&core.inner.net).is_none() {
-                break;
-            }
-            match deliver_unpair(&core, &node, &pending).await {
-                Ok(()) => break,
-                Err(e) => {
-                    tracing::debug!("could not tell the old PC about the unpair yet: {e}");
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(Duration::from_secs(30));
-                }
-            }
-            // Void if it was cleared or replaced meanwhile.
-            let still = lock(&core.inner.db);
-            match crate::store::get_pending_unpair(&still.conn) {
-                Ok(Some(p)) => pending = p,
-                Ok(None) => break,
-                Err(e) => {
-                    drop(still);
-                    core.emit_error(e.kind(), &format!("could not read the unpair notice: {e}"));
-                    break;
-                }
-            }
-        }
-        core.inner.notice_running.store(false, SeqCst);
-    });
-    // The task belongs to this network instance: `stop` aborts it with the loops, so a restarted
-    // network never inherits a task that holds the old, shut-down node.
-    match lock(&core.inner.net).as_mut() {
-        Some(ns) => ns.tasks.push(handle),
-        None => {
-            handle.abort();
-            core.inner.notice_running.store(false, SeqCst);
-        }
-    }
-}
-
 /// Local side of an unpair (also run when the peer tells us it unpaired). Files stay.
 /// Ok(true) = unpaired now, Ok(false) = nothing was paired. A failure is returned (and shown):
 /// callers that are about to tell the peer must not do so when this device is still paired.
-fn unpair_local(core: &Core, peer: DeviceId) -> Result<bool> {
+/// `by_peer`: the other device did it, so this one only found out.
+fn unpair_local(core: &Core, peer: DeviceId, by_peer: bool) -> Result<bool> {
     let r = core.with_ctx(|c, ctx| {
         if crate::store::is_paired(c, peer)? {
-            ops::unpair(c, ctx, peer)?;
+            ops::unpair(c, ctx, peer, by_peer)?;
             Ok(true)
         } else {
             Ok(false)
@@ -406,8 +428,10 @@ fn unpair_local(core: &Core, peer: DeviceId) -> Result<bool> {
     });
     match &r {
         Ok(true) => {
-            core.inner.storage_low.store(false, std::sync::atomic::Ordering::SeqCst);
-            core.emit(Event::Pairing(PairingEvent::Unpaired { peer }));
+            core.forget_peer(peer);
+            // Nothing downloads from this device any more: it holds nothing back.
+            set_storage_low(core, peer, None);
+            core.emit(Event::Pairing(PairingEvent::Unpaired { peer, by_peer }));
             core.emit(Event::ActivityAdded);
             core.emit_status();
         }
@@ -417,16 +441,30 @@ fn unpair_local(core: &Core, peer: DeviceId) -> Result<bool> {
     r
 }
 
+/// Unpair the one linked device. Several linked: the caller must name one (`unpair_peer`).
 pub(crate) async fn unpair(core: &Core) -> Result<()> {
+    let linked = {
+        let db = lock(&core.inner.db);
+        crate::store::paired_peers(&db.conn)?
+    };
+    match linked.as_slice() {
+        [] => Err(CoreError::NotPaired),
+        [one] => unpair_peer(core, one.id).await,
+        _ => Err(CoreError::Invalid("name the device to unlink".into())),
+    }
+}
+
+/// Unpair `peer`: this device first, then tell it (live, or later through a notice).
+pub(crate) async fn unpair_peer(core: &Core, peer: DeviceId) -> Result<()> {
     let peer = {
         let db = lock(&core.inner.db);
-        crate::store::paired_peer(&db.conn)?
+        crate::store::get_device(&db.conn, peer)?.filter(|d| d.paired_at.is_some() && d.unpaired_at.is_none())
     }
     .ok_or(CoreError::NotPaired)?;
     // If this device cannot unpair, say so and tell nobody: the peer would drop the pairing while
     // this device kept it, and the caller would see success.
-    unpair_local(core, peer.id)?;
-    let cmd = lock(&core.inner.active).as_ref().filter(|a| a.conn.peer() == peer.id.0).map(|a| a.cmd.clone());
+    unpair_local(core, peer.id, false)?;
+    let cmd = lock(&core.inner.active).get(&peer.id).map(|a| a.cmd.clone());
     let mut delivered = false;
     if let Some(cmd) = cmd {
         let (dtx, drx) = oneshot::channel();
@@ -439,9 +477,9 @@ pub(crate) async fn unpair(core: &Core) -> Result<()> {
     // never dials the PC again, so it keeps a notice and delivers it once the PC is reachable.
     if !delivered && core.inner.cfg.role == Role::Phone {
         let pending = crate::store::PendingUnpair { peer: hex::encode(peer.id.0), addresses: peer.addresses.clone() };
-        core.with_ctx(|c, _| crate::store::set_pending_unpair(c, &pending))?;
+        core.with_ctx(|c, _| crate::store::add_pending_unpair(c, &pending))?;
         core.emit_status();
-        core.inner.wake.notify_one();
+        core.inner.wake.fire();
     }
     Ok(())
 }
@@ -462,26 +500,29 @@ enum Flow {
 pub(crate) async fn run_session(core: Core, conn: Arc<PeerConn>, dialer: bool) {
     let gen = core.inner.generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-    // A second connection from the same paired peer replaces the first (phone changed network).
-    let old = lock(&core.inner.active).replace(Active { gen, conn: conn.clone(), cmd: cmd_tx });
+    let peer = DeviceId(conn.peer());
+    // A second connection from the same paired peer replaces the first (phone changed network);
+    // the sessions with other devices stay.
+    let old = lock(&core.inner.active).insert(peer, Active { gen, conn: conn.clone(), cmd: cmd_tx });
     if let Some(old) = old {
         old.conn.close(close::NORMAL, "replaced by a newer connection");
     }
-    let peer = DeviceId(conn.peer());
     let (end, refused) = drive(&core, &conn, dialer, cmd_rx).await;
     conn.close(close::NORMAL, "session ended");
     // "Last seen" is the last contact: written when the session ends too, not only at the hello,
     // so a long session does not leave the time at its start (Settings showed "never" / stale).
-    if matches!(core.with_ctx(|c, _| crate::store::is_paired(c, peer)), Ok(true)) {
+    let still_paired = matches!(core.with_ctx(|c, _| crate::store::is_paired(c, peer)), Ok(true));
+    if still_paired {
         if let Err(e) = core.with_ctx(|c, ctx| crate::store::touch_last_seen(c, peer, ctx.now)) {
             core.emit_error(e.kind(), &format!("could not save the last seen time: {e}"));
         }
     }
+    // Take the entry out only if it is still this session's: a newer one for the same peer stays.
     let current = {
         let mut a = lock(&core.inner.active);
-        let mine = a.as_ref().is_some_and(|x| x.gen == gen);
+        let mine = a.get(&peer).is_some_and(|x| x.gen == gen);
         if mine {
-            *a = None;
+            a.remove(&peer);
         }
         mine
     };
@@ -491,7 +532,7 @@ pub(crate) async fn run_session(core: Core, conn: Arc<PeerConn>, dialer: bool) {
         End::Net(NetError::ClosedByPeer { code, reason }) if code == close::NOT_PAIRED || code == close::UNPAIRED => {
             tracing::info!("the other device unpaired us: {reason}");
             // A failure is already shown by unpair_local; the pairing stays until a retry works.
-            let _ = unpair_local(&core, peer);
+            let _ = unpair_local(&core, peer, true);
         }
         End::Net(NetError::ClosedByPeer { code, reason }) if code == close::NORMAL => tracing::debug!("peer closed: {reason}"),
         End::Net(e @ (NetError::Timeout(_) | NetError::Stream(_))) => tracing::debug!("connection lost: {e}"),
@@ -499,11 +540,16 @@ pub(crate) async fn run_session(core: Core, conn: Arc<PeerConn>, dialer: bool) {
     }
     if current {
         // Nothing downloads without a session: the storage-low banner would outlive the user
-        // freeing the space. The next session's first pass sets it again if it still holds.
-        set_storage_low(&core, None);
-        match refused {
-            Some(text) => core.set_state(SyncState::Refused, Some(text)),
-            None => core.set_state(SyncState::Offline, None),
+        // freeing the space. The next session's first pass sets it again if it still holds. What
+        // another device's session holds back stays.
+        set_storage_low(&core, peer, None);
+        match (still_paired, refused) {
+            (false, _) => core.forget_peer(peer),
+            (true, Some(text)) => core.set_state(peer, SyncState::Refused, Some(text)),
+            (true, None) => core.set_state(peer, SyncState::Offline, None),
+        }
+        if !still_paired {
+            core.emit_status();
         }
     }
 }
@@ -604,7 +650,9 @@ async fn drive(core: &Core, conn: &Arc<PeerConn>, dialer: bool, mut cmd_rx: mpsc
             return (End::Core(e), None);
         }
     }
-    core.set_state(SyncState::Syncing, None);
+    core.set_state(peer, SyncState::Syncing, None);
+    let mut local_changed = inner.local_changed.subscribe();
+    let mut kick = inner.kick.subscribe();
 
     let (ctl_tx, ctl_rx) = oneshot::channel();
     let _streams = AbortOnDrop(tokio::spawn(stream_task(core.clone(), conn.clone(), if dialer { None } else { Some(ctl_tx) })));
@@ -636,6 +684,13 @@ async fn drive(core: &Core, conn: &Arc<PeerConn>, dialer: bool, mut cmd_rx: mpsc
 
     let mut sess = Session::new(inner.cfg.self_id, peer, inner.cfg.role, &inner.cfg.app_version);
     sess.proto = inner.proto.load(std::sync::atomic::Ordering::SeqCst);
+    // Named only beside other PCs: with one linked, "the PC" says which one.
+    {
+        let db = lock(&inner.db);
+        if crate::store::count_paired_except(&db.conn, peer).unwrap_or(0) > 0 {
+            sess.peer_name = crate::store::get_device(&db.conn, peer).ok().flatten().map(|d| d.name);
+        }
+    }
     if dialer {
         let hello = {
             let db = lock(&inner.db);
@@ -689,7 +744,7 @@ async fn drive(core: &Core, conn: &Arc<PeerConn>, dialer: bool, mut cmd_rx: mpsc
                     }
                 }
             }
-            _ = inner.local_changed.notified() => {
+            _ = local_changed.fired() => {
                 busy = true;
                 let m = {
                     let db = lock(&inner.db);
@@ -708,7 +763,7 @@ async fn drive(core: &Core, conn: &Arc<PeerConn>, dialer: bool, mut cmd_rx: mpsc
                 schedule(core, conn, peer, &mut fetcher, &fetch_tx);
                 evaluate(core, &sess, &refused);
             }
-            _ = inner.kick.notified() => {
+            _ = kick.fired() => {
                 schedule(core, conn, peer, &mut fetcher, &fetch_tx);
                 evaluate(core, &sess, &refused);
             }
@@ -717,7 +772,7 @@ async fn drive(core: &Core, conn: &Arc<PeerConn>, dialer: bool, mut cmd_rx: mpsc
                 fetcher.finish(&done, inner.retry_base_ms.load(std::sync::atomic::Ordering::SeqCst));
                 match done.outcome {
                     FetchOutcome::Done => {
-                        inner.local_changed.notify_one();
+                        inner.local_changed.fire();
                         core.emit(Event::ItemsChanged { ids: vec![done.id] });
                         core.emit(Event::ActivityAdded);
                     }
@@ -792,11 +847,11 @@ async fn apply_step(core: &Core, conn: &Arc<PeerConn>, sess: &Session, tx: &mut 
         // A failure is already shown by unpair_local. A phone retries on its next dial (this PC
         // answers NOT_PAIRED); a PC keeps the pairing until the user unpairs it there (an
         // app-level acknowledgement to the phone would need a wire change).
-        let _ = unpair_local(core, peer);
+        let _ = unpair_local(core, peer, true);
     }
     if let Some(text) = &step.refused {
         *refused = Some(text.clone());
-        core.set_state(SyncState::Refused, Some(text.clone()));
+        core.set_state(peer, SyncState::Refused, Some(text.clone()));
         core.emit_error("version_mismatch", text);
     }
     if !step.changed_items.is_empty() {
@@ -813,6 +868,11 @@ async fn apply_step(core: &Core, conn: &Arc<PeerConn>, sess: &Session, tx: &mut 
     }
     for (kind, message) in &step.errors {
         core.emit_error(kind, message);
+    }
+    if step.applied > 0 && (step.wrote_local || step.relayed) {
+        // Before the writes below: the rows are committed, so the other sessions must hear of them
+        // even when this link drops now (they are already synced and would not look again).
+        core.inner.local_changed.fire();
     }
     for m in &step.send {
         if let Err(e) = write_frame(tx, m).await {
@@ -833,27 +893,35 @@ async fn apply_step(core: &Core, conn: &Arc<PeerConn>, sess: &Session, tx: &mut 
         if let Err(e) = swept {
             core.emit_error(e.kind(), &format!("sweep failed: {e}"));
         }
-        if step.wrote_local {
-            core.inner.local_changed.notify_one();
-        }
     }
     if step.synced || (step.applied > 0 && sess.synced) {
-        core.mark_synced(now);
+        core.mark_synced(peer, now);
     }
     Flow::Continue
 }
 
-/// Status from what the session knows: Synced only when the digest matched and nothing is
-/// left to download.
+/// The device whose files `peer`'s session may ask for: that peer, and only the files it holds.
+/// None = any file (a test plays an older build that never checks).
+fn holder(core: &Core, peer: DeviceId) -> Option<DeviceId> {
+    (!core.inner.no_holder_test.load(std::sync::atomic::Ordering::SeqCst)).then_some(peer)
+}
+
+/// Status of this device's session from what it knows: Synced only when the digest matched and
+/// nothing is left to download FROM THIS DEVICE. A Pending file that another device holds does not
+/// keep this one in Syncing: it waits for that device, not for this one.
 fn evaluate(core: &Core, sess: &Session, refused: &Option<String>) {
     if refused.is_some() || sess.phase == Phase::AwaitHello {
         return;
     }
     let pending = {
         let db = lock(&core.inner.db);
-        crate::store::items_in_state(&db.conn, &[LocalFileState::Pending], 1).map(|v| !v.is_empty()).unwrap_or(true)
+        match holder(core, sess.peer) {
+            Some(p) => crate::store::pending_held_by(&db.conn, p),
+            None => crate::store::items_in_state(&db.conn, &[LocalFileState::Pending], 1).map(|v| !v.is_empty()),
+        }
+        .unwrap_or(true)
     };
-    core.set_state(if sess.synced && !pending { SyncState::Synced } else { SyncState::Syncing }, None);
+    core.set_state(sess.peer, if sess.synced && !pending { SyncState::Synced } else { SyncState::Syncing }, None);
 }
 
 // ---------- blob downloads ----------
@@ -945,17 +1013,19 @@ struct GuardPass {
     /// Set when the pass stopped because every slot was taken: the scan did not reach the end, so
     /// "nothing held back" says nothing about the items behind the last pick.
     slots_full: bool,
+    /// Only items this device holds are picked (None: any item).
+    holder: Option<DeviceId>,
 }
 
 impl GuardPass {
-    fn new(core: &Core) -> GuardPass {
-        GuardPass { phone: core.inner.cfg.role == Role::Phone, placement: core.inner.placement.clone(), held_back: None, slots_full: false }
+    fn new(core: &Core, holder: Option<DeviceId>) -> GuardPass {
+        GuardPass { phone: core.inner.cfg.role == Role::Phone, placement: core.inner.placement.clone(), held_back: None, slots_full: false, holder }
     }
 
     /// No guard (tests that are not about the guard).
     #[cfg(test)]
     fn off(core: &Core) -> GuardPass {
-        GuardPass { phone: false, ..GuardPass::new(core) }
+        GuardPass { phone: false, ..GuardPass::new(core, None) }
     }
 }
 
@@ -974,7 +1044,8 @@ struct HashGuard {
 impl Drop for HashGuard {
     fn drop(&mut self) {
         lock(&self.core.inner.fetching).remove(&self.hash);
-        self.core.inner.kick.notify_one();
+        // Every session looks again: a freed slot goes to whichever one has work.
+        self.core.inner.kick.fire();
     }
 }
 
@@ -1042,7 +1113,7 @@ fn pick_into(
         // under the DB lock.
         let mut guard_skips: u32 = 0;
         'pages: loop {
-            let page = crate::store::items_in_state_after(c, &[state], after, PICK_PAGE)?;
+            let page = crate::store::items_in_state_after(c, &[state], after, PICK_PAGE, gp.holder)?;
             for (captured_at, id) in &page {
                 after = Some((*captured_at, *id));
                 if out.len() >= slots {
@@ -1127,7 +1198,14 @@ fn pick_into(
     Ok(())
 }
 
-/// Start downloads for Pending items, oldest first, up to `MAX_PARALLEL_FETCH`.
+/// Downloads this session may start now: its own limit, and what is left of the device-wide one
+/// (every live download task holds a claim in `fetching`, whichever session started it).
+fn free_slots(f: &Fetcher, fetching: &Mutex<HashMap<BlobHash, u64>>) -> usize {
+    MAX_PARALLEL_FETCH.saturating_sub(f.in_flight.len()).min(MAX_TOTAL_FETCH.saturating_sub(lock(fetching).len()))
+}
+
+/// Start downloads for Pending items, oldest first, up to `MAX_PARALLEL_FETCH` per session and
+/// `MAX_TOTAL_FETCH` on the device. Only items the session's peer holds are asked of it.
 ///
 /// Phone storage guard (0.2.0): `Settings.storage_guard_bytes` is enforced here, on the phone
 /// only. Nothing is downloaded while the free space is below the guard, and one item is skipped
@@ -1143,13 +1221,20 @@ fn schedule(core: &Core, conn: &Arc<PeerConn>, peer: DeviceId, f: &mut Fetcher, 
     }
     let now = core.now();
     let t = Instant::now();
-    f.last_schedule = t;
-    let slots = MAX_PARALLEL_FETCH - f.in_flight.len();
-    let mut gp = GuardPass::new(core);
+    let mut gp = GuardPass::new(core, holder(core, peer));
     let picked = {
         let db = lock(&core.inner.db);
+        // The device-wide count is read under the lock that serialises picking, so two sessions
+        // cannot both take the last slot.
+        let slots = free_slots(f, &core.inner.fetching);
+        if slots == 0 {
+            return;
+        }
+        f.last_schedule = t;
         pick_downloads(&db.conn, f, &core.inner.fetching, slots, now, t, &mut gp)
     };
+    let claimed = lock(&core.inner.fetching).len() as u64;
+    core.inner.fetch_peak.fetch_max(claimed, std::sync::atomic::Ordering::SeqCst);
     let picked = match picked {
         Ok(c) => c,
         Err(e) => {
@@ -1160,7 +1245,7 @@ fn schedule(core: &Core, conn: &Arc<PeerConn>, peer: DeviceId, f: &mut Fetcher, 
     // A pass that filled its slots may not have reached a held item: it can turn the flag on but
     // never off, so the flag does not flap while small items are picked ahead of a big one.
     if gp.phone && (gp.held_back.is_some() || !gp.slots_full) {
-        set_storage_low(core, gp.held_back.take());
+        set_storage_low(core, peer, gp.held_back.take());
     }
     for (id, hash, was_lost) in picked {
         f.in_flight.insert(id);
@@ -1196,12 +1281,21 @@ fn load_for_fetch(core: &Core, id: ItemId, claimed: BlobHash) -> Result<Option<(
     }
 }
 
-/// Turn the storage-guard flag on or off. On the OFF -> ON edge: one activity row and one error
-/// event (never one per 30 s pass); every change refreshes the status the UIs show.
-fn set_storage_low(core: &Core, why: Option<String>) {
+/// Say whether `peer`'s session has a download held back by the storage guard. The flag the UIs
+/// show is on while any session holds one back. On the OFF -> ON edge: one activity row and one
+/// error event (never one per 30 s pass); every change refreshes the status the UIs show.
+fn set_storage_low(core: &Core, peer: DeviceId, why: Option<String>) {
     use std::sync::atomic::Ordering::SeqCst;
-    let low = why.is_some();
-    let was = core.inner.storage_low.swap(low, SeqCst);
+    let (low, was) = {
+        let mut peers = lock(&core.inner.low_peers);
+        if why.is_some() {
+            peers.insert(peer);
+        } else {
+            peers.remove(&peer);
+        }
+        let low = !peers.is_empty();
+        (low, core.inner.storage_low.swap(low, SeqCst))
+    };
     if low && !was {
         let text = "PHONE STORAGE LOW - downloads wait";
         let detail = format!("{text} ({})", why.unwrap_or_default());
@@ -1509,9 +1603,10 @@ mod tests {
         let f = Fetcher::default();
         let got = pick(&core, &f, 2);
         assert_eq!(got.iter().map(|g| g.0).collect::<Vec<_>>(), vec![items[1].0], "the held item is skipped, the other is picked");
+        let mut kicked = core.inner.kick.subscribe();
         drop(guard);
         assert!(!lock(&core.inner.fetching).contains_key(&held_hash), "freed when the task ends");
-        tokio::time::timeout(Duration::from_millis(200), core.inner.kick.notified()).await.expect("the scheduler was woken");
+        tokio::time::timeout(Duration::from_millis(200), kicked.fired()).await.expect("the scheduler was woken");
         let got = pick(&core, &f, 2);
         assert!(got.iter().any(|g| g.0 == held_id), "now it is picked");
     }
@@ -1571,7 +1666,7 @@ mod tests {
     /// A phone-side guard pass that sees `free` bytes (the default guard is 2 GB).
     fn low_space_pass(dir: &std::path::Path, free: u64) -> GuardPass {
         let inner = AppStorage::new(dir.join("storage")).unwrap();
-        GuardPass { phone: true, placement: Arc::new(LowSpace { inner, free }), held_back: None, slots_full: false }
+        GuardPass { phone: true, placement: Arc::new(LowSpace { inner, free }), held_back: None, slots_full: false, holder: None }
     }
 
     fn pick_with(core: &Core, f: &Fetcher, slots: usize, gp: &mut GuardPass) -> Vec<(ItemId, BlobHash, bool)> {
@@ -1693,12 +1788,10 @@ mod tests {
         assert_eq!(got.iter().map(|g| g.0).collect::<Vec<_>>(), vec![items[1].0], "bytes already written no longer count");
     }
 
-    // The unpair-notice task belongs to the network instance. Stopping the network
-    // ends it at once, so a restarted network can start its own (a task that outlived the stop kept
-    // the shut-down node, and its running flag kept the new task from ever starting).
+    // The dial tasks belong to the network instance. Stopping the network ends them at once, so a
+    // restarted network can start its own (a task that outlived the stop kept the shut-down node).
     #[tokio::test]
-    async fn stopping_the_network_ends_the_notice_task() {
-        use std::sync::atomic::Ordering::SeqCst;
+    async fn stopping_the_network_ends_the_device_tasks() {
         let dir = tempfile::tempdir().unwrap();
         let mut secret = [0u8; 32];
         getrandom::fill(&mut secret).unwrap();
@@ -1711,19 +1804,106 @@ mod tests {
         };
         let storage = AppStorage::new(dir.path().join("storage")).unwrap();
         let core = Core::open(cfg, Arc::new(TestClock::new(T0)), Arc::new(storage)).unwrap().0;
+        // Two old PCs that nobody answers for: each task dials (5 s) and backs off.
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let mut other = [0u8; 32];
+            getrandom::fill(&mut other).unwrap();
+            let id = crate::facade::device_id_from_secret(&other);
+            let pending = crate::store::PendingUnpair { peer: hex::encode(id.0), addresses: vec!["127.0.0.1:9".into()] };
+            core.debug_conn(|c| crate::store::add_pending_unpair(c, &pending).unwrap());
+            ids.push(id);
+        }
         core.start_network(NetworkConfig { bind: "127.0.0.1:0".parse().unwrap(), mdns: false, secret_key: secret }).await.unwrap();
-        let mut other = [0u8; 32];
-        getrandom::fill(&mut other).unwrap();
-        // An old PC that nobody answers for: the task dials (5 s) and backs off.
-        let pending = crate::store::PendingUnpair { peer: hex::encode(crate::facade::device_id_from_secret(&other).0), addresses: vec!["127.0.0.1:9".into()] };
-        let node = lock(&core.inner.net).as_ref().unwrap().node.clone();
-        let before = lock(&core.inner.net).as_ref().unwrap().tasks.len();
-        spawn_notice(&core, &node, pending);
-        assert!(core.inner.notice_running.load(SeqCst), "the task is running");
-        assert_eq!(lock(&core.inner.net).as_ref().unwrap().tasks.len(), before + 1, "the task is registered with this network instance, so stop aborts it");
+        let devices = lock(&core.inner.net).as_ref().unwrap().devices.clone();
+        until_true(|| lock(&devices).len() == 2).await;
+        let handles: Vec<bool> = ids.iter().map(|id| lock(&devices).contains_key(id)).collect();
+        assert_eq!(handles, vec![true, true], "one task per device owed a notice");
         tokio::time::sleep(Duration::from_millis(300)).await;
         core.stop_network().await;
-        assert!(!core.inner.notice_running.load(SeqCst), "stopping the network ended the task and freed the flag");
+        assert!(lock(&devices).is_empty(), "stopping the network ended every task");
+    }
+
+    async fn until_true(mut f: impl FnMut() -> bool) {
+        for _ in 0..100 {
+            if f() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("condition not reached in 2 s");
+    }
+
+    // One fire reaches every listener, and a listener that was busy when it fired still sees it.
+    #[tokio::test]
+    async fn signal_wakes_every_subscriber() {
+        let s = crate::facade::Signal::new();
+        let (mut a, mut b) = (s.subscribe(), s.subscribe());
+        s.fire();
+        tokio::time::timeout(Duration::from_millis(200), a.fired()).await.expect("first listener woke");
+        tokio::time::timeout(Duration::from_millis(200), b.fired()).await.expect("second listener woke");
+        // Nothing fired since: both wait.
+        assert!(tokio::time::timeout(Duration::from_millis(50), a.fired()).await.is_err());
+        // A fire while the listener is not waiting is kept, once however many there were.
+        s.fire();
+        s.fire();
+        tokio::time::timeout(Duration::from_millis(200), a.fired()).await.expect("a fire while busy is kept");
+        assert!(tokio::time::timeout(Duration::from_millis(50), a.fired()).await.is_err());
+        // A listener that subscribes later does not see an old fire.
+        let mut late = s.subscribe();
+        assert!(tokio::time::timeout(Duration::from_millis(50), late.fired()).await.is_err());
+    }
+
+    // The device-wide limit counts the claims of every session, not only this session's downloads.
+    #[tokio::test]
+    async fn total_fetch_cap_counts_claims_of_all_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = open_core(dir.path());
+        let items = add_items(&core, 6, LocalFileState::Pending);
+        let f = Fetcher::default();
+        assert_eq!(free_slots(&f, &core.inner.fetching), MAX_PARALLEL_FETCH, "an idle device gives the session its own limit");
+        // Two other sessions run one download each: this session, with nothing of its own running,
+        // may start only what is left of the total.
+        lock(&core.inner.fetching).insert(items[0].1, 100);
+        lock(&core.inner.fetching).insert(items[1].1, 100);
+        assert_eq!(free_slots(&f, &core.inner.fetching), MAX_TOTAL_FETCH - 2);
+        lock(&core.inner.fetching).insert(items[2].1, 100);
+        assert_eq!(free_slots(&f, &core.inner.fetching), 0, "the total is used up");
+        // The pick itself never claims past the slots it was given.
+        lock(&core.inner.fetching).clear();
+        let got = pick(&core, &f, free_slots(&f, &core.inner.fetching));
+        assert_eq!(got.len(), MAX_PARALLEL_FETCH);
+        assert!(lock(&core.inner.fetching).len() <= MAX_TOTAL_FETCH);
+    }
+
+    // A peer is asked only for files it holds: its own, or one it has confirmed with a receipt.
+    #[tokio::test]
+    async fn only_files_the_peer_holds_are_picked() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = open_core(dir.path());
+        let items = add_items(&core, 3, LocalFileState::Pending);
+        let (pc_a, pc_b) = (dev(0xA1), dev(0xB1));
+        // Item 0 was written by A; item 1 was written by B but the phone's peer A confirmed it;
+        // item 2 only B holds.
+        core.debug_conn(|c| {
+            for (n, who) in [(0usize, pc_a), (1, pc_b), (2, pc_b)] {
+                let (mut rec, _) = store::get_item(c, items[n].0).unwrap().unwrap();
+                rec.content.val.hash = items[n].1;
+                rec.content.v.device = who;
+                store::update_item(c, &rec).unwrap();
+            }
+            store::insert_receipt(c, &crate::model::ReceiptRecord { hash: items[1].1, device: pc_a, received_at: T0 }, T0).unwrap();
+        });
+        let picked = |holder: Option<DeviceId>| {
+            let mut gp = GuardPass::off(&core);
+            gp.holder = holder;
+            let got = core.debug_conn(|c| pick_downloads(c, &Fetcher::default(), &core.inner.fetching, 3, T0, Instant::now(), &mut gp).unwrap());
+            lock(&core.inner.fetching).clear();
+            got.into_iter().map(|g| g.0).collect::<Vec<_>>()
+        };
+        assert_eq!(picked(Some(pc_a)), vec![items[0].0, items[1].0]);
+        assert_eq!(picked(Some(pc_b)), vec![items[1].0, items[2].0]);
+        assert_eq!(picked(None).len(), 3, "no holder test: everything is asked for");
     }
 
     // Only a fully acknowledged frame counts as delivered.

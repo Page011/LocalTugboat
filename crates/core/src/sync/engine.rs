@@ -12,10 +12,12 @@
 //!    Same on the receiving side of a Refuse. Never a silent no-sync.
 //! S3 Lamport catch-up: store::observe_lamport(peer max_lamport) before any local write.
 //! S4 Cursor None -> Pull{Snapshot{after: None}}; else Pull{Seq{since: last_seq_pulled}}.
-//!    On receiving a Pull{Seq{since}}: store::set_acked(peer, since) and trim_log(since)
-//!    (the peer has everything up to since). A since above our head means we were restored
-//!    from an older backup: the puller is told to restart from a snapshot, because new local
-//!    changes would otherwise reuse seq numbers the peer's cursor is already past.
+//!    On receiving a Pull{Seq{since}}: store::set_acked(peer, since) and trim what every linked
+//!    peer has acked (the peer has everything up to since). A since above our head means we were
+//!    restored from an older backup, and a since below the log floor means the rows it needs were
+//!    trimmed: either way the puller is told to restart from a snapshot, because new local
+//!    changes would otherwise reuse seq numbers the peer's cursor is already past, or a trimmed
+//!    change would be lost. The rows a peer itself sent (relayed by the phone) are never sent back.
 //! S5 Each received Changes/Records page is applied in one transaction, with the cursor update
 //!    inside it, so a crash never leaves the cursor ahead of applied data. A record that fails
 //!    validation is skipped, logged (activity SyncError) and reported; it never blocks the page.
@@ -62,6 +64,8 @@ pub struct Step {
     pub applied: usize,
     /// A local write happened (a delete-vs-keep rewrite): send Notify.
     pub wrote_local: bool,
+    /// Records taken from the peer were logged for the other linked devices: send Notify.
+    pub relayed: bool,
     /// Activity rows were written.
     pub activity: bool,
     /// The handshake was refused: the one-line text for the status.
@@ -90,6 +94,10 @@ pub struct Session {
     /// Our protocol number (wire::PROTO; tests override it to prove the refusal).
     pub proto: u32,
     pub app_version: String,
+    /// The phone logs what it applies from a PC so its other PCs get it (merge M9).
+    pub relay: bool,
+    /// Name of the PC on the other end, for the refusal text on a phone that has several linked.
+    pub peer_name: Option<String>,
     /// Our outstanding Pull, if any (S8 coalescing).
     pub pull_in_flight: Option<PullFrom>,
     pub our_caught_up: bool,
@@ -140,6 +148,8 @@ impl Session {
             phase: Phase::AwaitHello,
             proto: PROTO,
             app_version: app_version.to_string(),
+            relay: role == Role::Phone,
+            peer_name: None,
             pull_in_flight: None,
             our_caught_up: false,
             peer_caught_up: false,
@@ -160,6 +170,15 @@ impl Session {
 
     fn is_dialer(&self) -> bool {
         self.role == Role::Phone
+    }
+
+    /// `refusal_text`, naming the PC on the phone: with several PCs linked, "the PC" does not say
+    /// which one to update.
+    fn refusal_text(&self, r: &Refusal) -> String {
+        match (r, &self.peer_name) {
+            (Refusal::VersionMismatch { update: Role::Pc, .. }, Some(name)) if self.role == Role::Phone => format!("Update Tugboat on {name}"),
+            _ => refusal_text(r),
+        }
     }
 
     /// Our Hello (reads max_lamport and the self device name from the store).
@@ -201,7 +220,7 @@ impl Session {
                 self.on_hello(c, &mut step, proto, &app_version, role, max_lamport, now)?
             }
             Msg::Refuse { reason } => {
-                let text = refusal_text(&reason);
+                let text = self.refusal_text(&reason);
                 activity::log(c, now, Some(self.peer), None, ActivityAction::SyncError, &text)?;
                 step.activity = true;
                 let code = match reason {
@@ -291,7 +310,7 @@ impl Session {
             // S2: the side with the lower protocol number is the one to update.
             let update = if self.proto < proto { self.role } else { role };
             let reason = Refusal::VersionMismatch { ours: self.proto, theirs: proto, app_version: self.app_version.clone(), update };
-            let text = refusal_text(&reason);
+            let text = self.refusal_text(&reason);
             activity::log(c, now, Some(self.peer), None, ActivityAction::SyncError, &format!("{text} (protocol {} here, {proto} there, app {app_version})", self.proto))?;
             step.activity = true;
             step.send.push(Msg::Refuse { reason });
@@ -325,16 +344,21 @@ impl Session {
                     step.send.push(Msg::Changes { records: Vec::new(), next: PullFrom::Snapshot { after: None }, more: true, head });
                     return Ok(());
                 }
+                if since < store::log_floor(c)? {
+                    // The rows this peer still needs were trimmed (it was away longer than the log is kept).
+                    step.send.push(Msg::Changes { records: Vec::new(), next: PullFrom::Snapshot { after: None }, more: true, head });
+                    return Ok(());
+                }
                 store::set_acked(c, self.peer, since)?;
-                store::trim_log(c, since)?;
-                let (keys, last) = store::changes_since(c, since, limit)?;
+                store::trim_log_for_peers(c, now)?;
+                let (keys, last) = store::changes_since(c, since, limit, self.peer)?;
                 let mut records = Vec::with_capacity(keys.len());
                 for k in &keys {
                     if let Some(r) = store::get_record(c, k)? {
                         records.push(r);
                     }
                 }
-                let more = !store::changes_since(c, last, 1)?.0.is_empty();
+                let more = !store::changes_since(c, last, 1, self.peer)?.0.is_empty();
                 (records, PullFrom::Seq { since: last }, more)
             }
             PullFrom::Snapshot { after } => {
@@ -395,7 +419,7 @@ impl Session {
         let mut tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         for r in records {
             let sp = tx.savepoint()?;
-            match merge::apply_remote(&sp, self.self_id, self.peer, r, now) {
+            match merge::apply_remote(&sp, self.self_id, self.peer, r, self.relay, now) {
                 Ok(a) => {
                     // A new receipt changes what the UI shows for every item with that hash (the waiting count, "NOT ON PC" in the Bin); expiry itself never reads it.
                     let by_receipt = match a.changed {
@@ -405,6 +429,7 @@ impl Session {
                     sp.commit()?;
                     step.applied += 1;
                     step.wrote_local |= a.wrote_local;
+                    step.relayed |= a.relayed;
                     if a.conflicts > 0 {
                         step.activity = true;
                     }

@@ -1,6 +1,7 @@
 package app.localtugboat
 
 import android.os.Build
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -16,6 +17,7 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.FilledTonalButton
@@ -32,19 +34,21 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import uniffi.tugboat_ffi.DeviceStatus
 
-/** Connection, background behaviour, Bin days, permissions, storage, log export, unpair. */
+/** Linked devices, background behaviour, Bin days, permissions, storage, log export. */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun SettingsScreen(vm: SnapViewModel, ui: UiState, banners: List<UiLogic.BannerUi>, onBanner: (UiLogic.BannerUi) -> Unit, actions: ShellActions) {
     val hardDenied by vm.hardDenied.collectAsStateWithLifecycle()
     val nowMs by rememberNow(5_000)
-    var confirmUnpair by rememberSaveable { mutableStateOf(false) }
+    var unlinkId by rememberSaveable { mutableStateOf<String?>(null) }
     val cs = MaterialTheme.colorScheme
     val s = ui.settings
     val perms = ui.perms
@@ -54,10 +58,15 @@ fun SettingsScreen(vm: SnapViewModel, ui: UiState, banners: List<UiLogic.BannerU
         Column(Modifier.weight(1f).verticalScroll(rememberScrollState()).navigationBarsPadding().padding(horizontal = 16.dp)) {
             BannerStack(banners, onBanner)
 
+            SectionTitle(UiLogic.linkedHeader(ui.devices))
+            ui.devices.forEach { d -> DeviceRow(d, nowMs, onUnlink = { unlinkId = d.id }) }
+            val link = UiLogic.linkButton(ui.devices)
+            OutlinedButton(onClick = vm::openAddDevice,enabled = link.enabled, modifier = Modifier.fillMaxWidth().defaultMinSize(minHeight = 56.dp).padding(top = 8.dp)) {
+                Text("Link a PC")
+            }
+            link.limitLine?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = cs.error, modifier = Modifier.padding(top = 4.dp)) }
+
             SectionTitle("Connection")
-            Text(ui.paired?.name ?: "Not paired", style = MaterialTheme.typography.titleMedium)
-            SyncLine(ui.status, nowMs, Modifier.padding(top = 2.dp))
-            Spacer(Modifier.height(8.dp))
             Row(
                 Modifier.fillMaxWidth().defaultMinSize(minHeight = 64.dp).semantics(mergeDescendants = true) { stateDescription = if (s?.stayConnected != false) "On" else "Off" },
                 verticalAlignment = Alignment.CenterVertically,
@@ -116,28 +125,53 @@ fun SettingsScreen(vm: SnapViewModel, ui: UiState, banners: List<UiLogic.BannerU
             SectionTitle("About")
             Text("Local Tugboat ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})", style = MaterialTheme.typography.bodyLarge)
 
-            Spacer(Modifier.height(20.dp))
-            OutlinedButton(onClick = { confirmUnpair = true }, enabled = ui.paired != null, modifier = Modifier.fillMaxWidth().defaultMinSize(minHeight = 56.dp)) {
-                Text("Unpair from PC", color = if (ui.paired != null) cs.error else cs.onSurfaceVariant)
-            }
             Spacer(Modifier.height(24.dp))
         }
     }
 
-    if (confirmUnpair) {
+    // The row can vanish while the dialog is open (the PC logged out): the dialog goes with it.
+    val target = ui.devices.firstOrNull { it.id == unlinkId && !it.unlinking }
+    if (target != null) {
         AlertDialog(
-            onDismissRequest = { confirmUnpair = false },
-            title = { Text("Unpair from ${ui.paired?.name ?: "PC"}?") },
-            text = { Text("Photos stay on this phone and on the PC. They stop syncing until you pair again.") },
+            onDismissRequest = { unlinkId = null },
+            title = { Text("Unlink ${target.name}?") },
+            text = { Text("Files stay on both.") },
             confirmButton = {
                 TextButton(onClick = {
-                    confirmUnpair = false
-                    vm.unpair()
-                }) { Text("Unpair", color = cs.error) }
+                    unlinkId = null
+                    vm.unlink(target.id)
+                }) { Text("Unlink", color = cs.error) }
             },
-            dismissButton = { TextButton(onClick = { confirmUnpair = false }) { Text("Cancel") } },
+            dismissButton = { TextButton(onClick = { unlinkId = null }) { Text("Cancel") } },
         )
     }
+}
+
+/** One linked PC: name, one status line (grey when away, red when it needs the user), optional waiting chip, Unlink. */
+@Composable
+private fun DeviceRow(d: DeviceStatus, nowMs: Long, onUnlink: () -> Unit) {
+    val cs = MaterialTheme.colorScheme
+    val line = UiLogic.deviceLine(d, nowMs)
+    Row(Modifier.fillMaxWidth().defaultMinSize(minHeight = 64.dp), verticalAlignment = Alignment.CenterVertically) {
+        Column(Modifier.weight(1f).padding(vertical = 6.dp)) {
+            Text(d.name, style = MaterialTheme.typography.titleMedium)
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (line.problem) {
+                    Chip(line.text, cs.errorContainer, cs.onErrorContainer)
+                } else {
+                    Text(line.text, style = MaterialTheme.typography.bodyMedium, color = cs.onSurfaceVariant)
+                }
+                line.waitingChip?.let { Chip(it, cs.surfaceVariant, cs.onSurfaceVariant) }
+            }
+        }
+        if (line.canUnlink) TextButton(onClick = onUnlink, modifier = Modifier.defaultMinSize(minHeight = Touch)) { Text("Unlink", color = cs.error) }
+    }
+}
+
+/** Filled pill: the whole shape carries the colour, no edge stripe. */
+@Composable
+private fun Chip(text: String, bg: Color, fg: Color) {
+    Text(text, style = MaterialTheme.typography.labelMedium, color = fg, modifier = Modifier.background(bg, RoundedCornerShape(50)).padding(horizontal = 10.dp, vertical = 2.dp))
 }
 
 @Composable

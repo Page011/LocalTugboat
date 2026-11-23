@@ -5,7 +5,7 @@
   import { computeBanners, type BannerAction } from "./banners";
   import { shortPath } from "./format";
 
-  const banners = $derived(computeBanners({ info: app.info, sync: app.sync, library: app.library, firewall: app.firewall, error: app.error, drop: app.dropReport }));
+  const banners = $derived(computeBanners({ info: app.info, sync: app.sync, library: app.library, firewall: app.firewall, error: app.error, drop: app.dropReport, removedByPhone: app.removedByPhone }));
 
   const run: Record<BannerAction, () => unknown> = {
     "fw-fix": () =>
@@ -22,6 +22,7 @@
     "not-synced": () => (app.notSyncedOpen = true),
     "dismiss-error": () => (app.error = null),
     "dismiss-drop": () => (app.dropReport = null),
+    "dismiss-removed": () => (app.removedByPhone = false),
   };
 </script>
 

@@ -343,7 +343,7 @@ async fn an_expired_qr_says_expired() {
     r.shutdown().await;
 }
 
-// A database written by 0.1.x (schema v1, items held on disk) opens as v2, keeps its rows,
+// A database written by 0.1.x (schema v1, items held on disk) opens at the current schema, keeps its rows,
 // leaves a .bak-1, and syncs with a fresh peer to equal digests.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_v1_database_migrates_and_syncs() {
@@ -384,7 +384,7 @@ async fn a_v1_database_migrates_and_syncs() {
     }
     let phone = Dev::open_in(dir, Role::Phone, "Old phone", &clock, secret);
     assert!(data.join("tugboat.db.bak-1").exists(), "the v1 file was copied first");
-    assert_eq!(phone.core.debug_conn(|c| c.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap()), 2);
+    assert_eq!(phone.core.debug_conn(|c| c.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap()), tugboat_core::db::SCHEMA_VERSION as i64);
     assert_eq!(phone.view(item_id).unwrap().name, "old.jpg");
     let pc = Dev::new(Role::Pc, "TEST-PC", &TestClock::new(T0));
     pair(&pc, &phone).await;

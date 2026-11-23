@@ -7,7 +7,7 @@
 //! Threading rules for the Kotlin side (also in apps/android/FFI.md):
 //! - Every method is a plain blocking call. Call them from Dispatchers.IO / a worker thread,
 //!   never from the main thread and never from inside `EventListener.on_event`.
-//! - Only `start_network`, `stop_network`, `pair_with` and `unpair` wait on the network;
+//! - Only `start_network`, `stop_network`, `pair_with` and `unlink` wait on the network;
 //!   the rest only touch SQLite and are fast, except `add_file`, which copies and hashes the
 //!   file (tens of ms for a photo, seconds for a long video).
 //! - `EventListener.on_event` runs on a Rust runtime thread: hand the event to your own
@@ -40,7 +40,7 @@ use tokio::sync::{broadcast::error::RecvError, Notify};
 pub use error::SnapError;
 // Core types that are exported unchanged. Their definitions are restated for UniFFI; the
 // compiler stops the build if core adds a variant or a field and this list is not updated.
-pub use tugboat_core::events::{SyncState, SyncStatus};
+pub use tugboat_core::events::{DeviceStatus, SyncState, SyncStatus};
 pub use tugboat_core::{ActivityAction, FolderKind, LocalFileState, MediaKind, Settings};
 
 uniffi::setup_scaffolding!();
@@ -114,6 +114,20 @@ pub enum ActivityAction {
 }
 
 #[uniffi::remote(Record)]
+pub struct DeviceStatus {
+    pub id: String,
+    pub name: String,
+    pub state: SyncState,
+    pub message: Option<String>,
+    pub paired_at: Option<i64>,
+    pub last_seen_at: Option<i64>,
+    pub last_synced_at: Option<i64>,
+    pub waiting: u32,
+    pub downloading: u32,
+    pub unlinking: bool,
+}
+
+#[uniffi::remote(Record)]
 pub struct SyncStatus {
     pub state: SyncState,
     pub peer_name: Option<String>,
@@ -122,6 +136,7 @@ pub struct SyncStatus {
     pub downloading: u32,
     pub storage_low: bool,
     pub message: Option<String>,
+    pub devices: Vec<DeviceStatus>,
 }
 
 #[uniffi::remote(Record)]
@@ -196,6 +211,8 @@ pub struct ItemInfo {
     pub thumb_path: Option<String>,
     /// In the Bin because it EXPIRED and the PC never confirmed holding it: shown as "NOT ON PC".
     pub never_reached_peer: bool,
+    /// Names of the linked PCs that do not hold this item's file yet.
+    pub missing_on: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, uniffi::Record)]
@@ -299,11 +316,11 @@ pub enum FfiEvent {
     SettingsChanged,
     /// Pairing: the code to show large ("482 913"). The PC owner must see the same.
     PairingCode { code: String, peer_name: String },
-    PairingCompleted { peer_name: String },
+    PairingCompleted { device_id: String, peer_name: String },
     /// `code` is the stable PairError tag ("expired", "secret_reused", ...), `message` one line.
     PairingCancelled { code: String, message: String },
-    /// The PC was unpaired here or on the PC.
-    Unpaired,
+    /// A PC was unlinked here, or logged out on the PC (`by_peer`).
+    Unpaired { device_id: String, by_peer: bool },
     /// Something failed in the background. `kind` is stable snake_case; `message` is one line.
     Error { kind: String, message: String },
     /// The listener fell behind and events were dropped: re-query everything on screen.
@@ -327,6 +344,14 @@ fn item_id(s: &str) -> Result<ItemId, SnapError> {
 
 fn folder_id(s: &str) -> Result<FolderId, SnapError> {
     parse_uuid("folder id", s).map(FolderId)
+}
+
+/// A device id as `DeviceStatus.id` shows it: 64 hex chars.
+fn device_id_of(s: &str) -> Result<DeviceId, SnapError> {
+    let bad = |why: String| SnapError::InvalidInput(format!("device id is not 64 hex characters ({why}): {s:?}"));
+    let raw = hex::decode(s.trim()).map_err(|e| bad(e.to_string()))?;
+    let key: [u8; 32] = raw.try_into().map_err(|r: Vec<u8>| bad(format!("{} bytes", r.len())))?;
+    Ok(DeviceId(key))
 }
 
 fn folder_info(v: FolderView) -> FolderInfo {
@@ -367,6 +392,7 @@ fn item_info(v: ItemView) -> ItemInfo {
         path: v.path,
         thumb_path: v.thumb_path,
         never_reached_peer: v.never_reached_peer,
+        missing_on: v.missing_on,
     }
 }
 
@@ -389,9 +415,9 @@ fn ffi_event(e: Event) -> Option<FfiEvent> {
         Event::ActivityAdded => FfiEvent::ActivityAdded,
         Event::SettingsChanged => FfiEvent::SettingsChanged,
         Event::Pairing(P::Code { code, peer_name }) => FfiEvent::PairingCode { code, peer_name },
-        Event::Pairing(P::Completed { peer_name, .. }) => FfiEvent::PairingCompleted { peer_name },
+        Event::Pairing(P::Completed { peer, peer_name }) => FfiEvent::PairingCompleted { device_id: peer.to_string(), peer_name },
         Event::Pairing(P::Cancelled { code, message }) => FfiEvent::PairingCancelled { code, message },
-        Event::Pairing(P::Unpaired { .. }) => FfiEvent::Unpaired,
+        Event::Pairing(P::Unpaired { peer, by_peer }) => FfiEvent::Unpaired { device_id: peer.to_string(), by_peer },
         Event::Pairing(P::WindowOpen { .. }) => return None,
         Event::Error { kind, message } => FfiEvent::Error { kind, message },
     })
@@ -636,15 +662,11 @@ impl PhoneCore {
         self.pair_cancel.notify_waiters();
     }
 
-    pub fn paired_pc(&self) -> Result<Option<PairedPc>, SnapError> {
-        Ok(self.core.paired_device().map_err(SnapError::from)?.map(paired_pc))
-    }
-
-    /// Unpair the PC. Files stay on the phone. If the PC cannot be told now, the phone keeps
-    /// a notice and tells it when it is reachable (`status().message` says so meanwhile).
-    /// Fails with `NotPaired` when nothing is paired.
-    pub fn unpair(&self) -> Result<(), SnapError> {
-        self.rt().block_on(self.core.unpair()).map_err(SnapError::from)
+    /// Unlink one PC by its id (`DeviceStatus.id`). Files stay on both devices. A PC that cannot
+    /// be told now is told when it is reachable (its `devices` row shows `unlinking` meanwhile). A bad id is `InvalidInput`, an unknown one `NotPaired`.
+    pub fn unlink(&self, device_id: String) -> Result<(), SnapError> {
+        let id = device_id_of(&device_id)?;
+        self.rt().block_on(self.core.unpair_device(id)).map_err(SnapError::from)
     }
 
     // ----- folders, items -----
@@ -825,6 +847,65 @@ mod tests {
         let sink: Arc<dyn EventListener> = Arc::new(Sink(Mutex::new(Vec::new())));
         assert!(matches!(PhoneCore::open(cfg(vec![1; 31], None), sink.clone()), Err(SnapError::InvalidInput(_))), "short key");
         assert!(matches!(PhoneCore::open(cfg(vec![1; 32], Some("nonsense")), sink), Err(SnapError::InvalidInput(_))), "bad bind");
+    }
+
+    #[test]
+    fn status_maps_devices() {
+        let dir = tempfile::tempdir().unwrap();
+        let (phone, _sink) = open_phone(dir.path());
+        assert!(phone.status().devices.is_empty(), "nothing linked yet");
+        let id = DeviceId([0xab; 32]);
+        phone.core.debug_conn(|c| {
+            let row = DeviceRow {
+                id,
+                name: "WORK-PC".into(),
+                is_self: false,
+                role: Role::Pc,
+                paired_at: None,
+                unpaired_at: None,
+                last_seen_at: None,
+                last_synced_at: None,
+                addresses: Vec::new(),
+            };
+            tugboat_core::store::set_paired(c, &row, 1_000).unwrap();
+        });
+        let st = phone.status();
+        assert_eq!(st.devices.len(), 1);
+        let d = &st.devices[0];
+        assert_eq!(d.id, "ab".repeat(32), "64 hex chars");
+        assert_eq!(d.name, "WORK-PC");
+        assert_eq!(d.state, SyncState::Offline, "linked, no connection yet");
+        assert_eq!((d.waiting, d.downloading, d.unlinking), (0, 0, false));
+        assert_eq!(st.peer_name.as_deref(), Some("WORK-PC"));
+        match ffi_event(Event::Sync(st.clone())) {
+            Some(FfiEvent::Sync { status }) => assert_eq!(status, st),
+            other => panic!("expected a Sync event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unpaired_event_carries_id_and_by_peer() {
+        use tugboat_core::events::PairingEvent as P;
+        let id = DeviceId([7; 32]);
+        match ffi_event(Event::Pairing(P::Unpaired { peer: id, by_peer: true })) {
+            Some(FfiEvent::Unpaired { device_id, by_peer }) => assert_eq!((device_id, by_peer), (id.to_string(), true)),
+            other => panic!("got {other:?}"),
+        }
+        match ffi_event(Event::Pairing(P::Completed { peer: id, peer_name: "PC".into() })) {
+            Some(FfiEvent::PairingCompleted { device_id, peer_name }) => assert_eq!((device_id, peer_name), (id.to_string(), "PC".into())),
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unlink_rejects_bad_hex_and_unknown_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let (phone, _sink) = open_phone(dir.path());
+        for bad in ["", "not hex", "abcd", &"zz".repeat(32), &"ab".repeat(33)] {
+            assert!(matches!(phone.unlink(bad.to_string()), Err(SnapError::InvalidInput(_))), "{bad:?}");
+        }
+        // A well-formed id that is not linked.
+        assert!(matches!(phone.unlink("ab".repeat(32)), Err(SnapError::NotPaired(_))));
     }
 
     #[test]

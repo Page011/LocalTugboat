@@ -155,7 +155,7 @@ export function syncLabel(s: SyncStatus, now: number): Label {
   const waiting = s.waiting > 0 ? `, ${s.waiting} waiting` : "";
   switch (s.state) {
     case "unpaired":
-      return { text: "No phone paired", tone: "neutral", icon: "wifi-off" };
+      return { text: "Not linked to a phone", tone: "neutral", icon: "wifi-off" };
     case "offline":
       // The phone away from the Wi-Fi is the normal state for most of the day, so it is not red:
       // red stays for the states that need the user (paused, refused). Warn only when photos wait.
@@ -165,9 +165,10 @@ export function syncLabel(s: SyncStatus, now: number): Label {
     case "syncing":
       return { text: `Syncing with ${peer}${s.downloading > 0 ? `, ${s.downloading} downloading` : ""}${waiting}`, tone: "neutral", icon: "refresh" };
     case "synced":
-      return s.waiting > 0
-        ? { text: `Synced with ${peer}, ${s.waiting} waiting`, tone: "warn", icon: "hourglass" }
-        : { text: `Synced with ${peer}, ${ago(s.last_synced_at, now)}`, tone: "ok", icon: "check" };
+      if (s.waiting > 0) return { text: `Synced with ${peer}, ${s.waiting} waiting`, tone: "warn", icon: "hourglass" };
+      // A file still travelling through the phone from another PC: never look finished.
+      if (s.downloading > 0) return { text: `Synced with ${peer}, ${s.downloading} on the way`, tone: "neutral", icon: "refresh" };
+      return { text: `Synced with ${peer}, ${ago(s.last_synced_at, now)}`, tone: "ok", icon: "check" };
     case "paused":
       // Only the key phrase: the banner above carries the detail (a path would not fit here).
       return { text: `PAUSED${s.message ? ` - ${s.message.split(" - ")[0]}` : ""}`, tone: "danger", icon: "pause" };
@@ -198,8 +199,8 @@ const ACTIONS: Record<ActivityAction, string> = {
   folder_renamed: "Folder renamed",
   folder_deleted: "Folder deleted",
   retention_changed: "Retention changed",
-  paired: "Paired",
-  unpaired: "Unpaired",
+  paired: "Linked",
+  unpaired: "Logged out",
   paused: "PAUSED",
   resumed: "Resumed",
   sync_error: "SYNC ERROR",
@@ -216,8 +217,11 @@ export function deviceLabel(device: DeviceId | null, selfId: DeviceId | null, pa
   if (device === null) return "System";
   if (device === selfId) return "This PC";
   if (paired && device === paired.id) return paired.name;
-  return "Earlier phone";
+  return "Another device";
 }
+
+/** The core words a log out by the phone as "by the other device"; the PC says who. */
+export const activityDetail = (a: ActivityAction, detail: string): string => (a === "unpaired" && detail === "by the other device" ? "removed by phone" : detail);
 
 /** Bin days field: a whole number 1..365 (the same range Core enforces, so the error shows before the save). */
 export function parseBinDays(text: string): { ok: true; days: number } | { ok: false; message: string } {

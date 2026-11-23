@@ -1,6 +1,7 @@
 package app.localtugboat
 
 import android.os.Build
+import androidx.activity.compose.LocalActivity
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
@@ -64,6 +65,49 @@ fun Onboarding(vm: SnapViewModel, ui: UiState, actions: ShellActions) {
     val rows = ui.perms?.let { UiLogic.permRows(it, hardDenied, Build.VERSION.SDK_INT) }
     val step = UiLogic.onboardingStep(rows, continued, pairing)
 
+    when (step) {
+        OnboardingStep.PERMISSIONS -> PermissionStep(rows, vm::continuePermissions, actions)
+        OnboardingStep.DONE -> DoneStep((pairing as PairUi.Done).peer)
+        else -> PairSteps(vm, ui, step, pairing, hardDenied, actions)
+    }
+}
+
+/**
+ * Link another PC from inside the app: the same scan, code and failure steps as the first run. A success returns to
+ * Settings; leaving the screen stops a pairing in progress.
+ */
+@Composable
+fun AddDeviceScreen(vm: SnapViewModel, ui: UiState, actions: ShellActions) {
+    val pairing by vm.pairing.collectAsStateWithLifecycle()
+    val hardDenied by vm.hardDenied.collectAsStateWithLifecycle()
+    val rows = ui.perms?.let { UiLogic.permRows(it, hardDenied, Build.VERSION.SDK_INT) }
+    // A rotation or a theme change recreates the activity: the pairing in progress carries on in the view model.
+    val activity = LocalActivity.current
+    DisposableEffect(Unit) {
+        onDispose {
+            if (activity?.isChangingConfigurations != true) {
+                vm.cancelPairing()
+                vm.resetPairing()
+            }
+        }
+    }
+    LaunchedEffect(pairing) {
+        if (pairing is PairUi.Done) {
+            vm.resetPairing()
+            vm.nav.back()
+        }
+    }
+    // Permissions were asked on the first run: only a required one that was turned off since is shown again.
+    when (val step = UiLogic.onboardingStep(rows, true, pairing)) {
+        OnboardingStep.PERMISSIONS -> PermissionStep(rows, vm::continuePermissions, actions)
+        OnboardingStep.DONE -> DoneStep((pairing as PairUi.Done).peer)
+        else -> PairSteps(vm, ui, step, pairing, hardDenied, actions, onCancel = { vm.nav.back() })
+    }
+}
+
+/** Scan, connecting, code check and failure: shared by the first run and Link a PC. [onCancel] adds a Cancel button to the scanner. */
+@Composable
+private fun PairSteps(vm: SnapViewModel, ui: UiState, step: OnboardingStep, pairing: PairUi, hardDenied: Set<PermKind>, actions: ShellActions, onCancel: (() -> Unit)? = null) {
     // "LOCAL NETWORK BLOCKED" is stale the moment the permission is on: go back to the scanner.
     val failedMessage = (pairing as? PairUi.Failed)?.message
     val netOn = ui.perms?.localNetwork == true
@@ -72,8 +116,6 @@ fun Onboarding(vm: SnapViewModel, ui: UiState, actions: ShellActions) {
     }
 
     when (step) {
-        OnboardingStep.PERMISSIONS -> PermissionStep(rows, vm::continuePermissions, actions)
-        OnboardingStep.SCAN -> ScanStep(vm)
         OnboardingStep.CONNECTING -> Centered {
             CircularProgressIndicator(Modifier.size(48.dp))
             Spacer(Modifier.height(20.dp))
@@ -81,11 +123,16 @@ fun Onboarding(vm: SnapViewModel, ui: UiState, actions: ShellActions) {
         }
         OnboardingStep.CODE -> CodeStep((pairing as PairUi.Code), vm::cancelPairing)
         OnboardingStep.FAILED -> FailedStep((pairing as PairUi.Failed).message, vm::resetPairing, actions, hardDenied)
-        OnboardingStep.DONE -> Centered {
-            Ico(R.drawable.ic_check, null, tint = MaterialTheme.colorScheme.primary, size = 48)
-            Spacer(Modifier.height(12.dp))
-            Text("Paired with ${(pairing as PairUi.Done).peer}", style = MaterialTheme.typography.titleMedium)
-        }
+        else -> ScanStep(vm, onCancel)
+    }
+}
+
+@Composable
+private fun DoneStep(peer: String) {
+    Centered {
+        Ico(R.drawable.ic_check, null, tint = MaterialTheme.colorScheme.primary, size = 48)
+        Spacer(Modifier.height(12.dp))
+        Text("Linked to $peer", style = MaterialTheme.typography.titleMedium)
     }
 }
 
@@ -123,7 +170,7 @@ private fun PermissionStep(rows: List<PermRow>?, onContinue: () -> Unit, actions
 }
 
 @Composable
-private fun ScanStep(vm: SnapViewModel) {
+private fun ScanStep(vm: SnapViewModel, onCancel: (() -> Unit)? = null) {
     val scrimText = Modifier.background(Scrim, MaterialTheme.shapes.medium).padding(horizontal = 14.dp, vertical = 8.dp)
     LightSystemIcons()
     Box(Modifier.fillMaxSize().background(Color.Black)) {
@@ -134,8 +181,9 @@ private fun ScanStep(vm: SnapViewModel) {
                 // Full outline on all four sides: a framing aid, not an accent stripe.
                 Box(Modifier.size(240.dp).clip(MaterialTheme.shapes.large).border(BorderStroke(2.dp, Color.White), MaterialTheme.shapes.large))
             }
-            Text("On your PC click Pair a phone.", style = MaterialTheme.typography.bodyMedium, color = Color.White, modifier = scrimText)
+            Text("On your PC click Link phone.", style = MaterialTheme.typography.bodyMedium, color = Color.White, modifier = scrimText)
             if (BuildConfig.DEBUG) DebugPaste(vm)
+            if (onCancel != null) TextButton(onClick = onCancel, modifier = Modifier.defaultMinSize(minHeight = Touch)) { Text("Cancel", color = Color.White) }
         }
     }
 }
@@ -161,7 +209,7 @@ private fun CodeStep(p: PairUi.Code, onCancel: () -> Unit) {
             textAlign = TextAlign.Center, modifier = Modifier.described("Pairing code ${p.code.filter { it.isDigit() }.toList().joinToString(" ")}"),
         )
         Spacer(Modifier.height(12.dp))
-        Text("Then click Pair on ${p.peer}.", style = MaterialTheme.typography.bodyLarge, textAlign = TextAlign.Center)
+        Text("Then click Link on ${p.peer}.", style = MaterialTheme.typography.bodyLarge, textAlign = TextAlign.Center)
         Spacer(Modifier.height(24.dp))
         CircularProgressIndicator(Modifier.size(28.dp))
         Spacer(Modifier.height(24.dp))

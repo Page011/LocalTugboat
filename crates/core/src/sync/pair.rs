@@ -30,7 +30,7 @@ use crate::{
     facade::{lock, Core},
     model::*,
     ops,
-    sync::net::{net_err, Active},
+    sync::net::net_err,
     CoreError, Result,
 };
 
@@ -280,6 +280,7 @@ pub(crate) async fn confirm(core: &Core, accept: bool) -> Result<()> {
         paired_at: None,
         unpaired_at: None,
         last_seen_at: None,
+        last_synced_at: None,
         addresses: Vec::new(),
     };
     let delay = core.inner.pair_save_delay_ms.load(std::sync::atomic::Ordering::SeqCst);
@@ -293,17 +294,25 @@ pub(crate) async fn confirm(core: &Core, accept: bool) -> Result<()> {
     core.emit(Event::Pairing(PairingEvent::Completed { peer: row.id, peer_name: row.name.clone() }));
     core.emit(Event::ActivityAdded);
     core.emit_status();
-    core.inner.wake.notify_one();
+    core.inner.wake.fire();
     Ok(())
 }
 
 /// A session with a phone that is no longer the paired one must end (one phone per PC).
 fn drop_other_sessions(core: &Core, keep: DeviceId) {
-    let guard = lock(&core.inner.active);
-    if let Some(Active { conn, .. }) = guard.as_ref() {
-        if conn.peer() != keep.0 {
-            conn.close(close::UNPAIRED, "replaced by another phone");
+    for (peer, a) in lock(&core.inner.active).iter() {
+        if *peer != keep {
+            a.conn.close(close::UNPAIRED, "replaced by another phone");
         }
+    }
+}
+
+/// Holds `Inner.phone_pairing` for one pairing exchange on the phone.
+struct PairingRunning<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl Drop for PairingRunning<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -336,6 +345,17 @@ pub(crate) async fn pair_with(core: &Core, payload: &str, mut cancel: impl std::
         err
     })?;
     let node = node_of(core).ok_or_else(|| CoreError::Invalid("the network is not started".into()))?;
+    // Two exchanges at once would both count the same free place.
+    if core.inner.phone_pairing.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return Err(CoreError::Invalid("PAIRING ALREADY RUNNING".into()));
+    }
+    let _running = PairingRunning(&core.inner.phone_pairing);
+    // At the limit the PC is turned away before it shows a code. The same PC again is no new place.
+    if crate::store::count_paired_except(&lock(&core.inner.db).conn, DeviceId(parsed.pc_key))? >= MAX_LINKED {
+        let e = CoreError::TooManyDevices;
+        core.emit(Event::Pairing(PairingEvent::Cancelled { code: e.kind().to_string(), message: e.to_string() }));
+        return Err(e);
+    }
     let cancelled = |e: &NetError| {
         let (code, message) = match e {
             NetError::Pairing(pe) => (pair_code(pe), pair_text(pe)),
@@ -402,13 +422,25 @@ pub(crate) async fn pair_with(core: &Core, payload: &str, mut cancel: impl std::
         paired_at: None,
         unpaired_at: None,
         last_seen_at: None,
+        last_synced_at: None,
         addresses: parsed.addrs.iter().map(|a| a.to_string()).collect(),
     };
-    core.with_ctx(|c, ctx| ops::pairing_completed_phone(c, ctx, &row))?;
-    drop_other_sessions(core, row.id);
+    if let Err(e) = core.with_ctx(|c, ctx| ops::pairing_completed_phone(c, ctx, &row)) {
+        if matches!(e, CoreError::TooManyDevices) {
+            // The PC is owed a notice: let its task deliver it.
+            core.emit_status();
+            core.inner.wake.fire();
+        }
+        return Err(e);
+    }
+    // Linked again while a session with this PC is live: it still runs on the old cursor, so end it
+    // and let the PC's task dial anew. The sessions with the other PCs stay.
+    if let Some(a) = lock(&core.inner.active).get(&row.id) {
+        a.conn.close(close::NORMAL, "linked again");
+    }
     core.emit(Event::Pairing(PairingEvent::Completed { peer: row.id, peer_name: pc_name }));
     core.emit(Event::ActivityAdded);
     core.emit_status();
-    core.inner.wake.notify_one();
+    core.inner.wake.fire();
     Ok(row)
 }

@@ -40,6 +40,9 @@ pub enum CoreError {
     /// Pairing a new phone while one is paired, without `replace_existing`.
     #[error("a phone is already paired; unpair it first")]
     AlreadyPaired,
+    /// The phone already has `MAX_LINKED` PCs linked.
+    #[error("LIMIT {} DEVICES - unlink one first", crate::model::MAX_LINKED)]
+    TooManyDevices,
     /// Sync paused (PC library missing or bulk-missing check).
     #[error("sync paused: {0}")]
     Paused(String),
@@ -78,6 +81,7 @@ impl CoreError {
             CoreError::FileGone => "file_gone",
             CoreError::NotPaired => "not_paired",
             CoreError::AlreadyPaired => "already_paired",
+            CoreError::TooManyDevices => "too_many_devices",
             CoreError::Paused(_) => "paused",
             CoreError::Net { .. } => "net",
             CoreError::Protocol(_) => "protocol",
@@ -106,6 +110,7 @@ mod tests {
             CoreError::FileGone,
             CoreError::NotPaired,
             CoreError::AlreadyPaired,
+            CoreError::TooManyDevices,
             CoreError::Paused("x".into()),
             CoreError::Net { kind: "timeout".into(), msg: "m".into() },
             CoreError::Protocol("x".into()),
@@ -122,5 +127,6 @@ mod tests {
         let io = CoreError::io(std::path::Path::new("dir/x.jpg"), std::io::Error::from(std::io::ErrorKind::NotFound));
         assert!(io.to_string().contains("x.jpg") && io.to_string().contains("NotFound"));
         assert_eq!(CoreError::VersionMismatch { ours: 1, theirs: 2, update: "pc".into() }.to_string(), "Update Tugboat on the pc (protocol 1 here, 2 there)");
+        assert_eq!(CoreError::TooManyDevices.to_string(), "LIMIT 5 DEVICES - unlink one first");
     }
 }

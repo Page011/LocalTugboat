@@ -238,7 +238,7 @@ async fn on_event(core: &Core, opts: &Opts, e: Event) -> Result<(), String> {
                 open_window(core, opts)?;
             }
         }
-        Event::Pairing(PairingEvent::Unpaired { peer }) => emit(json!({"event": "unpaired", "id": peer.to_string()})),
+        Event::Pairing(PairingEvent::Unpaired { peer, .. }) => emit(json!({"event": "unpaired", "id": peer.to_string()})),
         Event::Sync(s) => emit(json!({"event": "sync", "status": s})),
         Event::Error { kind, message } => emit(json!({"event": "error", "kind": kind, "message": message})),
         _ => {}

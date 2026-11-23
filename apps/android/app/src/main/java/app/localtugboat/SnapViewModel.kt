@@ -20,11 +20,11 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import uniffi.tugboat_ffi.ActivityInfo
+import uniffi.tugboat_ffi.DeviceStatus
 import uniffi.tugboat_ffi.FfiEvent
 import uniffi.tugboat_ffi.FolderInfo
 import uniffi.tugboat_ffi.ItemInfo
 import uniffi.tugboat_ffi.ItemPage
-import uniffi.tugboat_ffi.PairedPc
 import uniffi.tugboat_ffi.Settings
 import uniffi.tugboat_ffi.SyncStatus
 import uniffi.tugboat_ffi.inspectPairingPayload
@@ -34,14 +34,14 @@ sealed interface PairUi {
     data object Idle : PairUi
     /** Dialing the PC; the code is not known yet. */
     data object Dialing : PairUi
-    /** "Check your PC shows 482 913": waiting for the PC owner to click Pair. */
+    /** "Check your PC shows 482 913": waiting for the PC owner to click Link. */
     data class Code(val code: String, val peer: String) : PairUi
     data class Done(val peer: String) : PairUi
     /** One readable line; uppercase key word for blockers. */
     data class Failed(val message: String) : PairUi
 }
 
-/** A deep link waiting behind the "Pair with this PC?" dialog. */
+/** A deep link waiting behind the "Link this PC?" dialog. */
 data class DeepLink(val payload: String, val pcName: String, val addresses: List<String>)
 
 /** Everything the app-level banners and settings need. Null fields = not loaded yet. */
@@ -49,7 +49,8 @@ data class UiState(
     val loaded: Boolean = false,
     /** Blocker: the core could not open (KEY UNREADABLE, newer database...). Nothing else works. */
     val openError: String? = null,
-    val paired: PairedPc? = null,
+    /** Linked PCs, from the core's status. Empty = none linked (rows only waiting to be told of an unlink count as not linked). */
+    val devices: List<DeviceStatus> = emptyList(),
     val settings: Settings? = null,
     val status: SyncStatus? = null,
     val perms: PermState? = null,
@@ -71,7 +72,7 @@ class SnapViewModel(app: Application) : AndroidViewModel(app) {
     private val core get() = ctx.core
 
     private data class Meta(
-        val openError: String? = null, val paired: PairedPc? = null, val settings: Settings? = null,
+        val openError: String? = null, val settings: Settings? = null,
         val perms: PermState? = null, val gapFrom: Long? = null, val freeBytes: Long? = null, val loaded: Boolean = false,
     )
 
@@ -79,8 +80,8 @@ class SnapViewModel(app: Application) : AndroidViewModel(app) {
 
     val ui: StateFlow<UiState> = combine(meta, core.status, core.errors) { m, st, errs ->
         UiState(
-            loaded = m.loaded, openError = m.openError, paired = m.paired, settings = m.settings, status = st, perms = m.perms,
-            stoppedGapFromMs = m.gapFrom, freeBytes = m.freeBytes,
+            loaded = m.loaded, openError = m.openError, devices = st?.devices.orEmpty(), settings = m.settings, status = st, perms = m.perms,
+            stoppedGapFromMs = if (st != null && UiLogic.linked(st.devices)) m.gapFrom else null, freeBytes = m.freeBytes,
             storageLow = m.freeBytes != null && m.settings != null && m.freeBytes.toULong() < m.settings.storageGuardBytes,
             errors = errs,
         )
@@ -133,7 +134,7 @@ class SnapViewModel(app: Application) : AndroidViewModel(app) {
             core.events.collect { e ->
                 when (e) {
                     is FfiEvent.PairingCode -> _pairing.value = PairUi.Code(e.code, e.peerName)
-                    is FfiEvent.Unpaired -> { resetAfterUnpair(); refresh() }
+                    is FfiEvent.Unpaired -> { if (!stillLinked()) resetAfterUnpair(); refresh() }
                     is FfiEvent.PairingCompleted, is FfiEvent.SettingsChanged, FfiEvent.Resync -> refresh()
                     else -> {}
                 }
@@ -205,10 +206,9 @@ class SnapViewModel(app: Application) : AndroidViewModel(app) {
             val perms = Perms.snapshot(ctx)
             try {
                 val p = core.phone()
-                val paired = p.pairedPc()
                 val settings = p.settings()
-                val gap = if (paired != null && settings.stayConnected) Heartbeat.lastGap(ctx, System.currentTimeMillis())?.fromMs else null
-                meta.value = Meta(null, paired, settings, perms, gap, p.freeSpaceBytes().toLong(), true)
+                val gap = if (settings.stayConnected) Heartbeat.lastGap(ctx, System.currentTimeMillis())?.fromMs else null
+                meta.value = Meta(null, settings, perms, gap, p.freeSpaceBytes().toLong(), true)
             } catch (e: Exception) {
                 core.reportError("open: ${e.message}")
                 meta.value = meta.value.copy(openError = e.message ?: "Core did not open", perms = perms, loaded = true)
@@ -310,18 +310,23 @@ class SnapViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
+     * Opens Link a PC at the scanner. A result left from an earlier visit is cleared here, not when the screen is
+     * first drawn: a pairing started right after this can finish before that, and its success would be wiped.
+     */
+    fun openAddDevice() {
+        resetPairing()
+        nav.go(Route.AddDevice)
+    }
+
+    /**
      * A deep link (intent data). Never reads extras. Shows the confirmation first: see [confirmDeepLink].
-     * "Already paired" is asked of the core, not of [meta]: a link that starts the app arrives before [refresh]
-     * has loaded anything, and an unloaded state must not read as "not paired".
+     * The limit is not checked here: linking a PC that is already listed again adds no device, so the core
+     * decides when the pairing completes.
      */
     fun onDeepLink(text: String?) {
         val payload = PairingText.candidate(text)
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                if (core.phone().pairedPc() != null) {
-                    _messages.tryEmit("Already paired. Unpair in Settings first")
-                    return@launch
-                }
                 if (payload == null) {
                     _messages.tryEmit("That link is not a Tugboat code")
                     return@launch
@@ -334,15 +339,17 @@ class SnapViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** The dialog's Pair button. Asks the core again: the phone may have paired while the dialog was open. */
+    /**
+     * The dialog's Link button. With a PC already linked the app is on the main screens, which do not show the
+     * code check: go to the Link a PC screen first. The core's list is asked, not [meta], for the same reason as above.
+     */
     fun confirmDeepLink() {
         val d = _deepLink.value ?: return
         _deepLink.value = null
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                if (core.phone().pairedPc() != null) {
-                    _messages.tryEmit("Already paired. Unpair in Settings first")
-                    return@launch
+                if (UiLogic.linked(core.phone().status().devices)) {
+                    withContext(Dispatchers.Main) { openAddDevice() }
                 }
                 pair(d.payload)
             } catch (e: Exception) {
@@ -428,14 +435,25 @@ class SnapViewModel(app: Application) : AndroidViewModel(app) {
         refresh()
     }
 
-    fun unpair() = act("Unpair") {
-        core.phone().unpair()
-        SnapService.stop(ctx)
-        resetAfterUnpair()
+    /** Unlink one PC. The service and the screens reset only when it was the last one. */
+    fun unlink(deviceId: String) = act("Unlink") {
+        core.phone().unlink(deviceId)
+        if (!stillLinked()) {
+            SnapService.stop(ctx)
+            resetAfterUnpair()
+        }
         refresh()
     }
 
-    /** The PC unpaired too (event) or the user did: forget everything that belonged to the pairing. */
+    /** Asked of the core after an unlink: a failed read keeps the screens as they are and is reported. */
+    private fun stillLinked(): Boolean = try {
+        UiLogic.linked(core.phone().status().devices)
+    } catch (e: Exception) {
+        core.reportError("unlink check: ${e.message}")
+        true
+    }
+
+    /** The last PC was unlinked (here, or by it: event): forget everything that belonged to the pairing. */
     private fun resetAfterUnpair() {
         _pairing.update { UiLogic.pairingAfterUnpair(it) }
         _permsContinued.value = false

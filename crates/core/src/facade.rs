@@ -19,13 +19,13 @@ use std::{
 };
 
 use rusqlite::Connection;
-use tokio::sync::{broadcast, Notify};
+use tokio::sync::{broadcast, watch};
 
 use crate::{
     activity, bin,
     clock::Clock,
     db::Db,
-    events::{Event, SyncState, SyncStatus},
+    events::{DeviceStatus, Event, SyncState, SyncStatus},
     expiry, folders,
     model::*,
     names,
@@ -65,12 +65,48 @@ pub fn device_id_from_secret(secret: &[u8; 32]) -> DeviceId {
     DeviceId(*tugboat_net::iroh::SecretKey::from(*secret).public().as_bytes())
 }
 
-/// Mutable sync status behind `Core::status`.
+/// A wake-up for every task that listens, not for one of them. A listener that was busy when it
+/// fired still sees it on its next wait.
+pub(crate) struct Signal(watch::Sender<u64>);
+
+impl Signal {
+    pub fn new() -> Signal {
+        Signal(watch::channel(0).0)
+    }
+
+    pub fn fire(&self) {
+        self.0.send_modify(|v| *v = v.wrapping_add(1));
+    }
+
+    /// Listens for fires from now on.
+    pub fn subscribe(&self) -> Listener {
+        Listener(self.0.subscribe())
+    }
+}
+
+pub(crate) struct Listener(watch::Receiver<u64>);
+
+impl Listener {
+    /// Resolves when the signal fired since this listener last returned. Cancel safe.
+    pub async fn fired(&mut self) {
+        if self.0.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// What one linked device's connection is doing now.
+#[derive(Debug, Clone)]
+pub(crate) struct PeerLink {
+    pub state: SyncState,
+    pub message: Option<String>,
+}
+
+/// Mutable sync status behind `Core::status`: one entry per device with a session history
+/// (a device without one is Offline).
 #[derive(Debug, Default)]
 pub(crate) struct StatusInner {
-    pub state: Option<SyncState>,
-    pub message: Option<String>,
-    pub last_synced_at: Option<i64>,
+    pub per: HashMap<DeviceId, PeerLink>,
     pub last_emitted: Option<SyncStatus>,
 }
 
@@ -80,16 +116,17 @@ pub(crate) struct Inner {
     pub clock: Arc<dyn Clock>,
     pub placement: Arc<dyn Placement>,
     pub events: broadcast::Sender<Event>,
-    /// A local change happened: the live session sends Notify.
-    pub local_changed: Notify,
+    /// A local change happened: every live session sends Notify.
+    pub local_changed: Signal,
     /// Something may need downloading (restore, sweep, new record).
-    pub kick: Notify,
-    /// The connect loop should look again (pairing done, resumed, started).
-    pub wake: Notify,
+    pub kick: Signal,
+    /// The dial tasks should look again (pairing done, resumed, started).
+    pub wake: Signal,
     pub status: Mutex<StatusInner>,
     pub paused: Mutex<Option<String>>,
     pub net: Mutex<Option<net::NetState>>,
-    pub active: Mutex<Option<net::Active>>,
+    /// Live sessions by peer (the phone has one per linked PC, a PC one for its phone).
+    pub active: Mutex<HashMap<DeviceId, net::Active>>,
     pub pairing: Mutex<Option<pair::PairState>>,
     pub proto: AtomicU32,
     /// Pairing protocol number the phone speaks (tests play an older phone).
@@ -100,11 +137,14 @@ pub(crate) struct Inner {
     pub generation: AtomicU64,
     /// Bytes of downloads that continued from an existing part file (tests assert on it).
     pub resumed_bytes: AtomicU64,
-    /// Phone: a task is delivering an unpair notice to a replaced PC while the connect loop
-    /// serves the new one.
-    pub notice_running: std::sync::atomic::AtomicBool,
+    /// Phone: a pairing exchange is running (one at a time).
+    pub phone_pairing: std::sync::atomic::AtomicBool,
     /// Phone: the storage guard is holding at least one download back (SyncStatus.storage_low).
+    /// True while `low_peers` is not empty.
     pub storage_low: std::sync::atomic::AtomicBool,
+    /// Phone: the devices whose session has a download held back by the storage guard. Each session
+    /// sees only the files its own device holds, so the warning is the sum over sessions.
+    pub low_peers: Mutex<std::collections::HashSet<DeviceId>>,
     /// How long a blocked download queue waits before it looks at the free space again (ms).
     pub guard_recheck_ms: AtomicU64,
     /// Tests only: record the hash of each blob request (`debug_record_blob_requests`). Off in the
@@ -117,6 +157,10 @@ pub(crate) struct Inner {
     /// same part file, and a task outlives the session that started it. The value is the declared
     /// size of that download: the phone storage guard counts what it still has to write.
     pub fetching: Mutex<std::collections::HashMap<BlobHash, u64>>,
+    /// Most downloads (claims in `fetching`) alive at once since the core opened (tests read it).
+    pub fetch_peak: AtomicU64,
+    /// Tests only: ask a peer for any file, not only the ones that peer holds (an older build).
+    pub no_holder_test: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Clone)]
@@ -139,7 +183,6 @@ impl Core {
         store::ensure_self(&db.conn, cfg.self_id, &cfg.device_name, cfg.role)?;
         let thumbs = cfg.data_dir.join("thumbs");
         std::fs::create_dir_all(&thumbs).map_err(|e| CoreError::io(&thumbs, e))?;
-        let last_synced_at = store::get_value(&db.conn, "last_synced_at")?.and_then(|v| v.parse::<i64>().ok());
         let (tx, rx) = broadcast::channel(1024);
         let core = Core {
             inner: Arc::new(Inner {
@@ -148,13 +191,13 @@ impl Core {
                 clock,
                 placement,
                 events: tx,
-                local_changed: Notify::new(),
-                kick: Notify::new(),
-                wake: Notify::new(),
-                status: Mutex::new(StatusInner { last_synced_at, ..Default::default() }),
+                local_changed: Signal::new(),
+                kick: Signal::new(),
+                wake: Signal::new(),
+                status: Mutex::new(StatusInner::default()),
                 paused: Mutex::new(None),
                 net: Mutex::new(None),
-                active: Mutex::new(None),
+                active: Mutex::new(HashMap::new()),
                 pairing: Mutex::new(None),
                 proto: AtomicU32::new(wire::PROTO),
                 pair_proto: AtomicU32::new(tugboat_net::pairing::PAIR_PROTO),
@@ -162,12 +205,15 @@ impl Core {
                 pair_save_delay_ms: AtomicU64::new(0),
                 generation: AtomicU64::new(0),
                 resumed_bytes: AtomicU64::new(0),
-                notice_running: std::sync::atomic::AtomicBool::new(false),
+                phone_pairing: std::sync::atomic::AtomicBool::new(false),
                 storage_low: std::sync::atomic::AtomicBool::new(false),
+                low_peers: Mutex::new(std::collections::HashSet::new()),
                 guard_recheck_ms: AtomicU64::new(30_000),
                 record_blob_requests: std::sync::atomic::AtomicBool::new(false),
                 blob_requests: Mutex::new(Vec::new()),
                 fetching: Mutex::new(std::collections::HashMap::new()),
+                fetch_peak: AtomicU64::new(0),
+                no_holder_test: std::sync::atomic::AtomicBool::new(false),
             }),
         };
         core.sweep_and_emit()?;
@@ -218,11 +264,9 @@ impl Core {
     /// Returns true when the connection was closed.
     #[doc(hidden)]
     pub fn debug_enforce_path(&self, addr: &str) -> bool {
-        let conn = lock(&self.inner.active).as_ref().map(|a| a.conn.clone());
-        match (conn, addr.parse()) {
-            (Some(conn), Ok(ip)) => conn.enforce_path(&tugboat_net::iroh::TransportAddr::Ip(ip)),
-            _ => false,
-        }
+        let conns: Vec<_> = lock(&self.inner.active).values().map(|a| a.conn.clone()).collect();
+        let Ok(ip) = addr.parse() else { return false };
+        conns.iter().filter(|conn| conn.enforce_path(&tugboat_net::iroh::TransportAddr::Ip(ip))).count() > 0
     }
 
     /// Test hook: direct database access (digest checks, backups, dropping a log row).
@@ -319,54 +363,151 @@ impl Core {
         self.inner.resumed_bytes.load(Ordering::SeqCst)
     }
 
-    /// Test hook: drop the live connection without telling the peer why (network loss).
+    /// Test hook: drop every live connection without telling the peers why (network loss).
     #[doc(hidden)]
     pub fn debug_kill_connection(&self) {
-        if let Some(a) = lock(&self.inner.active).as_ref() {
+        for a in lock(&self.inner.active).values() {
             a.conn.close(tugboat_net::close::NORMAL, "connection dropped (test)");
         }
     }
 
+    /// Test hook: drop the live connection with one peer only.
+    #[doc(hidden)]
+    pub fn debug_kill_connection_of(&self, peer: DeviceId) {
+        if let Some(a) = lock(&self.inner.active).get(&peer) {
+            a.conn.close(tugboat_net::close::NORMAL, "connection dropped (test)");
+        }
+    }
+
+    /// Test hook: most downloads alive at once since this core opened.
+    #[doc(hidden)]
+    pub fn debug_fetch_peak(&self) -> u64 {
+        self.inner.fetch_peak.load(Ordering::SeqCst)
+    }
+
+    /// Test hook: ask peers for every file, not only the ones they hold (what a 0.2.x PC does).
+    #[doc(hidden)]
+    pub fn debug_disable_holder_test(&self) {
+        self.inner.no_holder_test.store(true, Ordering::SeqCst);
+    }
+
     // ----- status -----
 
-    /// Current sync status, computed from the db and the connection state.
+    /// Current sync status, computed from the db and the connection state of each device.
     pub fn status(&self) -> SyncStatus {
         let now = self.now();
-        let (peer, waiting, downloading, owes_unpair) = {
+        let (peers, notices, waits, downloads) = {
             let db = lock(&self.inner.db);
-            let peer = store::paired_peer(&db.conn).ok().flatten();
-            let owes_unpair = store::get_pending_unpair(&db.conn).ok().flatten().is_some();
-            let waiting = waiting_count(&db.conn, now).unwrap_or(0);
-            let downloading = store::items_in_state(&db.conn, &[LocalFileState::Pending], 100_000).map(|v| v.len() as u32).unwrap_or(0);
-            (peer, waiting, downloading, owes_unpair)
+            let c = &db.conn;
+            let peers = store::paired_peers(c).unwrap_or_default();
+            let ids: Vec<DeviceId> = peers.iter().map(|p| p.id).collect();
+            // A notice for a device that is linked again is void (linking removes it); skipped anyway.
+            let notices: Vec<(String, String)> = store::pending_unpairs(c)
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|n| {
+                    let id = n.peer_id().ok()?;
+                    if ids.contains(&id) {
+                        return None;
+                    }
+                    let name = store::get_device(c, id).ok().flatten().map(|d| d.name).unwrap_or_else(|| n.peer.chars().take(8).collect());
+                    Some((n.peer.clone(), name))
+                })
+                .collect();
+            let waits = waiting_by_device(c, &ids, now).unwrap_or_else(|_| Waiting { per: vec![0; ids.len()], any: 0 });
+            let downloads = store::pending_counts(c, &ids).unwrap_or_else(|_| (0, vec![0; ids.len()]));
+            (peers, notices, waits, downloads)
         };
         let st = lock(&self.inner.status);
         let paused = lock(&self.inner.paused).clone();
-        let (state, message) = if peer.is_none() {
+        let mut devices: Vec<DeviceStatus> = peers
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let link = st.per.get(&p.id);
+                DeviceStatus {
+                    id: hex::encode(p.id.0),
+                    name: p.name.clone(),
+                    state: link.map_or(SyncState::Offline, |l| l.state),
+                    message: link.and_then(|l| l.message.clone()),
+                    paired_at: p.paired_at,
+                    last_seen_at: p.last_seen_at,
+                    last_synced_at: p.last_synced_at,
+                    waiting: waits.per[i],
+                    downloading: downloads.1[i],
+                    unlinking: false,
+                }
+            })
+            .collect();
+        drop(st);
+        let aggregate = |state: SyncState| devices.iter().find(|d| d.state == state);
+        // First match wins: nothing linked, paused, a refusal (it names its device), then the best
+        // state any device reached. A device that is away is normal and never hides the others.
+        let (state, message) = if peers.is_empty() {
             // An unpair the other device has not heard of is shown, never silent.
-            (SyncState::Unpaired, owes_unpair.then(|| "PC NOT TOLD YET - will tell it when it is reachable".to_string()))
+            (SyncState::Unpaired, (!notices.is_empty()).then(|| "PC NOT TOLD YET - will tell it when it is reachable".to_string()))
         } else if let Some(reason) = paused {
             (SyncState::Paused, Some(reason))
+        } else if let Some(d) = aggregate(SyncState::Refused) {
+            (SyncState::Refused, d.message.clone())
         } else {
-            (st.state.unwrap_or(SyncState::Offline), st.message.clone())
+            let best = [SyncState::Syncing, SyncState::Synced, SyncState::Connecting].into_iter().find(|s| aggregate(*s).is_some());
+            (best.unwrap_or(SyncState::Offline), None)
         };
-        let storage_low = self.inner.storage_low.load(Ordering::SeqCst);
-        SyncStatus { state, peer_name: peer.map(|p| p.name), last_synced_at: st.last_synced_at, waiting, downloading, storage_low, message }
+        for (id, name) in notices {
+            devices.push(DeviceStatus {
+                id,
+                name,
+                state: SyncState::Unpaired,
+                message: None,
+                paired_at: None,
+                last_seen_at: None,
+                last_synced_at: None,
+                waiting: 0,
+                downloading: 0,
+                unlinking: true,
+            });
+        }
+        SyncStatus {
+            state,
+            peer_name: if peers.len() == 1 { Some(peers[0].name.clone()) } else { None },
+            last_synced_at: peers.iter().filter_map(|p| p.last_synced_at).max(),
+            waiting: waits.any,
+            downloading: downloads.0,
+            storage_low: self.inner.storage_low.load(Ordering::SeqCst),
+            message,
+            devices,
+        }
     }
 
-    /// Set the connection-derived state, then emit Event::Sync when the status changed.
-    pub(crate) fn set_state(&self, state: SyncState, message: Option<String>) {
-        {
-            let mut st = lock(&self.inner.status);
-            st.state = Some(state);
-            st.message = message;
-        }
+    /// The linked devices, as `status().devices` lists them.
+    pub fn linked_devices(&self) -> Vec<DeviceStatus> {
+        self.status().devices
+    }
+
+    /// Set the connection-derived state of one device, then emit Event::Sync when the status changed.
+    pub(crate) fn set_state(&self, peer: DeviceId, state: SyncState, message: Option<String>) {
+        lock(&self.inner.status).per.insert(peer, PeerLink { state, message });
         self.emit_status();
     }
 
-    pub(crate) fn mark_synced(&self, now: i64) {
-        lock(&self.inner.status).last_synced_at = Some(now);
-        let r = self.with_ctx(|c, _| store::set_value(c, "last_synced_at", &now.to_string()));
+    pub(crate) fn peer_state(&self, peer: DeviceId) -> Option<SyncState> {
+        lock(&self.inner.status).per.get(&peer).map(|l| l.state)
+    }
+
+    /// A device is no longer linked: its connection state goes with it.
+    pub(crate) fn forget_peer(&self, peer: DeviceId) {
+        lock(&self.inner.status).per.remove(&peer);
+    }
+
+    /// Every device is Offline (the network started or stopped).
+    pub(crate) fn reset_states(&self) {
+        lock(&self.inner.status).per.clear();
+        self.emit_status();
+    }
+
+    pub(crate) fn mark_synced(&self, peer: DeviceId, now: i64) {
+        let r = self.with_ctx(|c, _| store::set_last_synced(c, peer, now));
         if let Err(e) = r {
             self.emit_error(e.kind(), &format!("could not save the last synced time: {e}"));
         }
@@ -481,8 +622,8 @@ impl Core {
             .map(|t| self.thumb_path(t.hash))
             .filter(|p| p.exists())
             .map(|p| p.to_string_lossy().into_owned());
-        // Expired before the paired device ever confirmed the file: the Bin says so (silent-failure rule).
-        let never_reached_peer = matches!(state, ItemState::Expired { .. }) && bin::missing_at_peer(c, rec.content.val.hash).ok().flatten().is_some();
+        // Expired before a linked device ever confirmed the file: the Bin says so (silent-failure rule).
+        let missing_on = if matches!(state, ItemState::Expired { .. }) { bin::missing_on(c, rec.content.val.hash).unwrap_or_default() } else { Vec::new() };
         ItemView {
             id: rec.id,
             name: crate::names::display_name(&rec.name.val, &rec.content.val.ext),
@@ -497,7 +638,8 @@ impl Core {
             local: lfs,
             path,
             thumb_path,
-            never_reached_peer,
+            never_reached_peer: !missing_on.is_empty(),
+            missing_on,
         }
     }
 
@@ -576,7 +718,7 @@ impl Core {
             self.emit(Event::PlacesChanged);
         }
         self.emit(Event::ActivityAdded);
-        self.inner.local_changed.notify_one();
+        self.inner.local_changed.fire();
         self.emit_status();
     }
 
@@ -653,7 +795,7 @@ impl Core {
         if matches!(r, Ok(()) | Err(CoreError::Io { .. })) {
             self.wrote(&[id], false, false);
             // A purged file comes back as Pending: fetch it from the other device.
-            self.inner.kick.notify_one();
+            self.inner.kick.fire();
         }
         r
     }
@@ -826,13 +968,13 @@ impl Core {
             self.emit_error(e.kind(), &format!("could not log the pause: {e}"));
         }
         if reason.is_some() {
-            // Drop the live connection: a paused library must not exchange changes.
-            if let Some(a) = lock(&self.inner.active).as_ref() {
+            // Drop the live connections: a paused library must not exchange changes.
+            for a in lock(&self.inner.active).values() {
                 a.conn.close(tugboat_net::close::NORMAL, "sync paused");
             }
         } else {
-            self.inner.wake.notify_one();
-            self.inner.kick.notify_one();
+            self.inner.wake.fire();
+            self.inner.kick.fire();
         }
         self.emit(Event::ActivityAdded);
         self.emit_status();
@@ -907,7 +1049,7 @@ impl Core {
             self.emit_error("placement", &format!("item {}: {msg}", id.0));
         }
         if !rep.want.is_empty() {
-            self.inner.kick.notify_one();
+            self.inner.kick.fire();
         }
         Ok(rep)
     }
@@ -942,8 +1084,8 @@ impl Core {
 
     // ----- network and pairing -----
 
-    /// Start the endpoint and the connection loop: PC accepts; phone dials the paired PC
-    /// (cached addresses first, then mDNS), reconnecting with backoff 1 s .. 30 s.
+    /// Start the endpoint: the PC accepts; the phone runs one dial task per linked PC (cached
+    /// addresses first, then mDNS), each reconnecting with its own back-off, 1 s .. 30 s.
     pub async fn start_network(&self, cfg: NetworkConfig) -> Result<()> {
         net::start(self, cfg).await
     }
@@ -987,39 +1129,51 @@ impl Core {
         pair::pair_with(self, payload, cancel).await
     }
 
-    /// Unpair the peer: sends Unpair if connected, then ops::unpair. Files stay.
+    /// Unpair the only linked device: sends Unpair if connected, then ops::unpair. Files stay.
+    /// A phone with several PCs linked must name one (`unpair_device`).
     pub async fn unpair(&self) -> Result<()> {
         net::unpair(self).await
+    }
+
+    /// Phone: unlink one PC. Files stay on both. A PC that cannot be told now is owed a notice.
+    pub async fn unpair_device(&self, peer: DeviceId) -> Result<()> {
+        net::unpair_peer(self, peer).await
     }
 
     /// Phone: the Wi-Fi changed or the app came to the front; skip the reconnect back-off
     /// (up to 30 s) and dial the PC now. Harmless on a connected phone and on the PC.
     pub fn reconnect_now(&self) {
-        self.inner.wake.notify_one();
+        self.inner.wake.fire();
     }
 }
 
-/// Items held here (not in the Bin) that the paired device has not confirmed holding: no receipt
-/// from the CURRENTLY paired device for the item's current hash ("PC not found, 3 waiting").
-/// 0 while unpaired. The SQL narrows to the rare set without a receipt; `derive_state` still
-/// decides who is in the Bin, so the expiry rules stay in one place. Expiry itself never waits
-/// for these items (0.2.0).
-fn waiting_count(c: &Connection, now: i64) -> Result<u32> {
-    let Some(peer) = store::paired_peer(c)? else { return Ok(0) };
+/// Items held here that each linked device has not confirmed holding.
+struct Waiting {
+    /// Per device, in the order of the ids given.
+    per: Vec<u32>,
+    /// Items missing on at least one device (an item missing on three devices counts once).
+    any: u32,
+}
+
+/// Items held here (not in the Bin) that a linked device has not confirmed holding: no receipt from
+/// that device for the item's current hash ("PC not found, 3 waiting"). Empty while nothing is
+/// linked. One pass for all devices: the SQL narrows to the rare set without a receipt from some
+/// device, `derive_state` (once per item) still decides who is in the Bin, so the expiry rules stay
+/// in one place. Expiry itself never waits for these items (0.2.0).
+fn waiting_by_device(c: &Connection, ids: &[DeviceId], now: i64) -> Result<Waiting> {
+    let mut w = Waiting { per: vec![0; ids.len()], any: 0 };
+    if ids.is_empty() {
+        return Ok(w);
+    }
     let fmap: HashMap<FolderId, FolderRecord> = store::all_folders(c)?.into_iter().map(|f| (f.id, f)).collect();
-    let candidates = store::item_ids_where(
-        c,
-        &format!(
-            "local_file_state = 'present' AND deleted_at IS NULL AND NOT EXISTS (SELECT 1 FROM receipt r WHERE r.blob_hash = item.blob_hash AND r.device_id = x'{}')",
-            hex::encode(peer.id.0)
-        ),
-    )?;
-    let mut n = 0;
-    for id in candidates {
-        let Some((rec, _)) = store::get_item(c, id)? else { continue };
-        if !expiry::in_bin(bin::derive_state_in(c, &fmap, &rec, now)?) {
-            n += 1;
+    for (rec, flags) in store::items_missing_receipts(c, ids)? {
+        if expiry::in_bin(bin::derive_state_in(c, &fmap, &rec, now)?) {
+            continue;
+        }
+        w.any += 1;
+        for (n, missing) in w.per.iter_mut().zip(flags) {
+            *n += u32::from(missing);
         }
     }
-    Ok(n)
+    Ok(w)
 }

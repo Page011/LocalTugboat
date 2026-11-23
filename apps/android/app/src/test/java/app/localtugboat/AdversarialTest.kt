@@ -27,17 +27,16 @@ class AdversarialTest {
     }
 
     /**
-     * onDeepLink refuses a pairing link while paired by reading meta.value.paired. A link that starts the app
-     * (or a new MainActivity, which gets a new view model) arrives before refresh() has opened the core, so
-     * paired is still null and the "Pair with this PC?" dialog shows over the paired app. Tapping Pair then
-     * re-pairs the phone with whatever PC is in the link, and the paired app never shows the 6-digit code.
+     * A deep link is accepted while PCs are linked, and the Link button goes to the Link a PC screen first: the main
+     * screens never show the code check. A link that starts the app arrives before refresh() has opened the core, so
+     * whether a PC is linked has to come from the core's own device list, not the cached state.
      */
     @Test
-    fun deepLinkGuardDoesNotTrustUnloadedState() {
+    fun deepLinkOpensLinkScreenFromCoreState() {
         val vm = sources().getValue("SnapViewModel.kt")
-        val body = vm.substringAfter("fun onDeepLink(").substringBefore("fun dismissDeepLink(")
-        val readsFreshState = body.contains("pairedPc()") || body.contains(".loaded")
-        assertTrue("onDeepLink/confirmDeepLink decide 'already paired' from state that is not loaded yet on a cold start", readsFreshState)
+        val body = vm.substringAfter("fun confirmDeepLink(").substringBefore("fun dismissDeepLink(")
+        assertTrue("the linked check reads state that is not loaded yet on a cold start", body.contains("UiLogic.linked(core.phone().status().devices)"))
+        assertTrue("the Link a PC screen must be up before pairing starts", body.indexOf("openAddDevice()") in 0 until body.indexOf("pair(d.payload)"))
     }
 
     /**

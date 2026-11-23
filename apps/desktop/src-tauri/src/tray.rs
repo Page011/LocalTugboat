@@ -38,7 +38,7 @@ pub fn tooltip(state: TrayState, s: &SyncStatus) -> String {
         TrayState::Waiting if s.waiting > 0 => format!("Tugboat - {} waiting for {who}", s.waiting),
         TrayState::Waiting => format!("Tugboat - syncing with {who}"),
         TrayState::Offline => match (&s.state, &s.message) {
-            (SyncState::Unpaired, _) => "Tugboat - no phone paired".to_string(),
+            (SyncState::Unpaired, _) => "Tugboat - not linked to a phone".to_string(),
             (_, Some(m)) => format!("Tugboat - {m}"),
             _ => format!("Tugboat - {who} not connected"),
         },
@@ -114,7 +114,7 @@ mod tests {
     use super::*;
 
     fn status(state: SyncState, waiting: u32, downloading: u32) -> SyncStatus {
-        SyncStatus { state, peer_name: Some("Pixel".into()), last_synced_at: None, waiting, downloading, storage_low: false, message: None }
+        SyncStatus { state, peer_name: Some("Pixel".into()), last_synced_at: None, waiting, downloading, storage_low: false, message: None, devices: Vec::new() }
     }
 
     #[test]
@@ -135,7 +135,7 @@ mod tests {
         let t = |s: &SyncStatus| tooltip(tray_state(s), s);
         assert_eq!(t(&status(SyncState::Synced, 0, 0)), "Tugboat - synced with Pixel");
         assert_eq!(t(&status(SyncState::Synced, 4, 0)), "Tugboat - 4 waiting for Pixel");
-        assert_eq!(t(&status(SyncState::Unpaired, 0, 0)), "Tugboat - no phone paired");
+        assert_eq!(t(&status(SyncState::Unpaired, 0, 0)), "Tugboat - not linked to a phone");
         let mut paused = status(SyncState::Paused, 0, 0);
         paused.message = Some("LIBRARY FOLDER NOT FOUND - D:\\x".into());
         assert!(t(&paused).contains("LIBRARY FOLDER NOT FOUND"));

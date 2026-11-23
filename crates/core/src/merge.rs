@@ -21,7 +21,10 @@
 //! M7 Every remote version passes through `store::observe_lamport` before any local write.
 //! M8 New record: inserted as received; items get LocalFileState::Pending (the Bin sweep
 //!    turns it into Purged if the item is already in the Bin).
-//! M9 Remote-applied changes are not written to change_log; M5 rewrites are (they are local).
+//! M9 Remote-applied changes are not written to change_log, except on the phone (`relay`): it
+//!    logs each group it took, tagged with the device it came from, so its other linked PCs get
+//!    the change and the sender never gets it back. A merge that changes nothing logs nothing.
+//!    M5 rewrites are always logged as written here.
 //!
 //! Also at the trust boundary (a paired peer is still validated): a remote
 //! record with an out-of-range or unsafe field is a `Protocol` error and is not stored.
@@ -180,6 +183,11 @@ pub struct Applied {
     pub conflicts: u32,
     /// M5 rewrote a group (a new local change exists: send Notify).
     pub wrote_local: bool,
+    /// Groups that changed here because of the remote record (all of them for a new record or
+    /// receipt). Empty = the merge was a no-op.
+    pub groups: Vec<&'static str>,
+    /// Relay rows were written for `groups`.
+    pub relayed: bool,
 }
 
 // ---------- validation of remote records (trust boundary) ----------
@@ -338,7 +346,7 @@ fn log_conflicts(
     };
     let mut n = 0;
     for g in differing {
-        if store::unacked_local_change(c, key, g, acked)?.is_none() {
+        if store::unacked_local_change(c, key, g, acked, peer)?.is_none() {
             continue;
         }
         let remote_won = taken.contains(g);
@@ -351,28 +359,45 @@ fn log_conflicts(
 
 // ---------- apply ----------
 
+/// Write one relay row per changed group, tagged with the device they came from.
+fn relay_groups(c: &Connection, key: &EntityKey, out: &mut Applied, relay: Option<u64>, peer: DeviceId) -> Result<()> {
+    let Some(lamport) = relay else { return Ok(()) };
+    for g in &out.groups {
+        store::log_change_from(c, key, g, lamport, peer)?;
+        out.relayed = true;
+    }
+    Ok(())
+}
+
 /// Apply one received record inside the caller's transaction, following M1-M9.
 /// `peer` is the device the record came from (for activity rows and M6 `our_seq_acked`).
-pub fn apply_remote(c: &Connection, self_id: DeviceId, peer: DeviceId, record: &Record, now: i64) -> Result<Applied> {
+/// `relay` is true on the phone: what changed here is also logged for its other linked PCs.
+pub fn apply_remote(c: &Connection, self_id: DeviceId, peer: DeviceId, record: &Record, relay: bool, now: i64) -> Result<Applied> {
     validate_remote(record)?;
+    let lamport = max_lamport_of(record);
     // M7: before any local write (the M5 rewrite below takes the next version).
-    store::observe_lamport(c, max_lamport_of(record))?;
+    store::observe_lamport(c, lamport)?;
+    // Receipts carry no version: their relay rows stamp 0.
+    let relay = relay.then_some(lamport);
     match record {
         Record::Receipt(r) => {
             let mut out = Applied::default();
-            // M4: insert if absent. M9: not logged, the peer already has it.
+            // M4: insert if absent. M9: not logged here unless relaying.
             if store::insert_receipt(c, r, now)? {
-                out.changed = Some(EntityKey::Receipt { hash: r.hash, device: r.device });
+                let key = EntityKey::Receipt { hash: r.hash, device: r.device };
+                out.changed = Some(key);
+                out.groups = vec![group::ALL];
+                relay_groups(c, &key, &mut out, relay, peer)?;
             }
             Ok(out)
         }
-        Record::Item(r) => apply_item(c, self_id, peer, r, now),
-        Record::Folder(r) => apply_folder(c, peer, r, now),
-        Record::Place(r) => apply_place(c, peer, r, now),
+        Record::Item(r) => apply_item(c, self_id, peer, r, relay, now),
+        Record::Folder(r) => apply_folder(c, peer, r, relay, now),
+        Record::Place(r) => apply_place(c, peer, r, relay, now),
     }
 }
 
-fn apply_item(c: &Connection, self_id: DeviceId, peer: DeviceId, remote: &ItemRecord, now: i64) -> Result<Applied> {
+fn apply_item(c: &Connection, self_id: DeviceId, peer: DeviceId, remote: &ItemRecord, relay: Option<u64>, now: i64) -> Result<Applied> {
     let key = EntityKey::Item { id: remote.id };
     let mut out = Applied::default();
     let merged = match store::get_item(c, remote.id)? {
@@ -381,6 +406,7 @@ fn apply_item(c: &Connection, self_id: DeviceId, peer: DeviceId, remote: &ItemRe
             store::insert_item(c, remote, LocalFileState::Pending, now)?;
             out.changed = Some(key);
             out.content_changed = true;
+            out.groups = vec![group::ALL];
             remote.clone()
         }
         Some((local, lfs)) => {
@@ -398,6 +424,7 @@ fn apply_item(c: &Connection, self_id: DeviceId, peer: DeviceId, remote: &ItemRe
             if !m.taken.is_empty() {
                 store::update_item(c, &m.merged)?;
                 out.changed = Some(key);
+                out.groups = m.taken.clone();
                 if m.taken.contains(&group::CONTENT) && local.content.val.hash != m.merged.content.val.hash {
                     out.content_changed = true;
                     // The held file is the old content. Wanted again, unless it was purged
@@ -410,6 +437,7 @@ fn apply_item(c: &Connection, self_id: DeviceId, peer: DeviceId, remote: &ItemRe
             m.merged
         }
     };
+    relay_groups(c, &key, &mut out, relay, peer)?;
     // M5 on the merged record (also catches a new record that arrives both deleted and kept).
     if let Some(dk) = delete_vs_keep(&merged) {
         let nv = store::next_version(c, self_id)?;
@@ -435,13 +463,14 @@ fn apply_item(c: &Connection, self_id: DeviceId, peer: DeviceId, remote: &ItemRe
     Ok(out)
 }
 
-fn apply_folder(c: &Connection, peer: DeviceId, remote: &FolderRecord, now: i64) -> Result<Applied> {
+fn apply_folder(c: &Connection, peer: DeviceId, remote: &FolderRecord, relay: Option<u64>, now: i64) -> Result<Applied> {
     let key = EntityKey::Folder { id: remote.id };
     let mut out = Applied::default();
     match store::get_folder(c, remote.id)? {
         None => {
             store::put_folder(c, remote)?;
             out.changed = Some(key);
+            out.groups = vec![group::ALL];
         }
         Some(local) => {
             let m = merge_folder(&local, remote)?;
@@ -458,19 +487,22 @@ fn apply_folder(c: &Connection, peer: DeviceId, remote: &FolderRecord, now: i64)
             if !m.taken.is_empty() {
                 store::put_folder(c, &m.merged)?;
                 out.changed = Some(key);
+                out.groups = m.taken.clone();
             }
         }
     }
+    relay_groups(c, &key, &mut out, relay, peer)?;
     Ok(out)
 }
 
-fn apply_place(c: &Connection, peer: DeviceId, remote: &PlaceRecord, now: i64) -> Result<Applied> {
+fn apply_place(c: &Connection, peer: DeviceId, remote: &PlaceRecord, relay: Option<u64>, now: i64) -> Result<Applied> {
     let key = EntityKey::Place { id: remote.id };
     let mut out = Applied::default();
     match store::get_place(c, remote.id)? {
         None => {
             store::put_place(c, remote)?;
             out.changed = Some(key);
+            out.groups = vec![group::ALL];
         }
         Some(local) => {
             let m = merge_place(&local, remote)?;
@@ -487,9 +519,11 @@ fn apply_place(c: &Connection, peer: DeviceId, remote: &PlaceRecord, now: i64) -
             if !m.taken.is_empty() {
                 store::put_place(c, &m.merged)?;
                 out.changed = Some(key);
+                out.groups = m.taken.clone();
             }
         }
     }
+    relay_groups(c, &key, &mut out, relay, peer)?;
     Ok(out)
 }
 
@@ -645,7 +679,7 @@ mod tests {
     }
 
     fn apply(d: &Db, me: DeviceId, peer: DeviceId, r: &ItemRecord) -> Applied {
-        apply_remote(&d.conn, me, peer, &Record::Item(r.clone()), T0 + 1000).unwrap()
+        apply_remote(&d.conn, me, peer, &Record::Item(r.clone()), false, T0 + 1000).unwrap()
     }
 
     fn conflicts(d: &Db) -> Vec<String> {
@@ -775,10 +809,10 @@ mod tests {
     fn receipts_via_apply_remote() {
         let d = db_with_peer(p(), f());
         let r = Record::Receipt(ReceiptRecord { hash: hash(1), device: f(), received_at: 77 });
-        let a = apply_remote(&d.conn, p(), f(), &r, T0).unwrap();
+        let a = apply_remote(&d.conn, p(), f(), &r, false, T0).unwrap();
         assert_eq!(a.changed, Some(EntityKey::Receipt { hash: hash(1), device: f() }));
         assert!(store::peer_has_receipt(&d.conn, hash(1), f()).unwrap());
-        let a = apply_remote(&d.conn, p(), f(), &r, T0 + 5).unwrap();
+        let a = apply_remote(&d.conn, p(), f(), &r, false, T0 + 5).unwrap();
         assert_eq!(a.changed, None, "duplicate");
         let seen: i64 = d.conn.query_row("SELECT seen_at FROM receipt", [], |r| r.get(0)).unwrap();
         assert_eq!(seen, T0, "seen_at not moved by a duplicate");
@@ -832,14 +866,14 @@ mod tests {
     fn new_remote_item_is_pending_and_not_logged() {
         let d = db_with_peer(p(), f());
         let it = item(2, f(), v(4, f()));
-        let a = apply_remote(&d.conn, p(), f(), &Record::Item(it.clone()), T0).unwrap();
+        let a = apply_remote(&d.conn, p(), f(), &Record::Item(it.clone()), false, T0).unwrap();
         assert!(a.content_changed);
         assert_eq!(a.changed, Some(EntityKey::Item { id: it.id }));
         assert_eq!(store::get_item(&d.conn, it.id).unwrap().unwrap().1, LocalFileState::Pending);
         assert_eq!(store::head_seq(&d.conn).unwrap(), 0);
         assert_eq!(store::max_lamport(&d.conn).unwrap(), 4, "M7: remote versions observed");
         // Same record again: nothing changes.
-        let a = apply_remote(&d.conn, p(), f(), &Record::Item(it), T0).unwrap();
+        let a = apply_remote(&d.conn, p(), f(), &Record::Item(it), false, T0).unwrap();
         assert_eq!(a.changed, None);
         assert!(!a.content_changed);
     }
@@ -867,14 +901,14 @@ mod tests {
         // E9: retention Keep (GENESIS) vs 3 days (4,F).
         let mut inbox = store::get_folder(&d.conn, INBOX_ID).unwrap().unwrap();
         inbox.retention = vs(v(4, f()), Retention::Secs { secs: 3 * 86_400 });
-        let a = apply_remote(&d.conn, p(), f(), &Record::Folder(inbox.clone()), T0).unwrap();
+        let a = apply_remote(&d.conn, p(), f(), &Record::Folder(inbox.clone()), false, T0).unwrap();
         assert_eq!(a.changed, Some(EntityKey::Folder { id: INBOX_ID }));
         assert_eq!(store::get_folder(&d.conn, INBOX_ID).unwrap().unwrap().retention.val, Retention::Secs { secs: 3 * 86_400 });
         // The same record again: no change. The default records themselves: no change.
-        assert_eq!(apply_remote(&d.conn, p(), f(), &Record::Folder(inbox), T0).unwrap().changed, None);
+        assert_eq!(apply_remote(&d.conn, p(), f(), &Record::Folder(inbox), false, T0).unwrap().changed, None);
         for fr in crate::folders::default_folders() {
             if fr.id != INBOX_ID {
-                assert_eq!(apply_remote(&d.conn, p(), f(), &Record::Folder(fr), T0).unwrap().changed, None);
+                assert_eq!(apply_remote(&d.conn, p(), f(), &Record::Folder(fr), false, T0).unwrap().changed, None);
             }
         }
         // A new place arrives, then a rename merges without touching its area.
@@ -885,10 +919,10 @@ mod tests {
             target: vs(v(2, f()), INBOX_ID),
             deleted: vs(v(2, f()), None),
         };
-        apply_remote(&d.conn, p(), f(), &Record::Place(pl.clone()), T0).unwrap();
+        apply_remote(&d.conn, p(), f(), &Record::Place(pl.clone()), false, T0).unwrap();
         let mut renamed = pl.clone();
         renamed.name = vs(v(6, f()), "Site 2".into());
-        let a = apply_remote(&d.conn, p(), f(), &Record::Place(renamed), T0).unwrap();
+        let a = apply_remote(&d.conn, p(), f(), &Record::Place(renamed), false, T0).unwrap();
         assert!(a.changed.is_some());
         let got = store::get_place(&d.conn, pl.id).unwrap().unwrap();
         assert_eq!(got.name.val, "Site 2");
@@ -901,7 +935,7 @@ mod tests {
         let d = db_with_peer(p(), f());
         let mut keep = store::get_folder(&d.conn, KEEP_ID).unwrap().unwrap();
         keep.retention = vs(v(4, f()), Retention::Secs { secs: 3 * 86_400 });
-        assert!(matches!(apply_remote(&d.conn, p(), f(), &Record::Folder(keep), T0), Err(CoreError::Protocol(_))));
+        assert!(matches!(apply_remote(&d.conn, p(), f(), &Record::Folder(keep), false, T0), Err(CoreError::Protocol(_))));
         assert_eq!(store::get_folder(&d.conn, KEEP_ID).unwrap().unwrap().retention.val, Retention::Keep);
     }
 
@@ -914,7 +948,7 @@ mod tests {
         assert_eq!(store::max_lamport(&d.conn).unwrap(), before);
         let mut fo = store::get_folder(&d.conn, INBOX_ID).unwrap().unwrap();
         fo.name = vs(v(u64::MAX, f()), "x".into());
-        assert!(matches!(apply_remote(&d.conn, p(), f(), &Record::Folder(fo), T0), Err(CoreError::Protocol(_))));
+        assert!(matches!(apply_remote(&d.conn, p(), f(), &Record::Folder(fo), false, T0), Err(CoreError::Protocol(_))));
         let pl = PlaceRecord {
             id: PlaceId(Uuid::from_u128(0x902)),
             name: vs(v(u64::MAX, f()), "x".into()),
@@ -922,12 +956,176 @@ mod tests {
             target: vs(v(1, f()), INBOX_ID),
             deleted: vs(v(1, f()), None),
         };
-        assert!(matches!(apply_remote(&d.conn, p(), f(), &Record::Place(pl), T0), Err(CoreError::Protocol(_))));
+        assert!(matches!(apply_remote(&d.conn, p(), f(), &Record::Place(pl), false, T0), Err(CoreError::Protocol(_))));
         let mut it = item(7, f(), v(2, f()));
         it.name = vs(v(i64::MAX as u64, f()), "x.jpg".into());
-        assert!(matches!(apply_remote(&d.conn, p(), f(), &Record::Item(it), T0), Err(CoreError::Protocol(_))));
+        assert!(matches!(apply_remote(&d.conn, p(), f(), &Record::Item(it), false, T0), Err(CoreError::Protocol(_))));
         assert_eq!(store::max_lamport(&d.conn).unwrap(), before);
         assert_eq!(store::next_version(&d.conn, p()).unwrap().lamport, before + 1);
+    }
+
+    /// (entity, field group, src) of every change_log row, in seq order.
+    fn log_rows(d: &Db) -> Vec<(String, String, Option<DeviceId>)> {
+        d.conn
+            .prepare("SELECT entity, field_group, src FROM change_log ORDER BY seq")
+            .unwrap()
+            .query_map([], |r| {
+                let src: Option<Vec<u8>> = r.get(2)?;
+                Ok((r.get(0)?, r.get(1)?, src.map(|b| DeviceId(b.try_into().unwrap()))))
+            })
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    fn apply_relay(d: &Db, me: DeviceId, peer: DeviceId, r: Record) -> Applied {
+        apply_remote(&d.conn, me, peer, &r, true, T0 + 1000).unwrap()
+    }
+
+    // The phone logs each group it took from a PC, tagged with that PC, once per group.
+    #[test]
+    fn relay_logs_taken_groups_with_src() {
+        let (dp, _df, base) = pair_with_item();
+        let mut remote = base.clone();
+        remote.name = vs(v(5, f()), "renamed.jpg".into());
+        remote.pinned = vs(v(6, f()), true);
+        let a = apply_relay(&dp, p(), f(), Record::Item(remote.clone()));
+        assert_eq!(a.groups, vec![group::NAME, group::PINNED]);
+        assert!(a.relayed);
+        assert_eq!(
+            log_rows(&dp),
+            vec![("item".into(), "name".into(), Some(f())), ("item".into(), "pinned".into(), Some(f()))]
+        );
+        // The row carries a version, never 0, for a record group.
+        let lamport: i64 = dp.conn.query_row("SELECT lamport FROM change_log WHERE field_group = 'name'", [], |r| r.get(0)).unwrap();
+        assert_eq!(lamport, 6);
+        // The sender is not sent the key back; another PC is.
+        let key = EntityKey::Item { id: base.id };
+        assert!(store::changes_since(&dp.conn, 0, 10, f()).unwrap().0.is_empty());
+        assert_eq!(store::changes_since(&dp.conn, 0, 10, dev(0xCC)).unwrap().0, vec![key]);
+    }
+
+    // A merge that changes nothing writes nothing: this is what stops an echo between PCs.
+    #[test]
+    fn noop_merge_logs_nothing() {
+        let (dp, _df, base) = pair_with_item();
+        // The same record again, and an older one.
+        for r in [base.clone(), {
+            let mut older = base.clone();
+            older.name = vs(v(0, f()), "older.jpg".into());
+            older
+        }] {
+            let a = apply_relay(&dp, p(), f(), Record::Item(r));
+            assert_eq!(a.changed, None);
+            assert!(a.groups.is_empty() && !a.relayed);
+        }
+        assert_eq!(store::head_seq(&dp.conn).unwrap(), 0);
+        // A taken change is logged once; the same record arriving again is a no-op.
+        let mut remote = base.clone();
+        remote.name = vs(v(5, f()), "renamed.jpg".into());
+        apply_relay(&dp, p(), f(), Record::Item(remote.clone()));
+        let again = apply_relay(&dp, p(), f(), Record::Item(remote));
+        assert!(again.groups.is_empty() && !again.relayed);
+        assert_eq!(log_rows(&dp).len(), 1);
+        // Same for a folder and a receipt.
+        let inbox = store::get_folder(&dp.conn, INBOX_ID).unwrap().unwrap();
+        assert!(apply_relay(&dp, p(), f(), Record::Folder(inbox)).groups.is_empty());
+        let rc = Record::Receipt(ReceiptRecord { hash: hash(1), device: f(), received_at: 3 });
+        apply_relay(&dp, p(), f(), rc.clone());
+        assert!(apply_relay(&dp, p(), f(), rc).groups.is_empty());
+        assert_eq!(log_rows(&dp).len(), 2);
+    }
+
+    // A record that is new here is logged as a whole, the way a local create is.
+    #[test]
+    fn new_record_logs_all() {
+        let d = db_with_peer(p(), f());
+        let it = item(2, f(), v(4, f()));
+        let a = apply_relay(&d, p(), f(), Record::Item(it));
+        assert_eq!(a.groups, vec![group::ALL]);
+        let fo = FolderRecord { id: FolderId(Uuid::from_u128(0x500)), kind: FolderKind::User, name: vs(v(2, f()), "Work".into()), retention: vs(v(2, f()), Retention::Keep), deleted: vs(v(2, f()), None) };
+        assert_eq!(apply_relay(&d, p(), f(), Record::Folder(fo)).groups, vec![group::ALL]);
+        let pl = PlaceRecord {
+            id: PlaceId(Uuid::from_u128(0x800)),
+            name: vs(v(2, f()), "Site".into()),
+            area: vs(v(2, f()), Area { lat: -30.0, lon: 151.0, radius_m: 150.0 }),
+            target: vs(v(2, f()), INBOX_ID),
+            deleted: vs(v(2, f()), None),
+        };
+        assert_eq!(apply_relay(&d, p(), f(), Record::Place(pl)).groups, vec![group::ALL]);
+        assert_eq!(
+            log_rows(&d),
+            vec![
+                ("item".into(), "all".into(), Some(f())),
+                ("folder".into(), "all".into(), Some(f())),
+                ("place".into(), "all".into(), Some(f())),
+            ]
+        );
+    }
+
+    #[test]
+    fn new_receipt_logs_all() {
+        let d = db_with_peer(p(), f());
+        let a = apply_relay(&d, p(), f(), Record::Receipt(ReceiptRecord { hash: hash(1), device: dev(0xCC), received_at: 3 }));
+        assert_eq!(a.groups, vec![group::ALL]);
+        assert!(a.relayed);
+        assert_eq!(log_rows(&d), vec![("receipt".into(), "all".into(), Some(f()))]);
+        let lamport: i64 = d.conn.query_row("SELECT lamport FROM change_log", [], |r| r.get(0)).unwrap();
+        assert_eq!(lamport, 0, "a receipt has no version");
+    }
+
+    // A PC (not the hub) never logs what it applies, whatever it applies.
+    #[test]
+    fn leaf_never_logs_remote() {
+        let (dp, _df, base) = pair_with_item();
+        let mut remote = base.clone();
+        remote.name = vs(v(5, f()), "renamed.jpg".into());
+        let a = apply_remote(&dp.conn, p(), f(), &Record::Item(remote), false, T0).unwrap();
+        assert_eq!(a.groups, vec![group::NAME], "it still says what changed");
+        assert!(!a.relayed);
+        apply_remote(&dp.conn, p(), f(), &Record::Item(item(2, f(), v(4, f()))), false, T0).unwrap();
+        apply_remote(&dp.conn, p(), f(), &Record::Receipt(ReceiptRecord { hash: hash(1), device: f(), received_at: 3 }), false, T0).unwrap();
+        assert_eq!(store::head_seq(&dp.conn).unwrap(), 0);
+    }
+
+    // On the phone the delete-vs-keep rewrite is its own write (src NULL), after the row for what was taken.
+    #[test]
+    fn m5_rewrite_logs_src_null_on_hub() {
+        let (dp, _df, base) = pair_with_item();
+        let mut on_p = base.clone();
+        on_p.deleted = vs(v(6, p()), Some(T0 + 5));
+        store::update_item(&dp.conn, &on_p).unwrap();
+        let mut on_f = base.clone();
+        on_f.pinned = vs(v(8, f()), true);
+        let a = apply_relay(&dp, p(), f(), Record::Item(on_f));
+        assert!(a.wrote_local);
+        assert_eq!(a.groups, vec![group::PINNED], "only what was taken counts as relayed");
+        assert_eq!(
+            log_rows(&dp),
+            vec![("item".into(), "pinned".into(), Some(f())), ("item".into(), "deleted".into(), None)],
+            "the rewrite of the losing group is this device's own write"
+        );
+        // The PC that sent the pin is still owed the rewrite; it never gets its own pin back.
+        let key = EntityKey::Item { id: base.id };
+        assert_eq!(store::changes_since(&dp.conn, 0, 10, f()).unwrap().0, vec![key]);
+        assert_eq!(store::changes_since(&dp.conn, 1, 10, f()).unwrap().0, vec![key]);
+    }
+
+    // A change the peer sent is not "concurrent with the peer" when it comes back around the hub.
+    #[test]
+    fn m6_ignores_rows_taken_from_the_same_peer() {
+        let (dp, _df, base) = pair_with_item();
+        store::set_pulled(&dp.conn, f(), 0).unwrap();
+        // The hub took f's rename and relayed it (a row tagged with f, not yet acked by f).
+        let mut first = base.clone();
+        first.name = vs(v(3, f()), "one.jpg".into());
+        apply_relay(&dp, p(), f(), Record::Item(first));
+        // f sends a newer rename of its own: no conflict, f only replaced its own write.
+        let mut second = base.clone();
+        second.name = vs(v(5, f()), "two.jpg".into());
+        let a = apply_relay(&dp, p(), f(), Record::Item(second));
+        assert_eq!(a.conflicts, 0);
+        assert!(conflicts(&dp).is_empty());
     }
 
     // Trust boundary: a paired peer's malformed record is refused, nothing stored.
@@ -944,11 +1142,11 @@ mod tests {
         upper.content.val.ext = "JPG".into();
         for r in [bad_ext, path_ext, huge_name, upper] {
             let id = r.id;
-            assert!(matches!(apply_remote(&d.conn, p(), f(), &Record::Item(r), T0), Err(CoreError::Protocol(_))));
+            assert!(matches!(apply_remote(&d.conn, p(), f(), &Record::Item(r), false, T0), Err(CoreError::Protocol(_))));
             assert!(store::get_item(&d.conn, id).unwrap().is_none());
         }
         let zero = FolderRecord { id: FolderId(Uuid::from_u128(0x900)), kind: FolderKind::User, name: vs(v(1, f()), "x".into()), retention: vs(v(1, f()), Retention::Secs { secs: 0 }), deleted: vs(v(1, f()), None) };
-        assert!(matches!(apply_remote(&d.conn, p(), f(), &Record::Folder(zero), T0), Err(CoreError::Protocol(_))));
+        assert!(matches!(apply_remote(&d.conn, p(), f(), &Record::Folder(zero), false, T0), Err(CoreError::Protocol(_))));
         let bad_place = PlaceRecord {
             id: PlaceId(Uuid::from_u128(0x901)),
             name: vs(v(1, f()), "x".into()),
@@ -956,13 +1154,13 @@ mod tests {
             target: vs(v(1, f()), INBOX_ID),
             deleted: vs(v(1, f()), None),
         };
-        assert!(matches!(apply_remote(&d.conn, p(), f(), &Record::Place(bad_place), T0), Err(CoreError::Protocol(_))));
+        assert!(matches!(apply_remote(&d.conn, p(), f(), &Record::Place(bad_place), false, T0), Err(CoreError::Protocol(_))));
         // Different immutable data under an existing id: Protocol, local kept.
         let (dp, _df, base) = pair_with_item();
         let mut forged = base.clone();
         forged.captured_at += 5;
         forged.name = vs(v(50, f()), "forged".into());
-        assert!(matches!(apply_remote(&dp.conn, p(), f(), &Record::Item(forged), T0), Err(CoreError::Protocol(_))));
+        assert!(matches!(apply_remote(&dp.conn, p(), f(), &Record::Item(forged), false, T0), Err(CoreError::Protocol(_))));
         assert_eq!(store::get_item(&dp.conn, base.id).unwrap().unwrap().0, base);
     }
 }

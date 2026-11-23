@@ -6,15 +6,14 @@ import org.junit.Test
 import uniffi.tugboat_ffi.ItemStateInfo
 import uniffi.tugboat_ffi.SnapException
 import uniffi.tugboat_ffi.SyncState
-import uniffi.tugboat_ffi.SyncStatus
 
 class TextsTest {
     private val min = 60_000L
     private val hour = 60 * min
     private val day = 24 * hour
 
-    private fun status(state: SyncState, peer: String? = "OFFICE-PC", last: Long? = null, waiting: UInt = 0u, message: String? = null) =
-        SyncStatus(state, peer, last, waiting, 0u, false, message)
+    private fun status(state: SyncState, last: Long? = null, waiting: UInt = 0u, message: String? = null) =
+        TestData.status(state, waiting = waiting, message = message, lastSyncedAt = last)
 
     @Test fun duration_rounds_down_and_switches_unit() {
         assertEquals("<1m", Texts.duration(59_999))

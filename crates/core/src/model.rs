@@ -336,9 +336,14 @@ pub struct DeviceRow {
     pub paired_at: Option<i64>,
     pub unpaired_at: Option<i64>,
     pub last_seen_at: Option<i64>,
+    /// Last time this peer's session reached Synced (local only).
+    pub last_synced_at: Option<i64>,
     /// Last-known "ip:port" addresses (local only, dialed first by the phone).
     pub addresses: Vec<String>,
 }
+
+/// Most PCs one phone keeps linked at once (the phone itself is not counted).
+pub const MAX_LINKED: u32 = 5;
 
 /// Local settings (`setting` table). Business rules are settings, not constants.
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
@@ -417,6 +422,9 @@ pub struct ItemView {
     /// In the Bin because it EXPIRED, and the paired device never confirmed holding this file:
     /// the item may now exist on this device only (shown as "NOT ON PC" / "NOT ON PHONE").
     pub never_reached_peer: bool,
+    /// For an item in the Bin because it expired: the names of the linked devices that never
+    /// confirmed holding the file (empty otherwise; `never_reached_peer` is true when not empty).
+    pub missing_on: Vec<String>,
 }
 
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]

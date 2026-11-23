@@ -8,7 +8,7 @@ import type { LibraryStatus } from "./bindings/LibraryStatus";
 import type { SyncStatus } from "./bindings/SyncStatus";
 import { dropBanner } from "./drop";
 
-export type BannerAction = "fw-fix" | "fw-recheck" | "lib-locate" | "lib-rescan" | "lib-bin" | "lib-wait" | "lib-choose" | "not-synced" | "dismiss-error" | "dismiss-drop";
+export type BannerAction = "fw-fix" | "fw-recheck" | "lib-locate" | "lib-rescan" | "lib-bin" | "lib-wait" | "lib-choose" | "not-synced" | "dismiss-error" | "dismiss-drop" | "dismiss-removed";
 
 export interface Banner {
   id: string;
@@ -33,6 +33,8 @@ export interface BannerInput {
   error: { kind: string; message: string } | null;
   /** The last drop that left files behind (refused or failed), until dismissed. */
   drop: DropReport | null;
+  /** The phone logged this PC out; until dismissed or linked again. */
+  removedByPhone: boolean;
 }
 
 export function computeBanners(i: BannerInput): Banner[] {
@@ -92,6 +94,9 @@ export function computeBanners(i: BannerInput): Banner[] {
   }
   if (i.sync?.state === "refused") {
     out.push({ id: "refused", tone: "danger", text: `SYNC REFUSED${i.sync.message ? ` - ${i.sync.message}` : ""}`, actions: [] });
+  }
+  if (i.removedByPhone) {
+    out.push({ id: "removed", tone: "warn", text: "REMOVED BY PHONE - link again to sync", actions: [{ id: "dismiss-removed", label: "Dismiss" }] });
   }
   const drop = i.drop ? dropBanner(i.drop) : null;
   if (drop) {

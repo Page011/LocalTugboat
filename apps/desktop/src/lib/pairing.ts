@@ -35,6 +35,8 @@ export function nextPairPhase(s: PairPhase, i: PairInput): PairPhase {
       return s.t === "qr" ? { t: "cancelled", message: "QR EXPIRED - make a new one" } : s;
     case "event": {
       const e = i.e;
+      // Logged out (here or by the phone): a "Linked to X" or half-finished screen would be stale.
+      if (e.kind === "unpaired" && (s.t === "done" || s.t === "qr" || s.t === "code")) return { t: "idle" };
       // Events while no pairing is open on this screen belong to nobody here: ignore them.
       if (s.t === "idle" || s.t === "done" || s.t === "cancelled") return s;
       switch (e.kind) {

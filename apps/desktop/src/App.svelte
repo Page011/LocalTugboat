@@ -20,7 +20,7 @@
     { id: "gallery", label: "Gallery", icon: Images },
     { id: "bin", label: "Bin", icon: Trash2 },
     { id: "activity", label: "Activity", icon: History },
-    { id: "pair", label: "Pair", icon: Smartphone },
+    { id: "pair", label: "Link phone", icon: Smartphone },
     { id: "settings", label: "Settings", icon: SettingsIcon },
   ];
 

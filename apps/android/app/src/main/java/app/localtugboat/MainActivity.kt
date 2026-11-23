@@ -91,7 +91,7 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * A pairing link only ever shows the "Pair with this PC?" dialog. Intent extras are never read:
+     * A pairing link only ever shows the "Link this PC?" dialog. Intent extras are never read:
      * any app can send an intent, so nothing in it may decide what we connect to.
      */
     private fun handleIntent(intent: Intent) {

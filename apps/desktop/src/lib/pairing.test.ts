@@ -30,6 +30,21 @@ describe("nextPairPhase", () => {
     const done: PairPhase = { t: "done", peerName: "x" };
     expect(nextPairPhase(done, { t: "event", e: { kind: "cancelled", code: "c", message: "m" } })).toBe(done);
   });
+  test("a log out ends a Linked-to screen, a QR and a code", () => {
+    const unpaired = { t: "event" as const, e: { kind: "unpaired" as const, peer: "d", by_peer: true } };
+    expect(nextPairPhase({ t: "done", peerName: "x" }, unpaired)).toEqual({ t: "idle" });
+    expect(nextPairPhase(qr, unpaired)).toEqual({ t: "idle" });
+    expect(nextPairPhase(code, unpaired)).toEqual({ t: "idle" });
+    // completed, then the old phone's log out arrives
+    const done = nextPairPhase(code, { t: "event", e: { kind: "completed", peer: "d", peer_name: "Pixel" } });
+    expect(nextPairPhase(done, { t: "event", e: { kind: "unpaired", peer: "o", by_peer: false } })).toEqual({ t: "idle" });
+  });
+  test("a log out with nothing open, or an error screen, changes nothing", () => {
+    const idle: PairPhase = { t: "idle" };
+    expect(nextPairPhase(idle, { t: "event", e: { kind: "unpaired", peer: "d", by_peer: true } })).toBe(idle);
+    const cancelled: PairPhase = { t: "cancelled", message: "m" };
+    expect(nextPairPhase(cancelled, { t: "event", e: { kind: "unpaired", peer: "d", by_peer: true } })).toBe(cancelled);
+  });
   test("reset goes back to idle", () => {
     expect(nextPairPhase({ t: "done", peerName: "x" }, { t: "reset" })).toEqual({ t: "idle" });
   });

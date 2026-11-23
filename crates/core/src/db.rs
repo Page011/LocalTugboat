@@ -27,10 +27,10 @@ use rusqlite::{Connection, TransactionBehavior};
 use crate::{clock::Clock, CoreError, Result};
 
 /// Highest schema version this build knows.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Migration SQL, index i = from version i to i + 1.
-pub const MIGRATIONS: &[&str] = &[include_str!("schema/v1.sql"), include_str!("schema/v2.sql")];
+pub const MIGRATIONS: &[&str] = &[include_str!("schema/v1.sql"), include_str!("schema/v2.sql"), include_str!("schema/v3.sql")];
 
 /// File name of the database inside the data dir (%LOCALAPPDATA%\Local Tugboat on the PC,
 /// filesDir on Android).
@@ -213,7 +213,7 @@ mod tests {
         }
         let before = std::fs::read(&path).unwrap();
         match Db::open(dir.path()) {
-            Err(CoreError::NewerDatabase { found: 99, supported: 2 }) => {}
+            Err(CoreError::NewerDatabase { found: 99, supported: 3 }) => {}
             other => panic!("expected NewerDatabase, got {:?}", other.map(|_| ())),
         }
         assert_eq!(std::fs::read(&path).unwrap(), before);
@@ -310,7 +310,7 @@ mod tests {
             d.conn.execute("INSERT INTO file_ref (item_id, path) VALUES (x'00000000000000000000000000000001', 'C:/lib/a.jpg')", []).unwrap();
             before = dump(&d.conn, &format!("SELECT {cols} FROM item ORDER BY id"));
         }
-        let d = Db::open(dir.path()).unwrap();
+        let d = Db::open_with(dir.path(), &MIGRATIONS[..2]).unwrap();
         assert_eq!(d.user_version().unwrap(), 2);
         assert_eq!(dump(&d.conn, &format!("SELECT {cols} FROM item ORDER BY id")), before, "every item row is identical after the rebuild");
         // The backup is the v1 file: a 'file' row is refused there, accepted here.
@@ -328,9 +328,85 @@ mod tests {
         d.conn.execute("UPDATE file_ref SET mtime_ms = 5", []).unwrap();
         drop(d);
         // Reopening is idempotent and keeps the rows.
-        let again = Db::open(dir.path()).unwrap();
+        let again = Db::open_with(dir.path(), &MIGRATIONS[..2]).unwrap();
         let n: i64 = again.conn.query_row("SELECT count(*) FROM item", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 26);
+    }
+
+    // v2 -> v3 on a real 0.2.x file: rows kept, the old single last-synced setting moves onto the
+    // linked device row, the floor starts just below the oldest log row, the v2 file is backed up.
+    #[test]
+    fn migration_v2_to_v3_keeps_rows_sets_floor_and_last_synced() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let d = Db::open_with(dir.path(), &MIGRATIONS[..2]).unwrap();
+            assert_eq!(d.user_version().unwrap(), 2);
+            for (seq, id) in [(7, 1u8), (8, 2), (9, 1)] {
+                d.conn
+                    .execute("INSERT INTO change_log (seq, entity, entity_id, field_group, lamport) VALUES (?1, 'item', ?2, 'name', ?1)", rusqlite::params![seq, vec![id; 16]])
+                    .unwrap();
+            }
+            for (id, paired, unpaired) in [(1u8, Some(5), None::<i64>), (2, Some(6), Some(9)), (3, None, None)] {
+                d.conn
+                    .execute(
+                        "INSERT INTO device (id, name, is_self, role, paired_at, unpaired_at) VALUES (?1, 'pc', 0, 'pc', ?2, ?3)",
+                        rusqlite::params![vec![id; 32], paired, unpaired],
+                    )
+                    .unwrap();
+            }
+            d.conn.execute("INSERT INTO setting (key, value) VALUES ('last_synced_at', '123456')", []).unwrap();
+        }
+        let d = Db::open(dir.path()).unwrap();
+        assert_eq!(d.user_version().unwrap(), 3);
+        let log: Vec<(i64, Option<Vec<u8>>)> = d
+            .conn
+            .prepare("SELECT seq, src FROM change_log ORDER BY seq")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(log, vec![(7, None), (8, None), (9, None)], "every row kept, written here");
+        let floor: String = d.conn.query_row("SELECT value FROM setting WHERE key = 'log_floor'", [], |r| r.get(0)).unwrap();
+        assert_eq!(floor, "6", "one below the oldest row held");
+        let synced = |id: u8| -> Option<i64> { d.conn.query_row("SELECT last_synced_at FROM device WHERE id = ?1", [vec![id; 32]], |r| r.get(0)).unwrap() };
+        assert_eq!((synced(1), synced(2), synced(3)), (Some(123456), None, None), "only the linked device takes the old value");
+        let old: i64 = d.conn.query_row("SELECT count(*) FROM setting WHERE key = 'last_synced_at'", [], |r| r.get(0)).unwrap();
+        assert_eq!(old, 0, "the single setting is gone");
+        assert!(d.conn.execute("UPDATE change_log SET src = x'0102' WHERE seq = 7", []).is_err(), "src is 32 bytes or NULL");
+        let bak = Connection::open(backup_path(dir.path(), 2)).unwrap();
+        assert_eq!(read_version(&bak).unwrap(), 2);
+        assert!(bak.prepare("SELECT src FROM change_log").is_err(), "the backup is the v2 file");
+        let n: i64 = bak.query_row("SELECT count(*) FROM change_log", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 3);
+    }
+
+    // An empty log starts the floor at the head (or 0 when nothing was ever logged).
+    #[test]
+    fn migration_v2_to_v3_floor_follows_the_head_when_the_log_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let d = Db::open_with(dir.path(), &MIGRATIONS[..2]).unwrap();
+            d.conn.execute("INSERT INTO change_log (entity, entity_id, field_group, lamport) VALUES ('item', zeroblob(16), 'name', 1)", []).unwrap();
+            d.conn.execute("INSERT INTO change_log (entity, entity_id, field_group, lamport) VALUES ('item', zeroblob(16), 'name', 2)", []).unwrap();
+            d.conn.execute("DELETE FROM change_log", []).unwrap();
+        }
+        let d = Db::open(dir.path()).unwrap();
+        let floor: String = d.conn.query_row("SELECT value FROM setting WHERE key = 'log_floor'", [], |r| r.get(0)).unwrap();
+        assert_eq!(floor, "2");
+    }
+
+    #[test]
+    fn fresh_db_at_v3_floor_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = Db::open(dir.path()).unwrap();
+        assert_eq!(d.user_version().unwrap(), 3);
+        let floor: String = d.conn.query_row("SELECT value FROM setting WHERE key = 'log_floor'", [], |r| r.get(0)).unwrap();
+        assert_eq!(floor, "0");
+        assert!(!backup_path(dir.path(), 2).exists(), "a new database is not backed up");
+        let mem = Db::open_in_memory().unwrap();
+        let floor: String = mem.conn.query_row("SELECT value FROM setting WHERE key = 'log_floor'", [], |r| r.get(0)).unwrap();
+        assert_eq!(floor, "0");
     }
 
     fn dump(c: &Connection, sql: &str) -> Vec<String> {
