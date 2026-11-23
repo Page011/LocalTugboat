@@ -244,6 +244,25 @@ pub struct ItemRecord {
     pub pinned: Versioned<bool>,
     /// Some(unix ms) = user-deleted (in the Bin). None = not deleted.
     pub deleted: Versioned<Option<i64>>,
+    /// Some(unix ms) = deleted forever (a tombstone: the file and thumbnail are gone on every
+    /// device that merged it). Grow-only: once set, nothing unsets it. The version is that of the
+    /// purge, always above `GENESIS`; two concurrent purges settle on the higher one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purged: Option<Versioned<i64>>,
+}
+
+impl ItemRecord {
+    /// A deleted-forever record keeps no personal data: no name, no saved location, no thumbnail. Only what
+    /// the item needs to stay gone is left (id, versions, the purged group, file hash, size and type).
+    /// Every device scrubs the same way, so a merge ends in the same record everywhere. Idempotent; a
+    /// record that is not purged is untouched.
+    pub fn scrub_purged(&mut self) {
+        if self.purged.is_some() {
+            self.name.val.clear();
+            self.geo = None;
+            self.content.val.thumb = None;
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
@@ -318,6 +337,7 @@ pub mod group {
     pub const PLACEMENT: &str = "placement";
     pub const PINNED: &str = "pinned";
     pub const DELETED: &str = "deleted";
+    pub const PURGED: &str = "purged";
     pub const RETENTION: &str = "retention";
     pub const AREA: &str = "area";
     pub const TARGET: &str = "target";
@@ -485,6 +505,8 @@ pub enum ActivityAction {
     Returned,
     /// This device deleted its copy after Bin days.
     Purged,
+    /// Deleted forever: removed from the Bin on every linked device, never restorable.
+    DeletedForever,
     /// Received file failed the type check.
     Refused,
     /// Same field changed on both devices while apart; detail names winner and loser.

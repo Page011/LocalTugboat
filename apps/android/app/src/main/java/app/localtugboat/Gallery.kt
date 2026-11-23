@@ -27,6 +27,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
@@ -35,7 +36,9 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -50,6 +53,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.launch
+import uniffi.tugboat_ffi.BinCount
 import uniffi.tugboat_ffi.FfiEvent
 import uniffi.tugboat_ffi.FolderInfo
 import uniffi.tugboat_ffi.ItemInfo
@@ -175,7 +179,19 @@ private fun ItemCell(item: ItemInfo, cell: UiLogic.CellUi, onClick: () -> Unit) 
     }
 }
 
-/** Bin: what was deleted or expired, days left, Restore. Tapping a row opens it in the viewer. */
+/** The question before Delete forever and Empty Bin: what goes, and from where. */
+@Composable
+fun ForeverDialog(title: String, text: String, confirm: String, onConfirm: () -> Unit, onDismiss: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(title) },
+        text = { Text(text) },
+        confirmButton = { TextButton(onClick = onConfirm) { Text(confirm, color = MaterialTheme.colorScheme.error) } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
+}
+
+/** Bin: what was deleted or expired, days left, Restore, Delete forever, Empty Bin. Tapping a row opens it in the viewer. */
 @Composable
 fun BinScreen(vm: SnapViewModel, ui: UiState) {
     val model = vm.itemsModel(null, true)
@@ -184,6 +200,8 @@ fun BinScreen(vm: SnapViewModel, ui: UiState) {
     val binDays = ui.settings?.binDays ?: 7u
     val scope = androidx.compose.runtime.rememberCoroutineScope()
     val listState = rememberLazyListState()
+    var deleteId by remember { mutableStateOf<String?>(null) }
+    var emptyAsk by remember { mutableStateOf<BinCount?>(null) }
 
     // Next page when the last visible row is near the end of what is loaded (same rule as the gallery grid).
     LaunchedEffect(model, listState) {
@@ -193,7 +211,15 @@ fun BinScreen(vm: SnapViewModel, ui: UiState) {
     }
 
     Column(Modifier.fillMaxSize()) {
-        ScreenBar("Bin", onBack = { vm.nav.back() })
+        ScreenBar("Bin", onBack = { vm.nav.back() }) {
+            val any = model.rows.isNotEmpty()
+            // The count in the question is read from the core now, not from the pages loaded so far; its token
+            // names those exact items, so Empty Bin deletes only while the Bin still lists them.
+            TextButton(
+                onClick = { scope.launch { vm.binCount()?.let { ask -> if (ask.count > 0u) emptyAsk = ask else model.reload() } } },
+                enabled = any, modifier = Modifier.defaultMinSize(minHeight = Touch),
+            ) { Text("Empty Bin", color = MaterialTheme.colorScheme.error.copy(alpha = if (any) 1f else 0.4f)) }
+        }
         Text("Items stay ${binDays} days, then this phone removes its copy.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp))
         Box(Modifier.weight(1f)) {
             ListStates(model, null, true, null, { scope.launch { model.reload() } }) {
@@ -222,11 +248,40 @@ fun BinScreen(vm: SnapViewModel, ui: UiState) {
                                 Spacer(Modifier.width(6.dp))
                                 Text("Restore")
                             }
+                            IconBtn(R.drawable.ic_delete, "Delete forever", { deleteId = item.id }, tint = MaterialTheme.colorScheme.error)
                         }
                     }
                 }
             }
         }
+    }
+
+    deleteId?.let { id ->
+        ForeverDialog(
+            Texts.DELETE_FOREVER_TITLE, Texts.DELETE_FOREVER_TEXT, "Delete forever",
+            onConfirm = {
+                deleteId = null
+                scope.launchThenReload(model) { vm.purge(id) }
+            },
+            onDismiss = { deleteId = null },
+        )
+    }
+    emptyAsk?.let { ask ->
+        ForeverDialog(
+            Texts.EMPTY_BIN_TITLE, Texts.emptyBinText(ask.count.toInt()), "Empty Bin",
+            onConfirm = {
+                emptyAsk = null
+                scope.launchThenReload(model) { vm.emptyBin(ask) }
+            },
+            onDismiss = { emptyAsk = null },
+        )
+    }
+}
+
+private fun kotlinx.coroutines.CoroutineScope.launchThenReload(model: PagedModel<ItemInfo>, job: () -> kotlinx.coroutines.Job) {
+    launch {
+        job().join()
+        model.reload()
     }
 }
 

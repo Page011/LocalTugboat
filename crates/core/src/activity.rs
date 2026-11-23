@@ -68,6 +68,10 @@ pub fn name_items(c: &Connection, mut rows: Vec<ActivityEntry>) -> Result<Vec<Ac
     for r in &mut rows {
         let Some(id) = r.item.filter(|_| r.action != ActivityAction::Renamed) else { continue };
         let Some((rec, _)) = crate::store::get_item(c, id)? else { continue };
+        // A deleted-forever item has no name left: its rows keep the detail they were logged with.
+        if rec.name.val.is_empty() {
+            continue;
+        }
         let name = rec.name.val;
         r.detail = match (r.action, r.detail.is_empty()) {
             (_, true) => name,
@@ -101,6 +105,7 @@ pub fn action_str(a: ActivityAction) -> &'static str {
         ActivityAction::Restored => "restored",
         ActivityAction::Returned => "returned",
         ActivityAction::Purged => "purged",
+        ActivityAction::DeletedForever => "deleted_forever",
         ActivityAction::Refused => "refused",
         ActivityAction::Conflict => "conflict",
         ActivityAction::Lost => "lost",

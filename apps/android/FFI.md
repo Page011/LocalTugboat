@@ -54,9 +54,11 @@ non-local address). Use it in the scanner (ignore other QR codes) and in the dee
 interface PhoneCoreInterface {
     fun activity(before: kotlin.Long?, limit: kotlin.UInt): List<ActivityInfo>
     fun addFile(file: NewFile): kotlin.String
+    fun binCount(): BinCount
     fun cancelPairing()
     fun deleteItem(id: kotlin.String)
     fun deviceId(): kotlin.String
+    fun emptyBin(shown: kotlin.UInt, token: kotlin.String): kotlin.UInt
     fun folders(): List<FolderInfo>
     fun freeSpaceBytes(): kotlin.ULong
     fun item(id: kotlin.String): ItemInfo?
@@ -64,6 +66,7 @@ interface PhoneCoreInterface {
     fun logPath(): kotlin.String
     fun moveItem(id: kotlin.String, folderIdTarget: kotlin.String)
     fun pairWith(payload: kotlin.String): PairedPc
+    fun purgeItem(id: kotlin.String)
     fun reconnectNow()
     fun restoreItem(id: kotlin.String)
     fun routeCapture(fix: LocationFix?): CaptureRoute
@@ -99,6 +102,9 @@ throw; every other method carries `@Throws(SnapException::class)` in the generat
 | `setPinned` | Keep / un-keep. A kept item never expires. |
 | `moveItem` | Move to another folder; its retention clock restarts there. |
 | `deleteItem` | To the Bin, restorable for `Settings.binDays`. |
+| `purgeItem(id)` | Delete forever. The item must be in the Bin (`Invalid` otherwise); a second call is harmless. It leaves the Bin here and on every linked PC as each merges it, the file and thumbnail are deleted on each device at once, and it cannot be restored anywhere (`restoreItem` then answers `NotFound`). Nothing waits for another device. |
+| `emptyBin(shown, token)` | `purgeItem` for every item the Bin lists. `shown` and `token` are what the confirmation named (`binCount`): when the Bin lists other items now, even the same number of them, nothing is deleted and `Invalid` says so. Returns how many. |
+| `binCount` | How many items `emptyBin` would delete, with the token that names exactly those items (for its confirmation). |
 | `restoreItem` | From the Bin with a fresh full retention. A file already purged here is fetched from the PC (`local == PENDING` until it arrives). |
 | `routeCapture(fix)` | Camera routing, see `CaptureRoute`. The core uses the fix only if `ageMs` < 2 min and `accuracyM` <= 100; smallest radius wins. |
 | `activity(before, limit)` | Newest first. `before` = last `id` of the previous page. |
@@ -142,6 +148,7 @@ data class ItemInfo(
 )
 
 data class ItemPage(var rows: List<ItemInfo>, var next: kotlin.String?)   // next == null = last page
+data class BinCount(var count: kotlin.UInt, var token: kotlin.String)
 
 data class ActivityInfo(
     var id: kotlin.Long,
@@ -224,7 +231,7 @@ enum class LocalFileState { PENDING, PRESENT, BINNED, PURGED, LOST, REFUSED }
 enum class SyncState { UNPAIRED, OFFLINE, CONNECTING, SYNCING, SYNCED, PAUSED, REFUSED }
 enum class ActivityAction {
     CAPTURED, ADDED, RECEIVED, MOVED, RENAMED, KEPT, UNKEPT, EDITED, DELETED, BINNED, EXPIRED,
-    RESTORED, RETURNED, PURGED, REFUSED, CONFLICT, LOST, FOLDER_CREATED, FOLDER_RENAMED,
+    RESTORED, RETURNED, PURGED, DELETED_FOREVER, REFUSED, CONFLICT, LOST, FOLDER_CREATED, FOLDER_RENAMED,
     FOLDER_DELETED, RETENTION_CHANGED, PAIRED, UNPAIRED, PAUSED, RESUMED, SYNC_ERROR
 }
 

@@ -24,6 +24,9 @@
 //!   retries. Never mark Purged unless the file is really gone.
 //! - A Pending item that still has a `file_ref` holds the OLD content (its content changed
 //!   on the peer): when such an item is in the Bin, the stale file is purged first.
+//! - A purged record (Delete forever, merge rule M10) is handled first, whatever the table says: the
+//!   file goes (library or Bin), `file_ref` is dropped, local = Purged. It never waits for the Bin
+//!   days. The thumbnail is queued by the op or the merge (`thumb_trash`) and removed by the core.
 //! - Also trims activity older than activity::KEEP_DAYS.
 //! - Runs: at Core open, after every applied sync page, after every local op that can move
 //!   an item in or out of the Bin, and at `next_due` (the facade schedules it; minimum every
@@ -141,11 +144,52 @@ fn load_env<'a>(c: &Connection, placement: &'a dyn Placement, self_id: DeviceId,
     })
 }
 
+/// A purged record: remove the file this device holds, if any, and mark it gone. A placement error
+/// is returned with the item unchanged, so the next sweep retries (the table says Purged only when
+/// the file really is gone).
+fn purge_forever(c: &mut Connection, env: &Env<'_>, rec: &ItemRecord, lfs: LocalFileState, rep: &mut SweepReport) -> Result<()> {
+    let held = store::get_file_ref(c, rec.id)?.is_some();
+    if held {
+        env.placement.purge(&file_target(c, rec)?)?;
+    }
+    if held || lfs != LocalFileState::Purged {
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        store::set_local_state(&tx, rec.id, LocalFileState::Purged, env.now)?;
+        store::delete_file_ref(&tx, rec.id)?;
+        tx.commit()?;
+        rep.purged.push(rec.id);
+    }
+    // A download that was under way leaves its partial file behind, and nothing will resume it now.
+    if matches!(lfs, LocalFileState::Pending | LocalFileState::Lost) {
+        drop_part(c, env, rec);
+    }
+    Ok(())
+}
+
+/// Remove the partial download of a purged item's content, unless another item still wants the same
+/// bytes. Best effort: the file may be open in a download that is stopping.
+fn drop_part(c: &Connection, env: &Env<'_>, rec: &ItemRecord) {
+    let hash = rec.content.val.hash;
+    if store::wanted_by_other(c, hash, rec.id).unwrap_or(true) {
+        return;
+    }
+    if let Ok(part) = env.placement.part_path(&hash) {
+        if let Err(e) = std::fs::remove_file(&part) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!("partial download of a deleted item not removed: {e}");
+            }
+        }
+    }
+}
+
 /// One item, rules in the module table. Placement and logic errors are returned; the item's
 /// local state is unchanged when the file move failed. `quiet` = no Returned/Expired/Binned
 /// activity (the op that caused the move already logged what the user did).
 fn sweep_one(c: &mut Connection, env: &Env<'_>, id: ItemId, quiet: bool, rep: &mut SweepReport) -> Result<()> {
     let Some((rec, lfs)) = store::get_item(c, id)? else { return Ok(()) };
+    if rec.purged.is_some() {
+        return purge_forever(c, env, &rec, lfs, rep);
+    }
     let state = derive_state_in(c, &env.folders, &rec, env.now)?;
     let inbin = expiry::in_bin(state);
     let state_at = store::local_state_at(c, id)?.unwrap_or(env.now);
@@ -253,11 +297,11 @@ fn sweep_one(c: &mut Connection, env: &Env<'_>, id: ItemId, quiet: bool, rep: &m
     Ok(())
 }
 
-/// Candidate items: everything that may need a file action. Purged items are only candidates
+/// Candidate items: everything that may need a file action, including a deleted-forever record that
+/// still holds a file or has not been marked yet. Purged items are only candidates
 /// when they could have left the Bin (not user-deleted, or carrying a pin), so the 100k
 /// tombstones of a long-lived library are not re-derived every minute.
-const SWEEP_CANDIDATES: &str =
-    "local_file_state IN ('present', 'binned', 'pending') OR (local_file_state = 'purged' AND (deleted_at IS NULL OR pinned = 1))";
+const SWEEP_CANDIDATES: &str = "(purged_at IS NULL AND (local_file_state IN ('present', 'binned', 'pending') OR (local_file_state = 'purged' AND (deleted_at IS NULL OR pinned = 1)))) OR (purged_at IS NOT NULL AND (local_file_state != 'purged' OR EXISTS (SELECT 1 FROM file_ref f WHERE f.item_id = item.id)))";
 
 /// One full pass (rules above) inside one transaction per item.
 pub fn sweep(c: &mut Connection, placement: &dyn Placement, self_id: DeviceId, now: i64) -> Result<SweepReport> {
@@ -298,14 +342,14 @@ pub fn sweep_item(c: &mut Connection, placement: &dyn Placement, self_id: Device
     sweep_one(c, &env, id, true, &mut SweepReport::default())
 }
 
-/// Items currently in the Bin, newest binned_at first, keyset paged by item id.
-/// Items past their purge time are not listed (the file is gone; only the tombstone remains).
-pub fn bin_page(c: &Connection, after: Option<ItemId>, limit: u32, now: i64) -> Result<Vec<(ItemRecord, ItemState, LocalFileState)>> {
+/// Every item the Bin lists, newest binned_at first. Items past their purge time and items deleted
+/// forever are not listed (the file is gone; only the tombstone remains).
+fn bin_rows(c: &Connection, now: i64) -> Result<Vec<(ItemRecord, ItemState, LocalFileState)>> {
     let bin_days = store::load_settings(c)?.bin_days;
     let folders: HashMap<FolderId, FolderRecord> = store::all_folders(c)?.into_iter().map(|f| (f.id, f)).collect();
     let mut rows: Vec<(ItemRecord, ItemState, LocalFileState)> = Vec::new();
     // Purged-and-still-in-Bin items are the common tombstones; skip them in SQL.
-    for id in store::item_ids_where(c, "local_file_state != 'purged'")? {
+    for id in store::item_ids_where(c, "local_file_state != 'purged' AND purged_at IS NULL")? {
         let Some((rec, lfs)) = store::get_item(c, id)? else { continue };
         let state = derive_state_in(c, &folders, &rec, now)?;
         let state_at = store::local_state_at(c, id)?.unwrap_or(now);
@@ -318,11 +362,49 @@ pub fn bin_page(c: &Connection, after: Option<ItemId>, limit: u32, now: i64) -> 
         _ => 0,
     };
     rows.sort_by(|a, b| binned_at(&b.1).cmp(&binned_at(&a.1)).then_with(|| b.0.id.cmp(&a.0.id)));
+    Ok(rows)
+}
+
+/// Items currently in the Bin (see `bin_rows`), keyset paged by item id.
+pub fn bin_page(c: &Connection, after: Option<ItemId>, limit: u32, now: i64) -> Result<Vec<(ItemRecord, ItemState, LocalFileState)>> {
+    let rows = bin_rows(c, now)?;
     let start = match after {
         Some(a) => rows.iter().position(|r| r.0.id == a).map(|i| i + 1).unwrap_or(rows.len()),
         None => 0,
     };
     Ok(rows.into_iter().skip(start).take(limit.clamp(1, 500) as usize).collect())
+}
+
+/// Ids of every item the Bin lists: what Empty Bin deletes, and the count its confirmation shows.
+pub fn bin_ids(c: &Connection, now: i64) -> Result<Vec<ItemId>> {
+    Ok(bin_rows(c, now)?.into_iter().map(|r| r.0.id).collect())
+}
+
+/// What Empty Bin's question showed: how many items, and a token naming exactly which ones. Empty Bin
+/// deletes only while the Bin still lists the same items (a count alone cannot tell one item swapped
+/// for another).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
+pub struct BinCount {
+    pub count: u32,
+    pub token: String,
+}
+
+/// Names a set of items: the hash of their sorted ids. The same items give the same token in any order.
+pub fn bin_token(ids: &[ItemId]) -> String {
+    let mut sorted: Vec<ItemId> = ids.to_vec();
+    sorted.sort();
+    let mut h = blake3::Hasher::new();
+    for id in &sorted {
+        h.update(id.0.as_bytes());
+    }
+    h.finalize().to_hex()[..32].to_string()
+}
+
+/// The count and token for the items the Bin lists now.
+pub fn bin_count(c: &Connection, now: i64) -> Result<BinCount> {
+    let ids = bin_ids(c, now)?;
+    Ok(BinCount { count: ids.len() as u32, token: bin_token(&ids) })
 }
 
 #[cfg(test)]
@@ -424,7 +506,7 @@ mod tests {
             (1..=20u8)
                 .map(|n| {
                     let it = item(n, p(), v(1, p()));
-                    store::insert_item(&db.conn, &it, LocalFileState::Present, T0).unwrap();
+                    insert_item_before_v4(&db.conn, &it, LocalFileState::Present, T0);
                     let src = items_dir.join(format!("{}.jpg", it.id.0.hyphenated()));
                     std::fs::write(&src, [0xFF, 0xD8, 0xFF, n]).unwrap();
                     // The v1 file_ref table has no mtime_ms column yet: write it the way 0.1.x did.
@@ -811,5 +893,142 @@ mod tests {
         assert_eq!(r.sweep().purged, vec![old]);
         let again = r.rec(old);
         assert!(missing_on(&r.db.conn, again.content.val.hash).unwrap().is_empty(), "the old receipt for these bytes counts");
+    }
+
+    /// Mark an item deleted forever by another device (the purge reached this one by sync).
+    fn purged_by_peer(r: &Rig, id: ItemId) {
+        let mut rec = r.rec(id);
+        rec.purged = Some(Versioned { v: Version { lamport: 99, device: f() }, val: r.now() });
+        store::update_item(&r.db.conn, &rec).unwrap();
+    }
+
+    // A purge that arrives removes the file whatever state the file is in (library, Bin, still
+    // wanted, lost, refused, already gone): nothing waits for Bin days, and a second sweep is idle.
+    #[test]
+    fn a_purge_from_a_peer_removes_the_file_in_every_state() {
+        let mut r = Rig::new();
+        let live = r.add("live");
+        let binned = r.add("binned");
+        r.run(|c, x| ops::delete_item(c, x, binned)).unwrap();
+        let wanted = r.add("wanted");
+        let lost = r.add("lost");
+        let refused = r.add("refused");
+        let already_gone = r.add("gone");
+        let live_path = r.path(live).unwrap();
+        let bin_path = r.path(binned).unwrap();
+        // Held files that are about to be fetched again (new content) keep their old path until then.
+        for (id, state) in [(wanted, LocalFileState::Pending), (lost, LocalFileState::Lost), (refused, LocalFileState::Refused)] {
+            store::set_local_state(&r.db.conn, id, state, T0).unwrap();
+        }
+        store::set_local_state(&r.db.conn, already_gone, LocalFileState::Purged, T0).unwrap();
+        std::fs::remove_file(r.path(already_gone).unwrap()).unwrap();
+        store::delete_file_ref(&r.db.conn, already_gone).unwrap();
+        let ids = [live, binned, wanted, lost, refused, already_gone];
+        for id in ids {
+            purged_by_peer(&r, id);
+        }
+        let rep = r.sweep();
+        let mut got = rep.purged.clone();
+        got.sort();
+        let mut want: Vec<ItemId> = ids.iter().copied().filter(|id| *id != already_gone).collect();
+        want.sort();
+        assert_eq!(got, want, "the item with nothing held is already in its final state");
+        assert!(rep.errors.is_empty(), "{:?}", rep.errors);
+        assert!(!live_path.exists() && !bin_path.exists());
+        for id in ids {
+            assert_eq!(r.lfs(id), LocalFileState::Purged);
+            assert!(r.path(id).is_none());
+            assert!(r.rec(id).purged.is_some(), "the tombstone stays");
+        }
+        assert_eq!(r.sweep(), SweepReport::default(), "idle the second time");
+        assert_eq!(store::count_items(&r.db.conn).unwrap(), 6, "records are never removed");
+    }
+
+    // The Bin lists nothing that was deleted forever, even in the window before the sweep removed the file.
+    #[test]
+    fn the_bin_never_lists_a_purged_item() {
+        let mut r = Rig::new();
+        let a = r.add("a");
+        let b = r.add("b");
+        r.run(|c, x| ops::delete_item(c, x, a)).unwrap();
+        r.run(|c, x| ops::delete_item(c, x, b)).unwrap();
+        assert_eq!(bin_ids(&r.db.conn, r.now()).unwrap().len(), 2);
+        purged_by_peer(&r, a);
+        assert_eq!(bin_ids(&r.db.conn, r.now()).unwrap(), vec![b]);
+        assert_eq!(bin_page(&r.db.conn, None, 10, r.now()).unwrap().len(), 1);
+        r.sweep();
+        assert_eq!(bin_ids(&r.db.conn, r.now()).unwrap(), vec![b]);
+    }
+
+    // The table says Purged only when the file really is gone: a placement failure leaves the item
+    // as it was, reports it, and the next sweep retries and finishes.
+    #[test]
+    fn a_failed_purge_is_retried_by_the_next_sweep() {
+        let mut r = Rig::new();
+        let id = r.add("stuck");
+        r.run(|c, x| ops::delete_item(c, x, id)).unwrap();
+        let bin_path = r.path(id).unwrap();
+        // A directory where the file should be: removing it as a file fails.
+        std::fs::remove_file(&bin_path).unwrap();
+        std::fs::create_dir(&bin_path).unwrap();
+        purged_by_peer(&r, id);
+        let rep = r.sweep();
+        assert_eq!(rep.errors.len(), 1, "{rep:?}");
+        assert_eq!(r.lfs(id), LocalFileState::Binned, "not marked gone");
+        assert!(r.path(id).is_some());
+        std::fs::remove_dir(&bin_path).unwrap();
+        assert_eq!(r.sweep().purged, vec![id]);
+        assert_eq!(r.lfs(id), LocalFileState::Purged);
+        assert!(r.path(id).is_none());
+    }
+
+    // The partial download of an item deleted forever goes with it, unless another wanted item has the
+    // same content.
+    #[test]
+    fn a_partial_download_goes_with_a_purged_item_unless_another_wants_it() {
+        let mut r = Rig::new();
+        let first = item(5, f(), v(3, f()));
+        let mut second = item(9, f(), v(3, f()));
+        second.content.val.hash = first.content.val.hash;
+        for it in [&first, &second] {
+            store::insert_item(&r.db.conn, it, LocalFileState::Pending, T0).unwrap();
+        }
+        let part = r.pl.part_path(&first.content.val.hash).unwrap();
+        std::fs::create_dir_all(part.parent().unwrap()).unwrap();
+        std::fs::write(&part, b"half a file").unwrap();
+        purged_by_peer(&r, first.id);
+        r.sweep();
+        assert_eq!(r.lfs(first.id), LocalFileState::Purged);
+        assert!(part.exists(), "the other item still wants these bytes");
+        purged_by_peer(&r, second.id);
+        r.sweep();
+        assert!(!part.exists(), "nobody wants it now");
+        // A part that is not there is fine, and an item that is Lost counts as wanting it too.
+        let third = item(11, f(), v(3, f()));
+        let mut lost = item(12, f(), v(3, f()));
+        lost.content.val.hash = third.content.val.hash;
+        store::insert_item(&r.db.conn, &third, LocalFileState::Pending, T0).unwrap();
+        store::insert_item(&r.db.conn, &lost, LocalFileState::Lost, T0).unwrap();
+        let part = r.pl.part_path(&third.content.val.hash).unwrap();
+        std::fs::write(&part, b"x").unwrap();
+        purged_by_peer(&r, third.id);
+        r.sweep();
+        assert!(part.exists());
+        purged_by_peer(&r, lost.id);
+        r.sweep();
+        assert!(!part.exists());
+    }
+
+    // A purge never goes back to wanting the file: a stale Pending state is cleaned up, not fetched.
+    #[test]
+    fn a_purged_item_that_was_pending_is_never_wanted() {
+        let mut r = Rig::new();
+        let id = r.add("p");
+        store::set_local_state(&r.db.conn, id, LocalFileState::Pending, T0).unwrap();
+        store::delete_file_ref(&r.db.conn, id).unwrap();
+        purged_by_peer(&r, id);
+        let rep = r.sweep();
+        assert!(rep.want.is_empty());
+        assert_eq!(r.lfs(id), LocalFileState::Purged);
     }
 }

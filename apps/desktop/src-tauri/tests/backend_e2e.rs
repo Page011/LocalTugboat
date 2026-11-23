@@ -394,3 +394,142 @@ async fn a_drop_keeps_the_folder_it_was_dropped_on_and_a_finished_drag_is_never_
     assert_eq!(last, Some(Value::from("leave")), "the overlay is not left showing");
     be.shutdown().await;
 }
+
+/// Link a phone-role core to the PC and wait until both are synced.
+async fn link_phone(pc: &Pc, tmp: &std::path::Path) -> Core {
+    link_phone_keeping_key(pc, tmp).await.0
+}
+
+/// `link_phone`, also giving the phone's key so a test can stop its network and start it again.
+async fn link_phone_keeping_key(pc: &Pc, tmp: &std::path::Path) -> (Core, [u8; 32]) {
+    let (ph, secret) = phone(tmp);
+    ph.start_network(NetworkConfig { bind: "127.0.0.1:0".parse().unwrap(), mdns: false, secret_key: secret }).await.unwrap();
+    let start = pc.be.pairing_begin().unwrap();
+    let (core, payload) = (ph.clone(), start.payload.clone());
+    let pairing = tokio::spawn(async move { core.pair_with(&payload).await });
+    until("the PC shows a code", 10, || !code_events(&pc.out).is_empty()).await;
+    pc.be.pairing_confirm(true).await.unwrap();
+    pairing.await.unwrap().expect("phone paired");
+    until("synced", 20, || pc.be.status().state == SyncState::Synced && ph.status().state == SyncState::Synced).await;
+    (ph, secret)
+}
+
+fn files_under(dir: &std::path::Path) -> usize {
+    std::fs::read_dir(dir).map(|rd| rd.filter_map(|e| e.ok()).filter(|e| e.path().is_file()).count()).unwrap_or(0)
+}
+
+// Delete forever, both directions, through the real library folder: the phone deletes one item forever
+// and the PC's copy leaves its Bin; the PC empties its Bin and the phone's copies go. Both legs here
+// start from a copy already in the PC's Bin; the next test covers a file still in the library folder
+// when the purge arrives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delete_forever_removes_files_from_the_library_and_the_bin_in_both_directions() {
+    let pc = start_pc().await;
+    let be = &pc.be;
+    let tmp = tempfile::tempdir().unwrap();
+    let ph = link_phone(&pc, tmp.path()).await;
+    let bin_dir = pc._tmp.path().join("pc").join("Bin");
+    let all = || ItemQuery { limit: 100, ..Default::default() };
+    let mut ids = Vec::new();
+    for i in 0..3u8 {
+        let src = tmp.path().join(format!("cam{i}.jpg"));
+        std::fs::write(&src, jpeg(30 + i, 4000)).unwrap();
+        ids.push(ph.add_local_file(NewLocalFile { src, name: format!("DEL_{i}.jpg"), folder: None, captured_at: 1_790_000_000_000, geo: None, thumb: None, how: AddKind::Captured, ntfs: None }).unwrap());
+    }
+    until("three files in the library", 25, || (0..3).all(|i| pc.root.join(format!("DEL_{i}.jpg")).exists())).await;
+
+    // The phone deletes item 0 and then forever: the PC's Bin copy goes, nothing stays in the library.
+    ph.delete_item(ids[0]).unwrap();
+    until("the PC moved it to its Bin", 25, || !pc.root.join("DEL_0.jpg").exists() && files_under(&bin_dir) == 1).await;
+    ph.purge_item(ids[0]).unwrap();
+    until("the PC removed its Bin copy", 25, || files_under(&bin_dir) == 0).await;
+    until("the PC lists two items and an empty Bin", 10, || {
+        be.items(all()).unwrap().rows.len() == 2 && be.items(ItemQuery { bin: true, ..all() }).unwrap().rows.is_empty()
+    })
+    .await;
+    be.library_rescan();
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert!(!pc.root.join("DEL_0.jpg").exists(), "the rescan did not bring it back");
+    assert_eq!(be.items(all()).unwrap().rows.len(), 2);
+    assert_eq!(be.bin_count().unwrap().count, 0);
+
+    // The PC deletes the other two and empties its Bin: the count it shows is the count it deletes.
+    for i in 1..3 {
+        let id = be.items(all()).unwrap().rows.into_iter().find(|r| r.name == format!("DEL_{i}.jpg")).unwrap().id;
+        be.delete_item(id).unwrap();
+    }
+    until("both in the PC's Bin", 15, || be.bin_count().unwrap().count == 2 && files_under(&bin_dir) == 2).await;
+    let asked = be.bin_count().unwrap();
+    assert_eq!(be.empty_bin(asked.count, &asked.token).unwrap(), 2);
+    until("the PC's Bin folder is empty", 15, || files_under(&bin_dir) == 0).await;
+    until("the phone dropped both items", 25, || {
+        ids.iter().all(|id| ph.item(*id).unwrap().is_none()) && ph.items(&ItemQuery { bin: true, limit: 100, ..Default::default() }).unwrap().rows.is_empty()
+    })
+    .await;
+    be.library_rescan();
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert!(be.items(all()).unwrap().rows.is_empty() && files_under(&pc.root) == 0, "nothing left in the library");
+    assert!(be.status().message.is_none(), "{:?}", be.status());
+
+    ph.stop_network().await;
+    be.shutdown().await;
+}
+
+// The PC is away while the phone deletes an item and then deletes it forever, so the PC gets both in one
+// record while the file is still in the library folder: one that arrived by sync, and one the user dropped
+// into the folder a moment before. The files go at once, the user's other file in the same folder stays,
+// and neither the watcher nor a rescan reports anything or imports a file back as a new item.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delete_forever_of_a_file_still_in_the_library_leaves_nothing_to_import() {
+    let pc = start_pc().await;
+    let be = &pc.be;
+    let tmp = tempfile::tempdir().unwrap();
+    let (ph, secret) = link_phone_keeping_key(&pc, tmp.path()).await;
+    let bin_dir = pc._tmp.path().join("pc").join("Bin");
+    let all = || ItemQuery { limit: 100, ..Default::default() };
+
+    // One file from the phone, one dropped by the user a moment ago, and one the user keeps.
+    let src = tmp.path().join("cam.jpg");
+    std::fs::write(&src, jpeg(41, 4000)).unwrap();
+    let from_phone = ph.add_local_file(NewLocalFile { src, name: "AWAY_A.jpg".into(), folder: None, captured_at: 1_790_000_000_000, geo: None, thumb: None, how: AddKind::Captured, ntfs: None }).unwrap();
+    until("the phone's file is in the library", 25, || pc.root.join("AWAY_A.jpg").exists()).await;
+    std::fs::write(pc.root.join("mine.jpg"), jpeg(43, 3000)).unwrap();
+    std::fs::write(pc.root.join("dropped_b.jpg"), jpeg(42, 3000)).unwrap();
+    let phone_rows = || ph.items(&ItemQuery { limit: 100, ..Default::default() }).unwrap().rows;
+    until("the phone has the dropped file and the user's file", 25, || phone_rows().iter().any(|r| r.name == "dropped_b.jpg") && phone_rows().iter().any(|r| r.name == "mine.jpg")).await;
+    let dropped = phone_rows().into_iter().find(|r| r.name == "dropped_b.jpg").unwrap().id;
+    until("the PC lists all three", 10, || be.items(all()).unwrap().rows.len() == 3).await;
+
+    // The PC is away: the phone deletes both forever.
+    ph.stop_network().await;
+    for id in [from_phone, dropped] {
+        ph.delete_item(id).unwrap();
+        ph.purge_item(id).unwrap();
+    }
+    ph.start_network(NetworkConfig { bind: "127.0.0.1:0".parse().unwrap(), mdns: false, secret_key: secret }).await.unwrap();
+    until("both files left the library", 40, || !pc.root.join("AWAY_A.jpg").exists() && !pc.root.join("dropped_b.jpg").exists()).await;
+    until("the PC lists only the kept file", 15, || be.items(all()).unwrap().rows.len() == 1).await;
+    assert_eq!(files_under(&bin_dir), 0, "nothing was moved to the Bin either");
+
+    be.library_rescan();
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    let rows = be.items(all()).unwrap().rows;
+    assert!(rows.len() == 1 && rows[0].name == "mine.jpg", "the rescan imported nothing: {:?}", rows.iter().map(|r| r.name.clone()).collect::<Vec<_>>());
+    assert!(pc.root.join("mine.jpg").exists(), "the user's other file is untouched");
+    assert!(!pc.root.join("AWAY_A.jpg").exists() && !pc.root.join("dropped_b.jpg").exists());
+    assert_eq!(be.bin_count().unwrap().count, 0);
+    // The activity says "deleted forever" for each and nothing about a lost, missing or user-deleted file.
+    let acts = be.activity(None, 200).unwrap();
+    for id in [from_phone, dropped] {
+        let mine: Vec<_> = acts.iter().filter(|a| a.item == Some(id)).map(|a| a.action).collect();
+        assert!(mine.contains(&tugboat_core::ActivityAction::DeletedForever), "{mine:?}");
+        assert!(
+            mine.iter().all(|a| !matches!(a, tugboat_core::ActivityAction::Deleted | tugboat_core::ActivityAction::Lost | tugboat_core::ActivityAction::Refused | tugboat_core::ActivityAction::Paused)),
+            "{mine:?}"
+        );
+    }
+    assert!(be.status().message.is_none(), "{:?}", be.status());
+
+    ph.stop_network().await;
+    be.shutdown().await;
+}

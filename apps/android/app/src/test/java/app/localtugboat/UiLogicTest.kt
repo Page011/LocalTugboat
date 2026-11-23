@@ -411,6 +411,12 @@ class UiLogicTest {
         assertEquals("15 Nov, 10:30", UiLogic.activityTime(now - 2 * day, now, utc, Locale.ENGLISH))
     }
 
+    @Test fun a_delete_forever_row_reads_deleted_forever_and_is_not_a_problem() {
+        assertEquals("Deleted forever", UiLogic.activityText(ActivityAction.DELETED_FOREVER))
+        assertEquals(false, UiLogic.activityIsProblem(ActivityAction.DELETED_FOREVER))
+        assertEquals("Inbox", UiLogic.activityDetail(ActivityAction.DELETED_FOREVER, "Inbox"))
+    }
+
     @Test fun an_unlink_by_the_pc_reads_logged_out() {
         assertEquals("logged out", UiLogic.activityDetail(ActivityAction.UNPAIRED, "by the other device"))
         assertEquals("", UiLogic.activityDetail(ActivityAction.UNPAIRED, ""))

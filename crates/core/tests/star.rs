@@ -752,6 +752,7 @@ async fn star_status_cost() {
                 location: tugboat_core::Versioned { v, val: tugboat_core::Location { folder: tugboat_core::INBOX_ID, entered_at: T0 } },
                 pinned: tugboat_core::Versioned { v, val: false },
                 deleted: tugboat_core::Versioned { v, val: None },
+                purged: None,
             };
             store::insert_item(c, &rec, if pending { LocalFileState::Pending } else { LocalFileState::Present }, T0).unwrap();
             if !pending {
@@ -784,4 +785,292 @@ async fn star_status_cost() {
         assert_eq!(d.waiting, missing(k as u32), "{}: waiting", d.name);
         assert_eq!(d.downloading, PENDING / 5, "{}: downloading", d.name);
     }
+}
+
+// ---------- Delete forever ----------
+
+/// The item is a tombstone on every device in `devs`: purged record, no file state, not shown anywhere.
+fn purged_on(devs: &[&Dev], id: ItemId) -> bool {
+    devs.iter().all(|d| {
+        d.local(id) == Some(LocalFileState::Purged)
+            && d.record(id).is_some_and(|r| r.purged.is_some())
+            && d.view(id).is_none()
+            && d.items().iter().all(|v| v.id != id)
+            && d.bin().iter().all(|v| v.id != id)
+    })
+}
+
+/// No file and no thumbnail of any item is left on the device (it held one item).
+fn nothing_on_disk(d: &Dev) -> bool {
+    d.stored_files() == 0 && d.thumb_files() == 0
+}
+
+/// Item `id` is in the Bin on every device in `devs`.
+fn binned_on(devs: &[&Dev], id: ItemId) -> bool {
+    devs.iter().all(|d| d.local(id) == Some(LocalFileState::Binned) && matches!(d.view(id).map(|v| v.state), Some(ItemState::Deleted { .. })))
+}
+
+/// An item with a thumbnail made on `maker`, held (with its thumbnail) on the phone and both PCs.
+async fn item_everywhere(s: &StarRig, maker: &Dev, name: &str, seed: u64) -> ItemId {
+    let id = maker.add_with_thumb(name, seed, 20_000);
+    let all = [&s.phone, &s.pcs[0], &s.pcs[1]];
+    until("the item and its thumbnail on all three", 30, || present_on(&all, id) && all.iter().all(|d| d.thumb_files() == 1)).await;
+    s.settle().await;
+    id
+}
+
+// Delete forever on the phone removes the item from the Bin on every PC: the record stays as a
+// tombstone, the file and the thumbnail are gone from disk, it cannot be restored anywhere.
+#[tokio::test(flavor = "multi_thread")]
+async fn star_purge_on_the_phone_removes_it_on_every_pc() {
+    let s = StarRig::new(2).await;
+    let id = item_everywhere(&s, &s.phone, "forever.jpg", 40).await;
+    let all = [&s.phone, &s.pcs[0], &s.pcs[1]];
+    let held: Vec<_> = all.iter().map(|d| d.view(id).and_then(|v| v.path).expect("a held file")).collect();
+    s.phone.core.delete_item(id).unwrap();
+    until("in the Bin on all three", 20, || binned_on(&all, id)).await;
+    s.settle().await;
+
+    s.phone.core.purge_item(id).unwrap();
+    until("deleted forever on all three", 20, || purged_on(&all, id)).await;
+    until("no file and no thumbnail left on any device", 20, || all.iter().all(|d| nothing_on_disk(d))).await;
+    assert!(held.iter().all(|p| !std::path::Path::new(p).exists()), "the files are gone from disk");
+    for d in all {
+        assert!(d.has_activity(ActivityAction::DeletedForever), "{}: {:?}", d.name, d.activity_text());
+    }
+    // The PCs name the device that did it.
+    let row = s.pcs[1].core.activity(None, 50).unwrap().into_iter().find(|a| a.action == ActivityAction::DeletedForever).unwrap();
+    assert_eq!(row.device, Some(s.phone.id));
+    s.settle().await;
+    // Nothing brings it back: not a restore on a PC, not a later sync.
+    assert!(matches!(s.pcs[0].core.restore_item(id), Err(CoreError::NotFound { .. })));
+    assert!(s.pcs[0].record(id).unwrap().purged.is_some());
+    no_errors(&[&s.phone, &s.pcs[0], &s.pcs[1]]);
+    s.shutdown().await;
+}
+
+// Delete forever on PC A reaches PC B through the phone, and the phone drops its copy too.
+#[tokio::test(flavor = "multi_thread")]
+async fn star_purge_on_pc_a_reaches_pc_b_through_the_phone() {
+    let s = StarRig::new(2).await;
+    let id = item_everywhere(&s, &s.pcs[0], "from_a.jpg", 41).await;
+    let all = [&s.phone, &s.pcs[0], &s.pcs[1]];
+    s.pcs[0].core.delete_item(id).unwrap();
+    until("in the Bin on all three", 20, || binned_on(&all, id)).await;
+    s.settle().await;
+
+    s.pcs[0].core.purge_item(id).unwrap();
+    until("deleted forever on all three", 20, || purged_on(&all, id)).await;
+    until("no file and no thumbnail left on any device", 20, || all.iter().all(|d| nothing_on_disk(d))).await;
+    // PC B and the phone both say it came from A.
+    for d in [&s.phone, &s.pcs[1]] {
+        let row = d.core.activity(None, 50).unwrap().into_iter().find(|a| a.action == ActivityAction::DeletedForever).unwrap();
+        assert_eq!(row.device, Some(s.pcs[0].id), "{}", d.name);
+    }
+    s.settle().await;
+    // The phone relayed it once: it never sent the purge back to A.
+    assert_eq!(count_activity(&s.pcs[0], ActivityAction::DeletedForever), 1);
+    no_errors(&[&s.phone, &s.pcs[0], &s.pcs[1]]);
+    s.shutdown().await;
+}
+
+// Empty Bin on a PC: the count it shows is what it deletes, every other device loses exactly those
+// items, and an item that is not in the Bin stays everywhere.
+#[tokio::test(flavor = "multi_thread")]
+async fn star_empty_bin_removes_several_items_everywhere() {
+    let s = StarRig::new(2).await;
+    let ids: Vec<ItemId> = (0..4).map(|n| s.phone.add(&format!("bin{n}.jpg"), 50 + n, 5_000)).collect();
+    let all = [&s.phone, &s.pcs[0], &s.pcs[1]];
+    until("four items on every device", 30, || ids.iter().all(|id| present_on(&all, *id))).await;
+    s.settle().await;
+    for id in &ids[..3] {
+        s.pcs[1].core.delete_item(*id).unwrap();
+    }
+    until("three in the Bin on every device", 20, || ids[..3].iter().all(|id| binned_on(&all, *id))).await;
+    s.settle().await;
+    let asked = s.pcs[0].core.bin_count().unwrap();
+    assert_eq!(asked.count, 3);
+
+    assert_eq!(s.pcs[0].core.empty_bin(asked.count, &asked.token).unwrap(), 3);
+    until("the three are gone on every device", 20, || ids[..3].iter().all(|id| purged_on(&all, *id))).await;
+    until("only the fourth file is left on each device", 20, || all.iter().all(|d| d.stored_files() == 1)).await;
+    assert!(present_on(&all, ids[3]), "the item that was not in the Bin stays");
+    for d in all {
+        assert!(d.bin().is_empty(), "{}: the Bin is empty", d.name);
+        assert_eq!(d.core.bin_count().unwrap().count, 0);
+        assert_eq!(d.items().len(), 1);
+    }
+    let none = s.pcs[0].core.bin_count().unwrap();
+    assert_eq!(s.pcs[0].core.empty_bin(none.count, &none.token).unwrap(), 0, "an empty Bin is a no-op");
+    s.settle().await;
+    no_errors(&[&s.phone, &s.pcs[0], &s.pcs[1]]);
+    s.shutdown().await;
+}
+
+// A purge made while PC B is away waits for it in the phone's log: B deletes its copy when it
+// reconnects, and nobody waited for B in the meantime.
+#[tokio::test(flavor = "multi_thread")]
+async fn star_purge_while_b_is_away_arrives_when_it_returns() {
+    let s = StarRig::new(2).await;
+    let id = item_everywhere(&s, &s.phone, "away.jpg", 42).await;
+    let all = [&s.phone, &s.pcs[0], &s.pcs[1]];
+    s.phone.core.delete_item(id).unwrap();
+    until("in the Bin on all three", 20, || binned_on(&all, id)).await;
+    s.settle().await;
+
+    s.apart(1).await;
+    s.phone.core.purge_item(id).unwrap();
+    until("gone on the phone and PC A, while B is away", 20, || purged_on(&[&s.phone, &s.pcs[0]], id)).await;
+    assert!(nothing_on_disk(&s.phone) && nothing_on_disk(&s.pcs[0]), "no device waits for B");
+    assert_eq!(s.pcs[1].local(id), Some(LocalFileState::Binned), "B has not heard yet and still holds its copy");
+
+    s.together(1).await;
+    until("gone on B too", 30, || purged_on(&[&s.pcs[1]], id)).await;
+    until("B holds no file and no thumbnail", 20, || nothing_on_disk(&s.pcs[1])).await;
+    s.settle().await;
+    no_errors(&[&s.pcs[1]]);
+    s.shutdown().await;
+}
+
+// An item made and deleted forever while B is away: B only ever gets the tombstone, never asks for
+// the file, and reports no missing file.
+#[tokio::test(flavor = "multi_thread")]
+async fn star_item_made_and_purged_while_b_is_away() {
+    let s = StarRig::new(2).await;
+    s.apart(1).await;
+    let id = s.phone.add_with_thumb("short_lived.jpg", 43, 20_000);
+    until("PC A has it", 20, || present_on(&[&s.pcs[0]], id)).await;
+    s.phone.core.delete_item(id).unwrap();
+    until("in the Bin on PC A", 20, || binned_on(&[&s.pcs[0]], id)).await;
+    s.phone.core.purge_item(id).unwrap();
+    until("gone on PC A", 20, || purged_on(&[&s.pcs[0]], id)).await;
+    let asked_before = s.phone.core.debug_blob_requests();
+
+    s.together(1).await;
+    until("B has the tombstone", 30, || purged_on(&[&s.pcs[1]], id)).await;
+    s.settle().await;
+    assert!(nothing_on_disk(&s.pcs[1]));
+    assert_eq!(s.phone.core.debug_blob_requests(), asked_before, "B asked the phone for nothing");
+    assert_eq!(count_activity(&s.pcs[1], ActivityAction::DeletedForever), 0, "no row for an item B never held");
+    no_errors(&[&s.pcs[1]]);
+    s.shutdown().await;
+}
+
+// A PC away longer than the phone keeps its log starts again from a snapshot, and the snapshot
+// carries the purge.
+#[tokio::test(flavor = "multi_thread")]
+async fn star_b_behind_the_trimmed_log_gets_the_purge_in_the_snapshot() {
+    let s = StarRig::new(2).await;
+    let id = item_everywhere(&s, &s.phone, "behind.jpg", 44).await;
+    let all = [&s.phone, &s.pcs[0], &s.pcs[1]];
+    let docs = s.pcs[0].core.create_folder("Docs", Retention::Keep).unwrap();
+    until("the folder on every device", 20, || [&s.phone, &s.pcs[1]].iter().all(|d| d.core.folders().unwrap().iter().any(|f| f.id == docs))).await;
+    s.phone.core.delete_item(id).unwrap();
+    until("in the Bin on all three", 20, || binned_on(&all, id)).await;
+    s.settle().await;
+
+    let acked_by_b = cursor(&s.phone, &s.pcs[1]).expect("B has a cursor").1;
+    s.apart(1).await;
+    s.phone.core.purge_item(id).unwrap();
+    until("gone on PC A", 20, || purged_on(&[&s.pcs[0]], id)).await;
+    s.phone.clock.advance(61 * DAY);
+    s.pcs[0].core.rename_folder(docs, "Docs v2").unwrap();
+    until("the phone has v2", 20, || s.phone.core.folders().unwrap().iter().any(|f| f.name == "Docs v2")).await;
+    until("the phone dropped the rows B was holding", 20, || log_floor(&s.phone) > acked_by_b).await;
+
+    s.together(1).await;
+    until("B got the purge", 30, || purged_on(&[&s.pcs[1]], id)).await;
+    until("B holds no file and no thumbnail", 20, || nothing_on_disk(&s.pcs[1])).await;
+    s.settle().await;
+    no_errors(&[&s.pcs[1]]);
+    s.shutdown().await;
+}
+
+// Every device ends with the same tombstone: no name, no saved location, no thumbnail; digests equal.
+#[tokio::test(flavor = "multi_thread")]
+async fn star_a_purge_leaves_the_same_scrubbed_record_everywhere() {
+    let s = StarRig::new(2).await;
+    let id = s.pcs[0].add_with_geo("Ward_7_resident.jpg", 47, 20_000);
+    let all = [&s.phone, &s.pcs[0], &s.pcs[1]];
+    until("the item, thumbnail and location on all three", 30, || present_on(&all, id) && all.iter().all(|d| d.thumb_files() == 1 && d.record(id).is_some_and(|r| r.geo.is_some()))).await;
+    s.settle().await;
+    s.pcs[0].core.delete_item(id).unwrap();
+    until("in the Bin on all three", 20, || binned_on(&all, id)).await;
+    s.settle().await;
+
+    s.pcs[1].core.purge_item(id).unwrap();
+    until("deleted forever on all three", 20, || purged_on(&all, id)).await;
+    s.settle().await;
+    let first = s.phone.record(id).unwrap();
+    for d in all {
+        let rec = d.record(id).unwrap();
+        assert!(rec.name.val.is_empty() && rec.geo.is_none() && rec.content.val.thumb.is_none(), "{}: {rec:?}", d.name);
+        assert_eq!(rec, first, "{}: the same record as the phone", d.name);
+        assert_eq!(d.digest(), s.phone.digest(), "{}: equal digest", d.name);
+        assert!(d.activity_text().iter().all(|t| !t.contains("Ward_7")), "{}: {:?}", d.name, d.activity_text());
+    }
+    until("no thumbnail left", 20, || all.iter().all(|d| d.thumb_files() == 0)).await;
+    no_errors(&all);
+    s.shutdown().await;
+}
+
+/// A restore on one PC and a purge on the other, both made while apart; the PCs come back in the given order.
+async fn restore_against_purge(purger_back_first: bool) {
+    let s = StarRig::new(2).await;
+    let id = item_everywhere(&s, &s.phone, "contested.jpg", 45).await;
+    let all = [&s.phone, &s.pcs[0], &s.pcs[1]];
+    s.phone.core.delete_item(id).unwrap();
+    until("in the Bin on all three", 20, || binned_on(&all, id)).await;
+    s.settle().await;
+
+    s.apart(0).await;
+    s.apart(1).await;
+    s.pcs[0].core.purge_item(id).unwrap();
+    s.pcs[1].core.restore_item(id).unwrap();
+    assert_eq!(s.pcs[1].local(id), Some(LocalFileState::Present), "B really restored it");
+    let (first, second) = if purger_back_first { (0, 1) } else { (1, 0) };
+    s.together(first).await;
+    s.pcs[first].wait_state(SyncState::Synced).await;
+    s.together(second).await;
+    s.pcs[second].wait_state(SyncState::Synced).await;
+    until("deleted forever on all three", 30, || purged_on(&all, id)).await;
+    until("no file and no thumbnail left anywhere", 20, || all.iter().all(|d| nothing_on_disk(d))).await;
+    s.settle().await;
+    for d in all {
+        assert!(d.items().iter().all(|v| v.id != id), "{}: not in the gallery", d.name);
+    }
+    no_errors(&all);
+    s.shutdown().await;
+}
+
+// A purge beats a concurrent restore on every device, whichever PC reconnects first.
+#[tokio::test(flavor = "multi_thread")]
+async fn star_concurrent_restore_and_purge_end_purged_everywhere() {
+    restore_against_purge(true).await;
+    restore_against_purge(false).await;
+}
+
+// A PC on protocol 2 (0.3.0 or older) is refused and named; the other PC keeps syncing and gets the
+// purge, the old one keeps its copy until it is updated.
+#[tokio::test(flavor = "multi_thread")]
+async fn star_a_protocol_2_pc_is_refused_and_named() {
+    let s = StarRig::new(2).await;
+    let id = item_everywhere(&s, &s.phone, "old_pc.jpg", 46).await;
+    s.phone.core.delete_item(id).unwrap();
+    until("in the Bin on every device", 20, || binned_on(&[&s.phone, &s.pcs[0], &s.pcs[1]], id)).await;
+    s.settle().await;
+
+    s.pcs[0].core.debug_set_proto(2);
+    s.phone.core.debug_kill_connection_of(s.pcs[0].id);
+    until("the phone shows PC-1 refused", 20, || s.phone.core.status().state == SyncState::Refused).await;
+    assert_eq!(s.row(0).message.as_deref(), Some("Update Tugboat on PC-1"));
+    s.pcs[0].wait_state(SyncState::Refused).await;
+    assert_eq!(s.pcs[0].core.status().message.as_deref(), Some("Update Tugboat on the PC"));
+    until("PC-2 stays Synced", 10, || s.row_state(1) == Some(SyncState::Synced)).await;
+
+    s.phone.core.purge_item(id).unwrap();
+    until("gone on the phone and PC-2", 20, || purged_on(&[&s.phone, &s.pcs[1]], id)).await;
+    assert!(s.pcs[0].record(id).unwrap().purged.is_none(), "nothing crossed the refused connection");
+    assert_eq!(s.pcs[0].local(id), Some(LocalFileState::Binned));
+    s.shutdown().await;
 }

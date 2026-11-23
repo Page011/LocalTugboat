@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import { actionLabel, activityDetail, ago, binLabel, deviceLabel, duration, fileIcon, fmtSize, isProblem, itemLabel, itemMeta, kindText, lastSeenText, parseBinDays, peerNote, shortPath, syncLabel } from "./format";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { DELETE_FOREVER_TEXT, DELETE_FOREVER_TITLE, EMPTY_BIN_TITLE, actionLabel, activityDetail, ago, binLabel, deviceLabel, duration, emptyBinText, fileIcon, fmtSize, isProblem, itemLabel, itemMeta, kindText, lastSeenText, parseBinDays, peerNote, shortPath, syncLabel } from "./format";
 import type { ItemView } from "./bindings/ItemView";
 import type { SyncStatus } from "./bindings/SyncStatus";
 
@@ -51,6 +53,50 @@ describe("itemLabel", () => {
     expect(itemLabel(item({ local: "lost" }), NOW)).toEqual({ text: "FILE MISSING", tone: "danger", icon: "alert" });
     expect(itemLabel(item({ local: "refused" }), NOW).text).toBe("REFUSED");
     expect(itemLabel(item({ local: "pending" }), NOW).text).toBe("Downloading");
+  });
+});
+
+describe("Delete forever and Empty Bin texts", () => {
+  test("the confirmations say what happens, in one line", () => {
+    expect(DELETE_FOREVER_TITLE).toBe("Delete forever?");
+    expect(DELETE_FOREVER_TEXT).toBe("Removes it from every linked device.");
+    expect(EMPTY_BIN_TITLE).toBe("Empty Bin?");
+    expect(emptyBinText(12)).toBe("Removes 12 items from every linked device.");
+    expect(emptyBinText(2)).toBe("Removes 2 items from every linked device.");
+  });
+  test("one item reads as one item", () => {
+    expect(emptyBinText(1)).toBe("Removes 1 item from every linked device.");
+  });
+  test("the Activity row", () => {
+    expect(actionLabel("deleted_forever")).toBe("Deleted forever");
+    expect(isProblem("deleted_forever")).toBe(false);
+    expect(activityDetail("deleted_forever", "Inbox")).toBe("Inbox");
+  });
+  test("the Bin screen shows these texts and nothing of its own on the two confirmations", () => {
+    const bin = readFileSync(join(import.meta.dir, "Bin.svelte"), "utf8");
+    expect(bin).toContain("title={DELETE_FOREVER_TITLE}");
+    expect(bin).toContain("{DELETE_FOREVER_TEXT}");
+    expect(bin).toContain("title={EMPTY_BIN_TITLE}");
+    expect(bin).toContain("{emptyBinText(emptyCount)}");
+    expect(bin).toContain("api.purgeItem(");
+    expect(bin).toContain("api.emptyBin(emptyCount, emptyToken)");
+  });
+  test("a purge is reachable only from the confirm button of its question", () => {
+    const bin = readFileSync(join(import.meta.dir, "Bin.svelte"), "utf8");
+    const count = (re: RegExp) => bin.match(re)?.length ?? 0;
+    // One call each, and each handler is bound once.
+    expect(count(/api\.purgeItem\(/g)).toBe(1);
+    expect(count(/api\.emptyBin\(/g)).toBe(1);
+    expect(count(/\bdeleteForever\b/g)).toBe(2); // its definition and one binding
+    expect(count(/\bemptyBin\b/g)).toBe(3); // its definition, the api call and one binding
+    // The binding sits inside the dialog that asks, not on the bar or header button.
+    const dialog = (open: string) => {
+      const start = bin.indexOf(`<Dialog bind:open={${open}}`);
+      expect(start).toBeGreaterThan(-1);
+      return bin.slice(start, bin.indexOf("</Dialog>", start));
+    };
+    expect(dialog("confirmOne")).toContain("onclick={deleteForever}");
+    expect(dialog("confirmAll")).toContain("onclick={emptyBin}");
   });
 });
 

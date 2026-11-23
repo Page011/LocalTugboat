@@ -10,7 +10,7 @@
 
 use std::path::{Path, PathBuf};
 
-use tugboat_core::{events::Event, ActivityEntry, FolderView, ItemQuery, ItemView, Page, Settings};
+use tugboat_core::{events::Event, ActivityEntry, BinCount, FolderView, ItemQuery, ItemView, Page, Settings};
 use ts_rs::{Config, TS};
 
 use crate::{
@@ -30,6 +30,7 @@ fn export_all(dir: &Path) {
     all!(
         Event,
         ItemView,
+        BinCount,
         FolderView,
         ItemQuery,
         Page<ItemView>,

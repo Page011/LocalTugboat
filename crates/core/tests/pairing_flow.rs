@@ -35,7 +35,7 @@ fn pairing_code_of(e: &CoreError) -> String {
 #[tokio::test(flavor = "multi_thread")]
 async fn s11_version_mismatch_is_refused_visibly_on_both_devices() {
     let r = Rig::unconnected();
-    r.phone.core.debug_set_proto(3);
+    r.phone.core.debug_set_proto(tugboat_core::sync::wire::PROTO + 1);
     let from_phone_before_pairing = r.phone.add("secret.jpg", 1, 1_000);
     pair(&r.pc, &r.phone).await;
     r.phone.wait_state(SyncState::Refused).await;
@@ -50,6 +50,25 @@ async fn s11_version_mismatch_is_refused_visibly_on_both_devices() {
     tokio::time::sleep(Duration::from_millis(800)).await;
     assert!(!r.pc.has_item(from_phone_before_pairing), "no record crossed the refused connection");
     assert_eq!(r.pc.digest().1, 3, "the PC holds only its default folders");
+    r.shutdown().await;
+}
+
+// A phone on protocol 2 (0.3.0 or older, before Delete forever) is refused on both devices, names
+// itself as the one to update, and exchanges no record with the new PC.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_protocol_2_phone_is_refused_on_both_devices() {
+    let r = Rig::unconnected();
+    r.phone.core.debug_set_proto(2);
+    let before_pairing = r.phone.add("old_phone.jpg", 1, 1_000);
+    pair(&r.pc, &r.phone).await;
+    r.phone.wait_state(SyncState::Refused).await;
+    r.pc.wait_state(SyncState::Refused).await;
+    for d in [&r.pc, &r.phone] {
+        assert_eq!(d.core.status().message.as_deref(), Some("Update Tugboat on the phone"), "{}", d.name);
+        assert!(d.has_activity(ActivityAction::SyncError), "{}: {:?}", d.name, d.activity_text());
+    }
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert!(!r.pc.has_item(before_pairing), "no record crossed the refused connection");
     r.shutdown().await;
 }
 

@@ -79,7 +79,7 @@ import androidx.compose.ui.text.style.TextOverflow
 
 /**
  * One item full screen, swipe for the next. Photo: pinch, drag, double tap. Video: Media3 with controls.
- * Actions: Keep, Move, Share, Save to phone, Delete (to the Bin); in the Bin only Restore.
+ * Actions: Keep, Move, Share, Save to phone, Delete (to the Bin); in the Bin Restore and Delete forever.
  */
 @Composable
 fun ViewerScreen(vm: SnapViewModel, ui: UiState, route: Route.Viewer) {
@@ -94,6 +94,8 @@ fun ViewerScreen(vm: SnapViewModel, ui: UiState, route: Route.Viewer) {
     ReloadOnEvents(vm, model, ::itemsRelevant)
     var zoomed by remember { mutableStateOf(false) }
     var moving by rememberSaveable { mutableStateOf(false) }
+    // The item the Delete forever question is about: fixed when it was asked, whatever the pager shows later.
+    var foreverId by rememberSaveable { mutableStateOf<String?>(null) }
     LightSystemIcons()
 
     val rows = model.rows
@@ -112,7 +114,10 @@ fun ViewerScreen(vm: SnapViewModel, ui: UiState, route: Route.Viewer) {
     LaunchedEffect(pager, model) {
         androidx.compose.runtime.snapshotFlow { pager.currentPage }.collect { if (it >= model.rows.size - 5 && model.hasMore) model.loadMore() }
     }
-    val item = rows.getOrNull(pager.currentPage) ?: return
+    // Deleting the last page shrinks the list under the pager. The pager only moves back once it is laid out again,
+    // so show the new last item now rather than nothing (an empty screen would never lay the pager out).
+    val shown = pager.currentPage.coerceAtMost(rows.lastIndex)
+    val item = rows[shown]
 
     fun openFile(i: ItemInfo) {
         scope.launch {
@@ -139,7 +144,7 @@ fun ViewerScreen(vm: SnapViewModel, ui: UiState, route: Route.Viewer) {
             IconBtn(R.drawable.ic_arrow_back, "Back", { vm.nav.back() }, tint = Color.White)
             Column(Modifier.weight(1f)) {
                 Text(item.name, color = Color.White, style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                Text("${pager.currentPage + 1} of ${rows.size}${if (model.hasMore) "+" else ""}", color = Color.White, style = MaterialTheme.typography.labelMedium)
+                Text("${shown + 1} of ${rows.size}${if (model.hasMore) "+" else ""}", color = Color.White, style = MaterialTheme.typography.labelMedium)
             }
         }
         HorizontalPager(pager, Modifier.weight(1f).fillMaxWidth(), userScrollEnabled = !zoomed, key = { model.rows.getOrNull(it)?.id ?: it }) { page ->
@@ -157,6 +162,7 @@ fun ViewerScreen(vm: SnapViewModel, ui: UiState, route: Route.Viewer) {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
                 if (route.bin) {
                     ViewerAction(R.drawable.ic_restore_from_trash, "Restore", true) { after(vm.restore(item.id)) }
+                    ViewerAction(R.drawable.ic_delete, "Delete forever", true) { foreverId = item.id }
                 } else {
                     val folderKeep = item.state is ItemStateInfo.FolderKeep
                     ViewerAction(if (cell.kept) R.drawable.ic_star_fill1 else R.drawable.ic_star, if (cell.kept) "Kept" else "Keep", !folderKeep) { after(vm.keep(item.id, !item.pinned)) }
@@ -168,6 +174,17 @@ fun ViewerScreen(vm: SnapViewModel, ui: UiState, route: Route.Viewer) {
                 }
             }
         }
+    }
+
+    foreverId?.let { id ->
+        ForeverDialog(
+            Texts.DELETE_FOREVER_TITLE, Texts.DELETE_FOREVER_TEXT, "Delete forever",
+            onConfirm = {
+                foreverId = null
+                after(vm.purge(id))
+            },
+            onDismiss = { foreverId = null },
+        )
     }
 
     if (moving) {

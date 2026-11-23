@@ -27,10 +27,10 @@ use rusqlite::{Connection, TransactionBehavior};
 use crate::{clock::Clock, CoreError, Result};
 
 /// Highest schema version this build knows.
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// Migration SQL, index i = from version i to i + 1.
-pub const MIGRATIONS: &[&str] = &[include_str!("schema/v1.sql"), include_str!("schema/v2.sql"), include_str!("schema/v3.sql")];
+pub const MIGRATIONS: &[&str] = &[include_str!("schema/v1.sql"), include_str!("schema/v2.sql"), include_str!("schema/v3.sql"), include_str!("schema/v4.sql")];
 
 /// File name of the database inside the data dir (%LOCALAPPDATA%\Local Tugboat on the PC,
 /// filesDir on Android).
@@ -61,6 +61,9 @@ fn set_pragmas(conn: &Connection) -> Result<()> {
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.pragma_update(None, "busy_timeout", 5000)?;
+    // A row that is overwritten or deleted is zeroed on disk, so a purged item's name and saved
+    // location do not linger in free pages.
+    conn.pragma_update(None, "secure_delete", "ON")?;
     Ok(())
 }
 
@@ -165,6 +168,37 @@ impl Db {
     }
 }
 
+/// Clear the name, saved location and thumbnail of every purged item in the migration backups next to
+/// the database (`tugboat.db.bak-*`), which were written before the item was deleted forever. The rest
+/// of a backup is left as it is. `conn` is the open database; a backup that cannot be opened or read is
+/// skipped and the first such error is returned.
+pub(crate) fn scrub_backups(conn: &Connection, data_dir: &Path) -> Result<()> {
+    let Ok(rd) = std::fs::read_dir(data_dir) else { return Ok(()) };
+    let prefix = format!("{DB_FILE}.bak-");
+    let mut first: Option<CoreError> = None;
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if !name.starts_with(&prefix) || !e.path().is_file() || name.ends_with("-wal") || name.ends_with("-shm") || name.ends_with("-journal") {
+            continue;
+        }
+        let one = (|| -> rusqlite::Result<()> {
+            conn.execute("ATTACH DATABASE ?1 AS bak", [e.path().to_string_lossy().into_owned()])?;
+            let r = conn.execute(
+                "UPDATE bak.item SET name = '', lat = NULL, lon = NULL, accuracy_m = NULL, thumb_hash = NULL, thumb_size = NULL \
+                 WHERE id IN (SELECT id FROM main.item WHERE purged_at IS NOT NULL) \
+                 AND (name != '' OR lat IS NOT NULL OR lon IS NOT NULL OR thumb_hash IS NOT NULL)",
+                [],
+            );
+            let d = conn.execute("DETACH DATABASE bak", []);
+            r.and(d).map(|_| ())
+        })();
+        if let Err(err) = one {
+            first.get_or_insert(CoreError::from(err));
+        }
+    }
+    first.map_or(Ok(()), Err)
+}
+
 /// Path of the backup written before migrating from `version` (rule 4).
 pub fn backup_path(data_dir: &Path, version: u32) -> PathBuf {
     data_dir.join(format!("{DB_FILE}.bak-{version}"))
@@ -173,6 +207,43 @@ pub fn backup_path(data_dir: &Path, version: u32) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A purged item's name and saved location are cleared from the upgrade backups too; other items in
+    // the backup stay as they were.
+    #[test]
+    fn purged_items_are_scrubbed_from_the_migration_backups() {
+        use crate::{model::*, store, store::test_support::*};
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path()).unwrap();
+        let mut gone = item(1, p(), v(1, p()));
+        gone.geo = Some(Geo { lat: -33.8, lon: 151.2, accuracy_m: 5.0 });
+        gone.content.val.thumb = Some(Thumb { hash: hash(0x77), size: 10 });
+        let kept = item(2, p(), v(1, p()));
+        for it in [&gone, &kept] {
+            store::insert_item(&db.conn, it, LocalFileState::Present, T0).unwrap();
+        }
+        let bak = backup_path(dir.path(), 3);
+        db.conn.execute("VACUUM INTO ?1", [bak.to_string_lossy().into_owned()]).unwrap();
+        let read = |id: ItemId| -> (String, Option<f64>, Option<Vec<u8>>) {
+            let c = Connection::open(&bak).unwrap();
+            c.query_row("SELECT name, lat, thumb_hash FROM item WHERE id = ?1", [id.0.as_bytes().as_slice()], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap()
+        };
+        assert_eq!(read(gone.id).0, gone.name.val, "the backup holds the name before the purge");
+        // Nothing purged yet: nothing is touched.
+        scrub_backups(&db.conn, dir.path()).unwrap();
+        assert_eq!(read(gone.id).0, gone.name.val);
+        let mut purged = gone.clone();
+        purged.purged = Some(Versioned { v: v(5, p()), val: T0 + 1 });
+        purged.scrub_purged();
+        store::update_item(&db.conn, &purged).unwrap();
+        // A stray file with the backup prefix that is not a database does not stop the others.
+        std::fs::write(dir.path().join("tugboat.db.bak-9"), b"not a database").unwrap();
+        let _ = scrub_backups(&db.conn, dir.path());
+        assert_eq!(read(gone.id), (String::new(), None, None), "name, location and thumbnail are gone from the backup");
+        assert_eq!(read(kept.id).0, kept.name.val, "another item in the backup is untouched");
+        // The main database is still usable afterwards (the backup was detached).
+        assert!(store::get_item(&db.conn, kept.id).unwrap().is_some());
+    }
 
     const V1: &str = "CREATE TABLE a (x INTEGER); INSERT INTO a VALUES (1);";
     const V2: &str = "ALTER TABLE a ADD COLUMN y INTEGER DEFAULT 7;";
@@ -213,7 +284,7 @@ mod tests {
         }
         let before = std::fs::read(&path).unwrap();
         match Db::open(dir.path()) {
-            Err(CoreError::NewerDatabase { found: 99, supported: 3 }) => {}
+            Err(CoreError::NewerDatabase { found: 99, supported: 4 }) => {}
             other => panic!("expected NewerDatabase, got {:?}", other.map(|_| ())),
         }
         assert_eq!(std::fs::read(&path).unwrap(), before);
@@ -356,7 +427,7 @@ mod tests {
             }
             d.conn.execute("INSERT INTO setting (key, value) VALUES ('last_synced_at', '123456')", []).unwrap();
         }
-        let d = Db::open(dir.path()).unwrap();
+        let d = Db::open_with(dir.path(), &MIGRATIONS[..3]).unwrap();
         assert_eq!(d.user_version().unwrap(), 3);
         let log: Vec<(i64, Option<Vec<u8>>)> = d
             .conn
@@ -391,22 +462,75 @@ mod tests {
             d.conn.execute("INSERT INTO change_log (entity, entity_id, field_group, lamport) VALUES ('item', zeroblob(16), 'name', 2)", []).unwrap();
             d.conn.execute("DELETE FROM change_log", []).unwrap();
         }
-        let d = Db::open(dir.path()).unwrap();
+        let d = Db::open_with(dir.path(), &MIGRATIONS[..3]).unwrap();
         let floor: String = d.conn.query_row("SELECT value FROM setting WHERE key = 'log_floor'", [], |r| r.get(0)).unwrap();
         assert_eq!(floor, "2");
     }
 
     #[test]
-    fn fresh_db_at_v3_floor_zero() {
+    fn fresh_db_is_current_with_floor_zero() {
         let dir = tempfile::tempdir().unwrap();
         let d = Db::open(dir.path()).unwrap();
-        assert_eq!(d.user_version().unwrap(), 3);
+        assert_eq!(d.user_version().unwrap(), SCHEMA_VERSION);
         let floor: String = d.conn.query_row("SELECT value FROM setting WHERE key = 'log_floor'", [], |r| r.get(0)).unwrap();
         assert_eq!(floor, "0");
-        assert!(!backup_path(dir.path(), 2).exists(), "a new database is not backed up");
+        assert!(!backup_path(dir.path(), 2).exists() && !backup_path(dir.path(), 3).exists(), "a new database is not backed up");
         let mem = Db::open_in_memory().unwrap();
         let floor: String = mem.conn.query_row("SELECT value FROM setting WHERE key = 'log_floor'", [], |r| r.get(0)).unwrap();
         assert_eq!(floor, "0");
+    }
+
+    // v3 -> v4 on a real 0.3.x file: every row kept, none purged, the v3 file backed up first, the
+    // purge columns and the thumbnail queue exist afterwards.
+    #[test]
+    fn migration_v3_to_v4_keeps_rows_and_writes_a_backup() {
+        use crate::model::{ItemId, LocalFileState};
+        use crate::store::{self, test_support::*};
+        let dir = tempfile::tempdir().unwrap();
+        let ids: Vec<ItemId> = {
+            let d = Db::open_with(dir.path(), &MIGRATIONS[..3]).unwrap();
+            assert_eq!(d.user_version().unwrap(), 3);
+            assert!(d.conn.prepare("SELECT purged_at FROM item").is_err(), "a v3 file has no purge columns");
+            let mut ids = Vec::new();
+            for (n, lfs) in [(1u8, LocalFileState::Present), (2, LocalFileState::Binned), (3, LocalFileState::Purged)] {
+                let mut it = item(n, p(), v(1, p()));
+                it.deleted.val = (n != 1).then_some(T0 + 5);
+                insert_item_before_v4(&d.conn, &it, lfs, T0);
+                ids.push(it.id);
+            }
+            d.conn.execute("INSERT INTO change_log (entity, entity_id, field_group, lamport) VALUES ('item', zeroblob(16), 'name', 1)", []).unwrap();
+            d.conn.execute("INSERT INTO receipt (blob_hash, device_id, received_at, seen_at) VALUES (zeroblob(32), zeroblob(32), 1, 1)", []).unwrap();
+            ids
+        };
+        let d = Db::open(dir.path()).unwrap();
+        assert_eq!(d.user_version().unwrap(), 4);
+        for (n, id) in ids.iter().enumerate() {
+            let (rec, lfs) = store::get_item(&d.conn, *id).unwrap().expect("row kept");
+            assert_eq!(rec.name.val, format!("IMG_{}.jpg", n + 1));
+            assert_eq!(rec.deleted.val.is_some(), n != 0, "the delete mark is untouched");
+            assert!(rec.purged.is_none(), "the migration purges nothing");
+            assert_eq!(lfs, [LocalFileState::Present, LocalFileState::Binned, LocalFileState::Purged][n]);
+        }
+        let count = |t: &str| -> i64 { d.conn.query_row(&format!("SELECT count(*) FROM {t}"), [], |r| r.get(0)).unwrap() };
+        assert_eq!((count("item"), count("change_log"), count("receipt"), count("thumb_trash")), (3, 1, 1, 0));
+        assert!(d.conn.execute("UPDATE item SET purged_lamport = 0 WHERE id = ?1", [ids[0].0.as_bytes().as_slice()]).is_err(), "a purge version is 1 or more");
+        let bak = Connection::open(backup_path(dir.path(), 3)).unwrap();
+        assert_eq!(read_version(&bak).unwrap(), 3);
+        assert!(bak.prepare("SELECT purged_at FROM item").is_err(), "the backup is the v3 file");
+        assert!(bak.prepare("SELECT hash FROM thumb_trash").is_err());
+        let n: i64 = bak.query_row("SELECT count(*) FROM item", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 3);
+    }
+
+    // A new database has the v4 pieces without any backup or migration step.
+    #[test]
+    fn fresh_db_has_the_purge_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = Db::open(dir.path()).unwrap();
+        assert!(d.conn.prepare("SELECT purged_at, purged_lamport, purged_dev FROM item").is_ok());
+        assert!(d.conn.prepare("SELECT hash FROM thumb_trash").is_ok());
+        assert!(d.conn.execute("INSERT INTO thumb_trash (hash) VALUES (x'0102')", []).is_err(), "a thumbnail hash is 32 bytes");
+        assert!(!backup_path(dir.path(), 3).exists());
     }
 
     fn dump(c: &Connection, sql: &str) -> Vec<String> {

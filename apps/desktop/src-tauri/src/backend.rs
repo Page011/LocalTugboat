@@ -347,6 +347,22 @@ impl Backend {
         Ok(self.core.restore_item(id)?)
     }
 
+    /// Delete forever: gone from the Bin here and on every linked device.
+    pub fn purge_item(&self, id: ItemId) -> CmdResult<()> {
+        Ok(self.core.purge_item(id)?)
+    }
+
+    /// Empty Bin: Delete forever for everything the Bin lists, if it still lists exactly the `shown` items
+    /// (`token` names them) the confirmation asked about. Returns how many.
+    pub fn empty_bin(&self, shown: u32, token: &str) -> CmdResult<u32> {
+        Ok(self.core.empty_bin(shown, token)?)
+    }
+
+    /// How many items Empty Bin would delete, with the token naming them.
+    pub fn bin_count(&self) -> CmdResult<tugboat_core::BinCount> {
+        Ok(self.core.bin_count()?)
+    }
+
     pub fn activity(&self, before: Option<i64>, limit: u32) -> CmdResult<Vec<ActivityEntry>> {
         Ok(self.core.activity(before, limit.clamp(1, 500))?)
     }

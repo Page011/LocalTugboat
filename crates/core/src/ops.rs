@@ -35,6 +35,13 @@
 //!    unknown/deleted folder -> Unsorted). Expired -> placement entered_at = now.
 //!    Local Purged -> Pending ("If only the other device still has the file, it is fetched
 //!    from there"). Not in the Bin -> Invalid. Activity Restored.
+//! O6b purge_items (Delete forever, Empty Bin): `purged` = Some(now) with ONE new version for the
+//!    whole call, one change_log row each, thumbnail queued for deletion, name, saved location and
+//!    thumbnail cleared from the record (`scrub_purged`), Activity DeletedForever.
+//!    Every item must be in the Bin (restore and edit race: Invalid, nothing written); one already
+//!    purged is skipped. The file goes through the Bin sweep after the commit. Other devices delete
+//!    their copy when they merge it (merge M10); nothing waits for them. Every other op on a purged
+//!    item answers NotFound: it is gone.
 //! O7 content_changed (PC edit): re-hash; same hash -> no-op; else content group with the
 //!    new hash/size (kind and ext unchanged, thumb None until a new one is supplied); own receipt for
 //!    the new hash. Activity Edited. A photo/video whose new bytes no longer match -> NotMedia.
@@ -103,7 +110,20 @@ fn begin(c: &mut Connection) -> Result<Transaction<'_>> {
 }
 
 fn load_item(c: &Connection, id: ItemId) -> Result<(ItemRecord, LocalFileState)> {
-    store::get_item(c, id)?.ok_or(CoreError::NotFound { what: "item", id: id.0.to_string() })
+    match store::get_item(c, id)? {
+        // A purged item is a tombstone: every op treats it as gone.
+        Some((rec, lfs)) if rec.purged.is_none() => Ok((rec, lfs)),
+        _ => Err(CoreError::NotFound { what: "item", id: id.0.to_string() }),
+    }
+}
+
+/// The item, or None when it was deleted forever meanwhile (a download result says nothing then).
+fn load_unless_purged(c: &Connection, id: ItemId) -> Result<Option<(ItemRecord, LocalFileState)>> {
+    match store::get_item(c, id)? {
+        Some((rec, _)) if rec.purged.is_some() => Ok(None),
+        Some(x) => Ok(Some(x)),
+        None => Err(CoreError::NotFound { what: "item", id: id.0.to_string() }),
+    }
 }
 
 fn live_folder(c: &Connection, id: FolderId) -> Result<FolderRecord> {
@@ -257,6 +277,7 @@ pub fn add_local_file(c: &mut Connection, ctx: &Ctx<'_>, f: &NewLocalFile, thumb
             location: Versioned { v, val: Location { folder: folder.id, entered_at: ctx.now } },
             pinned: Versioned { v, val: false },
             deleted: Versioned { v, val: None },
+            purged: None,
         };
         store::insert_item(&tx, &rec, LocalFileState::Present, ctx.now)?;
         store::put_file_ref(
@@ -274,9 +295,10 @@ pub fn add_local_file(c: &mut Connection, ctx: &Ctx<'_>, f: &NewLocalFile, thumb
         Ok(())
     })();
     if let Err(e) = written {
-        // Never leave an orphan file when the record could not be written. The PC library's
-        // adopt returns the user's own file in place: purge is a no-op for files it did not move.
-        if ctx.placement.purge(&target).is_err() {
+        // Never leave an orphan file when the record could not be written. A file adopted in place
+        // (the PC library returns the very path it was given) is the user's own and stays: only a copy
+        // the placement made is removed.
+        if path != f.src && ctx.placement.purge(&target).is_err() {
             tracing::warn!("could not remove the file of a failed add: {}", path.display());
         }
         return Err(e);
@@ -470,6 +492,46 @@ pub fn restore_item(c: &mut Connection, ctx: &Ctx<'_>, id: ItemId) -> Result<()>
         bin::sweep_item(c, ctx.placement, ctx.self_id, id, ctx.now)?;
     }
     Ok(())
+}
+
+/// O6b. Returns how many items were purged now (one already purged is not counted).
+pub fn purge_items(c: &mut Connection, ctx: &Ctx<'_>, ids: &[ItemId]) -> Result<u32> {
+    let done: Vec<ItemId> = {
+        let tx = begin(c)?;
+        let v = store::next_version(&tx, ctx.self_id)?;
+        let mut done = Vec::new();
+        for id in ids {
+            let Some((rec, _)) = store::get_item(&tx, *id)? else {
+                return Err(CoreError::NotFound { what: "item", id: id.0.to_string() });
+            };
+            if rec.purged.is_some() {
+                continue;
+            }
+            if !expiry::in_bin(bin::derive_state(&tx, &rec, ctx.now)?) {
+                return Err(CoreError::Invalid("the item is not in the Bin".into()));
+            }
+            let mut new = rec.clone();
+            new.purged = Some(Versioned { v, val: ctx.now });
+            new.scrub_purged();
+            store::update_item(&tx, &new)?;
+            log_item(&tx, *id, group::PURGED, v)?;
+            if let Some(t) = &rec.content.val.thumb {
+                store::trash_thumb(&tx, t.hash)?;
+            }
+            activity::log(&tx, ctx.now, Some(ctx.self_id), Some(*id), ActivityAction::DeletedForever, &folder_name(&tx, rec.location.val.folder))?;
+            done.push(*id);
+        }
+        tx.commit()?;
+        done
+    };
+    // Files follow after the commit; the first failure is returned, the rest are still tried.
+    let mut first: Option<CoreError> = None;
+    for id in &done {
+        if let Err(e) = bin::sweep_item(c, ctx.placement, ctx.self_id, *id, ctx.now) {
+            first.get_or_insert(e);
+        }
+    }
+    first.map_or(Ok(done.len() as u32), Err)
 }
 
 /// O7.
@@ -807,7 +869,7 @@ pub fn blob_committed(c: &mut Connection, ctx: &Ctx<'_>, id: ItemId, hash: BlobH
 /// Returns whether the item was marked.
 pub fn blob_refused(c: &mut Connection, ctx: &Ctx<'_>, id: ItemId, hash: BlobHash, reason: &str) -> Result<bool> {
     let tx = begin(c)?;
-    let (rec, lfs) = load_item(&tx, id)?;
+    let Some((rec, lfs)) = load_unless_purged(&tx, id)? else { return Ok(false) };
     if rec.content.val.hash != hash || !matches!(lfs, LocalFileState::Pending | LocalFileState::Lost) {
         return Ok(false);
     }
@@ -825,7 +887,7 @@ pub fn blob_refused(c: &mut Connection, ctx: &Ctx<'_>, id: ItemId, hash: BlobHas
 /// not log or report again.
 pub fn blob_lost(c: &mut Connection, ctx: &Ctx<'_>, id: ItemId, hash: BlobHash) -> Result<bool> {
     let tx = begin(c)?;
-    let (rec, lfs) = load_item(&tx, id)?;
+    let Some((rec, lfs)) = load_unless_purged(&tx, id)? else { return Ok(false) };
     if rec.content.val.hash != hash || lfs != LocalFileState::Pending {
         return Ok(false);
     }
@@ -953,6 +1015,54 @@ mod tests {
         assert_eq!(store::head_seq(&r.db.conn).unwrap(), 2, "no change-log rows from the failed add");
         let files = std::fs::read_dir(r.pl.root.join("items")).unwrap().count();
         assert_eq!(files, 1, "the second file was removed again");
+    }
+
+    // A file adopted in place is the user's own: when the record cannot be written it stays, even for a
+    // placement whose purge removes whatever file it is given.
+    #[test]
+    fn failed_record_write_keeps_a_file_adopted_in_place() {
+        use crate::placement::{FileTarget, Placement};
+        use std::path::{Path, PathBuf};
+        struct InPlace(crate::placement::AppStorage);
+        impl Placement for InPlace {
+            fn part_path(&self, hash: &BlobHash) -> Result<PathBuf> {
+                self.0.part_path(hash)
+            }
+            fn commit(&self, part: &Path, t: &FileTarget) -> Result<PathBuf> {
+                self.0.commit(part, t)
+            }
+            fn adopt(&self, src: &Path, _t: &FileTarget) -> Result<PathBuf> {
+                Ok(src.to_path_buf())
+            }
+            fn relocate(&self, t: &FileTarget) -> Result<PathBuf> {
+                self.0.relocate(t)
+            }
+            fn to_bin(&self, t: &FileTarget) -> Result<PathBuf> {
+                self.0.to_bin(t)
+            }
+            fn from_bin(&self, t: &FileTarget) -> Result<PathBuf> {
+                self.0.from_bin(t)
+            }
+            fn purge(&self, t: &FileTarget) -> Result<()> {
+                match &t.current {
+                    Some(p) => std::fs::remove_file(p).map_err(|e| CoreError::io(p, e)),
+                    None => Ok(()),
+                }
+            }
+            fn available_space(&self) -> Result<u64> {
+                self.0.available_space()
+            }
+        }
+        let mut r = Rig::new();
+        let own = r.write_jpeg("mine");
+        let now = r.now();
+        let pl = InPlace(crate::placement::AppStorage::new(r.dir.path().join("other")).unwrap());
+        let ctx = Ctx { self_id: p(), now, placement: &pl };
+        r.db.conn.execute_batch("CREATE TRIGGER boom BEFORE INSERT ON activity BEGIN SELECT RAISE(ABORT, 'boom'); END;").unwrap();
+        let f = NewLocalFile { src: own.clone(), name: "mine.jpg".into(), folder: None, captured_at: now, geo: None, thumb: None, how: AddKind::Added, ntfs: None };
+        assert!(add_local_file(&mut r.db.conn, &ctx, &f, None).is_err());
+        assert!(own.exists(), "the user's own file was not deleted");
+        assert_eq!(store::count_items(&r.db.conn).unwrap(), 0);
     }
 
     // One change_log row per written group.
@@ -1590,5 +1700,145 @@ mod tests {
         assert_eq!(h.0, *blake3::hash(&data).as_bytes());
         assert_eq!(size, 300_000);
         assert!(matches!(hash_file(&dir.path().join("nope")), Err(CoreError::Io { .. })));
+    }
+
+    // O6b: Delete forever writes the purged group once for the whole call, removes the file, queues the
+    // thumbnail and logs one row; a repeat does nothing; every other op treats the item as gone.
+    #[test]
+    fn purge_items_deletes_forever_and_is_idempotent() {
+        let mut r = Rig::new();
+        let id = r.add("gone");
+        let held = r.path(id).unwrap();
+        // Not in the Bin: refused, nothing written.
+        let head = store::head_seq(&r.db.conn).unwrap();
+        assert!(matches!(r.run(|c, x| purge_items(c, x, &[id])), Err(CoreError::Invalid(_))));
+        assert_eq!(store::head_seq(&r.db.conn).unwrap(), head);
+        assert!(r.rec(id).purged.is_none());
+        // Deleted: now it can go.
+        r.run(|c, x| delete_item(c, x, id)).unwrap();
+        let in_bin = r.path(id).unwrap();
+        assert!(in_bin.exists());
+        r.clock.advance(5_000);
+        let rows_before = log_rows(&r.db.conn).len();
+        assert_eq!(r.run(|c, x| purge_items(c, x, &[id])).unwrap(), 1);
+        let purged = r.rec(id).purged.expect("purged is set");
+        assert_eq!((purged.v.device, purged.val), (p(), r.now()));
+        assert!(r.rec(id).name.val.is_empty() && r.rec(id).geo.is_none() && r.rec(id).content.val.thumb.is_none(), "no name, location or thumbnail is kept");
+        assert!(purged.v.lamport > r.rec(id).deleted.v.lamport, "a new write, after the delete");
+        assert_eq!(groups(&r.db.conn, "item").last().map(String::as_str), Some("purged"));
+        assert_eq!(log_rows(&r.db.conn).len(), rows_before + 1);
+        assert!(!in_bin.exists() && !held.exists(), "no copy is left anywhere");
+        assert!(r.path(id).is_none());
+        assert_eq!(r.lfs(id), LocalFileState::Purged);
+        let row = activity::list(&r.db.conn, None, 1).unwrap().remove(0);
+        assert_eq!((row.action, row.device, row.item, row.detail.as_str()), (ActivityAction::DeletedForever, Some(p()), Some(id), "Inbox"));
+        // Again: nothing written, nothing counted. An id that never existed is NotFound.
+        let head = store::head_seq(&r.db.conn).unwrap();
+        assert_eq!(r.run(|c, x| purge_items(c, x, &[id])).unwrap(), 0);
+        assert_eq!(store::head_seq(&r.db.conn).unwrap(), head);
+        assert!(matches!(r.run(|c, x| purge_items(c, x, &[ItemId(Uuid::from_u128(1))])), Err(CoreError::NotFound { .. })));
+        // Gone for every other op, and never restorable.
+        assert!(matches!(r.run(|c, x| restore_item(c, x, id)), Err(CoreError::NotFound { .. })));
+        assert!(matches!(r.run(|c, x| set_pinned(c, x, id, true)), Err(CoreError::NotFound { .. })));
+        assert!(matches!(r.run(|c, x| move_item(c, x, id, KEEP_ID)), Err(CoreError::NotFound { .. })));
+        assert!(matches!(r.run(|c, x| rename_item(c, x, id, "x")), Err(CoreError::NotFound { .. })));
+        assert!(matches!(r.run(|c, x| delete_item(c, x, id)), Err(CoreError::NotFound { .. })));
+        assert!(r.rec(id).deleted.val.is_some() && r.rec(id).purged.is_some());
+    }
+
+    // Several items in one call share one version; one that is not in the Bin stops the whole call.
+    #[test]
+    fn purge_items_takes_one_version_and_all_or_nothing() {
+        let mut r = Rig::new();
+        let ids: Vec<ItemId> = ["a", "b", "c"].iter().map(|n| r.add(n)).collect();
+        let live = r.add("live");
+        for id in &ids {
+            r.run(|c, x| delete_item(c, x, *id)).unwrap();
+        }
+        // The live item in the list: nothing is purged, not even the ones before it.
+        let mut with_live = ids.clone();
+        with_live.push(live);
+        assert!(matches!(r.run(|c, x| purge_items(c, x, &with_live)), Err(CoreError::Invalid(_))));
+        assert!(ids.iter().all(|id| r.rec(*id).purged.is_none()), "rolled back as a whole");
+        assert_eq!(r.run(|c, x| purge_items(c, x, &ids)).unwrap(), 3);
+        let versions: Vec<Version> = ids.iter().map(|id| r.rec(*id).purged.unwrap().v).collect();
+        assert!(versions.windows(2).all(|w| w[0] == w[1]), "one write, one version: {versions:?}");
+        assert_eq!(groups(&r.db.conn, "item").iter().filter(|g| *g == "purged").count(), 3);
+        assert!(r.rec(live).purged.is_none() && r.path(live).unwrap().exists(), "the live item is untouched");
+    }
+
+    // An expired item (not deleted) is in the Bin too and can be deleted forever.
+    #[test]
+    fn an_expired_item_can_be_deleted_forever() {
+        let mut r = Rig::new();
+        let id = r.add("old");
+        r.clock.advance(24 * HOUR_MS);
+        r.sweep();
+        assert_eq!(r.lfs(id), LocalFileState::Binned);
+        assert_eq!(r.run(|c, x| purge_items(c, x, &[id])).unwrap(), 1);
+        assert_eq!(r.lfs(id), LocalFileState::Purged);
+        assert!(r.rec(id).deleted.val.is_none(), "expiry stays derived; the purge is its own group");
+    }
+
+    // The thumbnail is queued; one a live item still uses stays on disk.
+    #[test]
+    fn purging_queues_the_thumbnail_unless_a_live_item_uses_it() {
+        let mut r = Rig::new();
+        let th = Thumb { hash: hash(0x44), size: 10 };
+        let add = |r: &mut Rig, name: &str| {
+            let src = r.write_jpeg(name);
+            let now = r.now();
+            r.run(|c, x| {
+                add_local_file(c, x, &NewLocalFile { src, name: format!("{name}.jpg"), folder: None, captured_at: now, geo: None, thumb: None, how: AddKind::Added, ntfs: None }, Some(th.clone()))
+            })
+            .unwrap()
+        };
+        let (a, b) = (add(&mut r, "one"), add(&mut r, "two"));
+        r.run(|c, x| delete_item(c, x, a)).unwrap();
+        r.run(|c, x| purge_items(c, x, &[a])).unwrap();
+        assert!(store::thumbs_to_delete(&r.db.conn).unwrap().is_empty(), "item two still uses this thumbnail");
+        r.run(|c, x| delete_item(c, x, b)).unwrap();
+        r.run(|c, x| purge_items(c, x, &[b])).unwrap();
+        assert_eq!(store::thumbs_to_delete(&r.db.conn).unwrap(), vec![th.hash], "now nobody does");
+        store::thumb_deleted(&r.db.conn, th.hash).unwrap();
+        assert!(store::thumbs_to_delete(&r.db.conn).unwrap().is_empty());
+    }
+
+    // Views that count or list items leave a deleted-forever one out, even before the sweep ran.
+    #[test]
+    fn a_purged_item_is_in_no_count_or_list() {
+        let mut r = Rig::new();
+        let kept = r.add("kept");
+        let gone = r.add("gone");
+        r.run(|c, x| delete_item(c, x, gone)).unwrap();
+        r.run(|c, x| purge_items(c, x, &[gone])).unwrap();
+        let now = r.now();
+        let inbox = |r: &Rig| folders::folder_views(&r.db.conn, now, false).unwrap().into_iter().find(|f| f.id == INBOX_ID).unwrap().count;
+        assert_eq!(inbox(&r), 1);
+        assert_eq!(store::items_page(&r.db.conn, None, None, 10).unwrap().into_iter().map(|(i, _)| i.id).collect::<Vec<_>>(), vec![kept]);
+        assert_eq!(store::item_ids_in_folder(&r.db.conn, INBOX_ID).unwrap(), vec![kept]);
+        assert!(bin::bin_ids(&r.db.conn, now).unwrap().is_empty());
+        assert_eq!(folders::retention_preview(&r.db.conn, INBOX_ID, Retention::Secs { secs: 1 }, now + 5_000).unwrap(), 1);
+        // A purged record that is still Pending on this device (the sweep has not run): not waiting, not picked.
+        let mut late = item(7, f(), v(3, f()));
+        late.purged = Some(Versioned { v: v(9, f()), val: T0 });
+        store::insert_item(&r.db.conn, &late, LocalFileState::Pending, T0).unwrap();
+        assert_eq!(store::pending_counts(&r.db.conn, &[f()]).unwrap(), (0, vec![0]));
+        assert!(!store::pending_held_by(&r.db.conn, f()).unwrap());
+        assert!(store::items_in_state(&r.db.conn, &[LocalFileState::Pending], 10).unwrap().is_empty());
+        assert!(store::items_missing_receipts(&r.db.conn, &[f()]).unwrap().iter().all(|(rec, _)| rec.id != late.id));
+    }
+
+    // A result for a download that was running when the item was deleted forever is not an error, and marks nothing.
+    #[test]
+    fn download_results_for_a_purged_item_mark_nothing() {
+        let mut r = Rig::new();
+        let mut it = item(5, f(), v(3, f()));
+        it.deleted.val = Some(T0);
+        it.purged = Some(Versioned { v: v(9, f()), val: T0 });
+        store::insert_item(&r.db.conn, &it, LocalFileState::Pending, T0).unwrap();
+        assert!(!r.run(|c, x| blob_lost(c, x, it.id, it.content.val.hash)).unwrap());
+        assert!(!r.run(|c, x| blob_refused(c, x, it.id, it.content.val.hash, "no")).unwrap());
+        assert_eq!(r.lfs(it.id), LocalFileState::Pending);
     }
 }

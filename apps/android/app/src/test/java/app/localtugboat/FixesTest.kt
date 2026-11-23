@@ -98,6 +98,31 @@ class FixesTest {
         assertTrue(v.contains("fontScale <= 1.5f"))
     }
 
+    // ---- delete forever ----
+
+    @Test fun the_bin_and_the_viewer_ask_before_deleting_forever_with_the_shared_words() {
+        val gallery = source("Gallery.kt")
+        assertTrue(gallery.contains("Texts.DELETE_FOREVER_TITLE, Texts.DELETE_FOREVER_TEXT"))
+        assertTrue(gallery.contains("Texts.EMPTY_BIN_TITLE, Texts.emptyBinText(ask.count.toInt())"))
+        assertTrue(gallery.contains("vm.purge(id)") && gallery.contains("vm.emptyBin(ask)"))
+        assertTrue(gallery.contains("vm.binCount()"))
+        val viewer = source("Viewer.kt")
+        assertTrue(viewer.contains("Texts.DELETE_FOREVER_TITLE, Texts.DELETE_FOREVER_TEXT") && viewer.contains("vm.purge(id)"))
+        // No path purges without the question: the only callers of purge and emptyBin sit inside a dialog's confirm.
+        assertEquals(2, Regex("""vm\.purge\(""").findAll(gallery + viewer).count())
+        assertEquals(1, Regex("""vm\.emptyBin\(""").findAll(gallery + viewer).count())
+        for (text in listOf(gallery, viewer)) {
+            for (call in Regex("""vm\.(purge|emptyBin)\(""").findAll(text)) {
+                val before = text.substring(0, call.range.first)
+                val confirm = before.lastIndexOf("onConfirm = {")
+                val tap = maxOf(before.lastIndexOf("onClick"), before.lastIndexOf("TextButton("))
+                assertTrue("${call.value} is not inside a confirm", confirm >= 0 && confirm > tap)
+                // ... and the confirm block has not closed before the call (its dismiss comes after).
+                assertFalse("${call.value} sits after the confirm block", before.substring(confirm).contains("onDismiss"))
+            }
+        }
+    }
+
     // ---- delete is undoable ----
 
     @Test fun delete_tells_the_user_where_it_went_and_offers_undo() {
@@ -157,6 +182,14 @@ class FixesTest {
         val open = source("SnapViewModel.kt").substringAfter("fun openAddDevice(").substringBefore("\n    }")
         assertTrue(open.indexOf("resetPairing()") in 0 until open.indexOf("nav.go(Route.AddDevice)"))
         assertTrue(source("Settings.kt").contains("onClick = vm::openAddDevice"))
+    }
+
+    // Found on the emulator: deleting the last of several items left the viewer blank. The page index pointed past the
+    // shorter list, the screen drew nothing, and the pager was never laid out again to move back.
+    @Test fun the_viewer_shows_the_new_last_item_after_the_last_is_deleted() {
+        val v = source("Viewer.kt").substringAfter("fun ViewerScreen(")
+        assertFalse(v.contains("rows.getOrNull(pager.currentPage) ?: return"))
+        assertTrue(v.contains("pager.currentPage.coerceAtMost(rows.lastIndex)"))
     }
 
     // Found on the emulator while testing Undo: a list reload waited 150 ms after ItemsChanged, but the Sync event

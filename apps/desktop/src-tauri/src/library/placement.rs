@@ -206,9 +206,6 @@ pub struct PcLibrary {
     arrived: Mutex<HashMap<String, Instant>>,
     /// Paths this placement moved a file away from (rescan: not "missing").
     departed: Mutex<HashMap<String, Instant>>,
-    /// Files adopted in place (the user's own file): purge must not delete them (the add may
-    /// have failed after adopt, and the file is the user's).
-    adopted: Mutex<HashMap<String, Instant>>,
     /// Test seam: make the Mark-of-the-Web write fail (a drive that cannot hold it).
     #[cfg(test)]
     pub(crate) fail_marks: AtomicBool,
@@ -227,7 +224,6 @@ impl PcLibrary {
             dirty: AtomicBool::new(false),
             arrived: Mutex::new(HashMap::new()),
             departed: Mutex::new(HashMap::new()),
-            adopted: Mutex::new(HashMap::new()),
             #[cfg(test)]
             fail_marks: AtomicBool::new(false),
             #[cfg(test)]
@@ -467,10 +463,8 @@ impl Placement for PcLibrary {
         self.not_switching()?;
         let root = self.need_root()?;
         if is_inside(&root, src) && !is_inside(&root.join(HIDDEN_DIR), src) {
-            // The user's own file, already in the library: nothing to move.
-            let mut m = lock(&self.adopted);
-            m.retain(|_, at| at.elapsed() < RECENT_TTL);
-            m.insert(norm(src), Instant::now());
+            // The user's own file, already in the library: nothing to move. Core leaves a file adopted
+            // in place alone when the add fails; once the item exists it owns this file.
             return Ok(src.to_path_buf());
         }
         // From outside (an "add file" action): copy in through a staging file, never move the
@@ -582,9 +576,11 @@ impl Placement for PcLibrary {
     fn purge(&self, t: &FileTarget) -> Result<()> {
         remove_if_exists(&self.bin_path(t)?)?;
         if let Some(cur) = &t.current {
+            // The item's file in the library goes, even one taken in place a moment ago: a purge arriving
+            // with the delete must not leave a file for the next rescan to import as a new item. A path
+            // in neither the library nor the Bin is not ours to remove.
             let in_library = self.root().is_some_and(|r| is_inside(&r, cur));
-            let adopted = Self::recent(&self.adopted, cur);
-            if in_library && !adopted {
+            if in_library {
                 remove_if_exists(cur)?;
                 Self::touch(&self.departed, cur);
             } else if is_inside(&self.bin, cur) {

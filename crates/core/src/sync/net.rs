@@ -1275,7 +1275,7 @@ fn part_len(placement: &dyn crate::placement::Placement, hash: &BlobHash) -> u64
 fn load_for_fetch(core: &Core, id: ItemId, claimed: BlobHash) -> Result<Option<(ItemRecord, Settings)>> {
     let db = lock(&core.inner.db);
     match (crate::store::get_item(&db.conn, id), crate::store::load_settings(&db.conn)) {
-        (Ok(Some((rec, LocalFileState::Pending | LocalFileState::Lost))), Ok(s)) if rec.content.val.hash == claimed => Ok(Some((rec, s))),
+        (Ok(Some((rec, LocalFileState::Pending | LocalFileState::Lost))), Ok(s)) if rec.content.val.hash == claimed && rec.purged.is_none() => Ok(Some((rec, s))),
         (Ok(_), Ok(_)) => Ok(None),
         (Err(e), _) | (_, Err(e)) => Err(e),
     }
@@ -1343,6 +1343,17 @@ async fn fetch_item(core: &Core, conn: &Arc<PeerConn>, peer: DeviceId, id: ItemI
                 // The thumbnail is cosmetic: report it, still get the file.
                 core.emit_error("thumbnail", &msg);
             }
+            // Deleted forever while the thumbnail came down: nothing may keep it.
+            let gone = core.with_ctx(|c, _| {
+                let purged = crate::store::get_item(c, id)?.is_none_or(|(r, _)| r.purged.is_some());
+                if purged {
+                    crate::store::trash_thumb(c, t.hash)?;
+                }
+                Ok(purged)
+            });
+            if matches!(gone, Ok(true)) {
+                return FetchOutcome::Dropped;
+            }
         }
     }
 
@@ -1387,6 +1398,17 @@ async fn fetch_item(core: &Core, conn: &Arc<PeerConn>, peer: DeviceId, id: ItemI
 
     let placed = core.with_ctx(|c, ctx| {
         let Some((now_rec, lfs)) = crate::store::get_item(c, id)? else { return Ok(false) };
+        if now_rec.purged.is_some() {
+            // Deleted forever while it downloaded: the thumbnail fetched meanwhile goes too, and so does
+            // the finished download unless another item wants the same bytes.
+            if let Some(t) = &content.thumb {
+                crate::store::trash_thumb(c, t.hash)?;
+            }
+            if !crate::store::wanted_by_other(c, content.hash, id)? {
+                let _ = std::fs::remove_file(&part);
+            }
+            return Ok(false);
+        }
         if !matches!(lfs, LocalFileState::Pending | LocalFileState::Lost) || now_rec.content.val.hash != content.hash {
             // Changed while downloading: this file is stale. The next round fetches the new one.
             return Ok(false);

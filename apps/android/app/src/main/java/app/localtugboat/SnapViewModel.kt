@@ -20,6 +20,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import uniffi.tugboat_ffi.ActivityInfo
+import uniffi.tugboat_ffi.BinCount
 import uniffi.tugboat_ffi.DeviceStatus
 import uniffi.tugboat_ffi.FfiEvent
 import uniffi.tugboat_ffi.FolderInfo
@@ -387,6 +388,19 @@ class SnapViewModel(app: Application) : AndroidViewModel(app) {
         _binned.tryEmit(id) // only after the core took it: a failed delete shows its error, never "Moved to Bin"
     }
     fun restore(id: String): Job = act("Restore") { core.phone().restoreItem(id) }
+    fun purge(id: String): Job = act("Delete forever") { core.phone().purgeItem(id) }
+    /** [asked] is what the question named: a Bin that lists other items now (even as many) deletes nothing and says so. */
+    fun emptyBin(asked: BinCount): Job = act("Empty Bin") { core.phone().emptyBin(asked.count, asked.token) }
+
+    /** How many items Empty Bin would delete, with the token naming them, for its question; null (with a message) when it cannot be read. */
+    suspend fun binCount(): BinCount? = withContext(Dispatchers.IO) {
+        try {
+            core.phone().binCount()
+        } catch (e: Exception) {
+            fail("Empty Bin", e)
+            null
+        }
+    }
 
     /** The share sheet intent for an item, or null (with a message) when the file is not on this phone. */
     suspend fun shareIntent(item: ItemInfo): Intent? = withContext(Dispatchers.IO) {

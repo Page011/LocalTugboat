@@ -25,6 +25,14 @@
 //!    logs each group it took, tagged with the device it came from, so its other linked PCs get
 //!    the change and the sender never gets it back. A merge that changes nothing logs nothing.
 //!    M5 rewrites are always logged as written here.
+//! M10 Purge (Delete forever): `purged` is a grow-only group, terminal once set. An item that is
+//!    purged on either side is purged in the result, whatever the other groups say (a restore, an
+//!    edit or a Keep made concurrently loses, the same way on every device). Two purges settle on
+//!    the higher version. The record stays as a tombstone, so a device that was away or a snapshot
+//!    from one that never saw the purge cannot bring the item back. A purge applied here removes
+//!    the file and thumbnail through the Bin sweep, never waiting for any other device. The tombstone
+//!    keeps no personal data: `ItemRecord::scrub_purged` clears the name, the saved location and the
+//!    thumbnail on every device, so every device holds the same record afterwards.
 //!
 //! Also at the trust boundary (a paired peer is still validated): a remote
 //! record with an out-of-range or unsafe field is a `Protocol` error and is not stored.
@@ -50,7 +58,7 @@ pub fn pick<T>(local: &Versioned<T>, remote: &Versioned<T>) -> Pick {
 }
 
 /// Item field group names in a fixed order (for loops, change_log and conflict detail).
-pub const ITEM_GROUPS: [&str; 5] = [group::NAME, group::CONTENT, group::PLACEMENT, group::PINNED, group::DELETED];
+pub const ITEM_GROUPS: [&str; 6] = [group::NAME, group::CONTENT, group::PLACEMENT, group::PINNED, group::DELETED, group::PURGED];
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ItemMerge {
@@ -82,15 +90,27 @@ fn merge_group<T: Clone + PartialEq>(
     }
 }
 
-/// M1-M3 for items. Immutable-field mismatch -> Err(Protocol).
+/// M10: purged beats not purged; two purges keep the higher version (equal = same write, keep local).
+pub fn merge_purged(local: &Option<Versioned<i64>>, remote: &Option<Versioned<i64>>) -> (Option<Versioned<i64>>, bool) {
+    match (local, remote) {
+        (None, Some(r)) => (Some(r.clone()), true),
+        (Some(l), Some(r)) if r.v > l.v => (Some(r.clone()), true),
+        _ => (local.clone(), false),
+    }
+}
+
+/// M1-M3 and M10 for items. Immutable-field mismatch -> Err(Protocol).
 pub fn merge_item(local: &ItemRecord, remote: &ItemRecord) -> Result<ItemMerge> {
     if local.id != remote.id {
         return Err(CoreError::Protocol("merge of two different items".into()));
     }
-    if local.captured_at != remote.captured_at || local.origin != remote.origin || local.geo != remote.geo {
+    // A purged record has no saved location (M10), so it is compared with the other side's only when neither is.
+    let both_live = local.purged.is_none() && remote.purged.is_none();
+    if local.captured_at != remote.captured_at || local.origin != remote.origin || (both_live && local.geo != remote.geo) {
         return Err(CoreError::Protocol(format!("item {} differs in captured_at, origin or location", local.id.0)));
     }
     let (mut taken, mut differing) = (Vec::new(), Vec::new());
+    let (purged, purge_taken) = merge_purged(&local.purged, &remote.purged);
     let merged = ItemRecord {
         id: local.id,
         captured_at: local.captured_at,
@@ -101,7 +121,17 @@ pub fn merge_item(local: &ItemRecord, remote: &ItemRecord) -> Result<ItemMerge> 
         location: merge_group(group::PLACEMENT, &local.location, &remote.location, &mut taken, &mut differing),
         pinned: merge_group(group::PINNED, &local.pinned, &remote.pinned, &mut taken, &mut differing),
         deleted: merge_group(group::DELETED, &local.deleted, &remote.deleted, &mut taken, &mut differing),
+        purged,
     };
+    if purge_taken {
+        taken.push(group::PURGED);
+    }
+    let mut merged = merged;
+    if merged.purged.is_some() {
+        // M10: nothing personal stays, and a name that differs is not a conflict worth a row that would repeat it.
+        merged.scrub_purged();
+        differing.clear();
+    }
     Ok(ItemMerge { merged, taken, differing })
 }
 
@@ -237,6 +267,14 @@ fn validate_remote(record: &Record) -> Result<()> {
                 return Err(proto("item size out of range"));
             }
             check_lamports(&[r.name.v, r.content.v, r.location.v, r.pinned.v, r.deleted.v])?;
+            // A purge is always a real write: its version is above GENESIS, so it is above the
+            // "never purged" entry of the list and digest.
+            if let Some(p) = &r.purged {
+                check_lamports(&[p.v])?;
+                if p.v.lamport == 0 {
+                    return Err(proto(format!("item {} is purged at version 0", r.id.0)));
+                }
+            }
         }
         Record::Folder(r) => {
             check_name("folder", &r.name.val)?;
@@ -275,7 +313,7 @@ fn validate_remote(record: &Record) -> Result<()> {
 
 fn max_lamport_of(record: &Record) -> u64 {
     match record {
-        Record::Item(r) => [r.name.v, r.content.v, r.location.v, r.pinned.v, r.deleted.v].iter().map(|v| v.lamport).max().unwrap_or(0),
+        Record::Item(r) => [r.name.v, r.content.v, r.location.v, r.pinned.v, r.deleted.v].iter().chain(r.purged.as_ref().map(|p| &p.v)).map(|v| v.lamport).max().unwrap_or(0),
         Record::Folder(r) => [r.name.v, r.retention.v, r.deleted.v].iter().map(|v| v.lamport).max().unwrap_or(0),
         Record::Place(r) => [r.name.v, r.area.v, r.target.v, r.deleted.v].iter().map(|v| v.lamport).max().unwrap_or(0),
         Record::Receipt(_) => 0,
@@ -403,11 +441,15 @@ fn apply_item(c: &Connection, self_id: DeviceId, peer: DeviceId, remote: &ItemRe
     let merged = match store::get_item(c, remote.id)? {
         None => {
             // M8: new record, inserted as received; the file is wanted until the sweep says otherwise.
-            store::insert_item(c, remote, LocalFileState::Pending, now)?;
+            // A tombstone (M10) is never wanted: this device never held the file.
+            let lfs = if remote.purged.is_some() { LocalFileState::Purged } else { LocalFileState::Pending };
+            let mut stored = remote.clone();
+            stored.scrub_purged();
+            store::insert_item(c, &stored, lfs, now)?;
             out.changed = Some(key);
-            out.content_changed = true;
+            out.content_changed = remote.purged.is_none();
             out.groups = vec![group::ALL];
-            remote.clone()
+            stored
         }
         Some((local, lfs)) => {
             let m = merge_item(&local, remote)?;
@@ -425,7 +467,28 @@ fn apply_item(c: &Connection, self_id: DeviceId, peer: DeviceId, remote: &ItemRe
                 store::update_item(c, &m.merged)?;
                 out.changed = Some(key);
                 out.groups = m.taken.clone();
-                if m.taken.contains(&group::CONTENT) && local.content.val.hash != m.merged.content.val.hash {
+                if let Some(p) = m.merged.purged.as_ref().filter(|_| m.taken.contains(&group::PURGED)) {
+                    // M10: the file goes with the next sweep; the thumbnail is queued here, in the
+                    // same transaction, so it cannot be forgotten.
+                    // The merged record is already scrubbed: the thumbnail this device holds is the local one's
+                    // (or the remote's, when its content group won and this device fetched that one).
+                    for t in [&local.content.val.thumb, &remote.content.val.thumb].into_iter().flatten() {
+                        store::trash_thumb(c, t.hash)?;
+                    }
+                    // One row per item on this device: a second purge (from another device, with a higher
+                    // version) only moves the version on, and a tombstone this device stored without ever
+                    // holding the item says nothing.
+                    if local.purged.is_none() {
+                        // Where it came from, the way a delete on the other device says so: the device's name when this one knows it.
+                        let from = match store::get_device(c, p.v.device)? {
+                            Some(d) => d.name,
+                            None => "another device".to_string(),
+                        };
+                        let detail = format!("{} - from {from}", folder_label(c, m.merged.location.val.folder));
+                        activity::log(c, now, Some(p.v.device), Some(local.id), ActivityAction::DeletedForever, &detail)?;
+                    }
+                    out.content_changed = false;
+                } else if m.merged.purged.is_none() && m.taken.contains(&group::CONTENT) && local.content.val.hash != m.merged.content.val.hash {
                     out.content_changed = true;
                     // The held file is the old content. Wanted again, unless it was purged
                     // (then the sweep decides: in the Bin stays purged, else Pending).
@@ -438,8 +501,9 @@ fn apply_item(c: &Connection, self_id: DeviceId, peer: DeviceId, remote: &ItemRe
         }
     };
     relay_groups(c, &key, &mut out, relay, peer)?;
-    // M5 on the merged record (also catches a new record that arrives both deleted and kept).
-    if let Some(dk) = delete_vs_keep(&merged) {
+    // M5 on the merged record (also catches a new record that arrives both deleted and kept). A
+    // purged item is past all that (M10).
+    if let Some(dk) = delete_vs_keep(&merged).filter(|_| merged.purged.is_none()) {
         let nv = store::next_version(c, self_id)?;
         let mut fixed = merged.clone();
         let detail = match dk {
@@ -1162,5 +1226,307 @@ mod tests {
         forged.name = vs(v(50, f()), "forged".into());
         assert!(matches!(apply_remote(&dp.conn, p(), f(), &Record::Item(forged), false, T0), Err(CoreError::Protocol(_))));
         assert_eq!(store::get_item(&dp.conn, base.id).unwrap().unwrap().0, base);
+    }
+
+    // ---------- M10: deleted forever ----------
+
+    fn purged_at(ver: Version) -> Option<Versioned<i64>> {
+        Some(vs(ver, T0 + 77))
+    }
+
+    /// `base` in the Bin (deleted at (3,P)).
+    fn binned(base: &ItemRecord) -> ItemRecord {
+        let mut r = base.clone();
+        r.deleted = vs(v(3, p()), Some(T0 + 5));
+        r
+    }
+
+    // A purge and a restore made apart end purged on both sides, whichever record arrives where.
+    #[test]
+    fn purge_beats_a_concurrent_restore_in_both_orders() {
+        let (_dp, _df, base) = pair_with_item();
+        let mut purge = binned(&base);
+        purge.purged = purged_at(v(7, f()));
+        // The restore has the higher versions: it still loses to the purge.
+        let mut restore = binned(&base);
+        restore.deleted = vs(v(9, p()), None);
+        restore.location = vs(v(9, p()), Location { folder: INBOX_ID, entered_at: T0 + 50 });
+        let a = merge_item(&restore, &purge).unwrap();
+        let b = merge_item(&purge, &restore).unwrap();
+        assert_eq!(a.merged, b.merged, "both orders end in the same record");
+        assert_eq!(a.merged.purged, purge.purged);
+        assert_eq!(a.merged.deleted.val, None, "the other groups still merge by version");
+        assert_eq!(a.taken, vec![group::PURGED], "the restore side takes the purge");
+        assert_eq!(b.taken, vec![group::PLACEMENT, group::DELETED], "the purge side still takes the newer restore groups, and stays purged");
+    }
+
+    // A purge beats an edit or a Keep made later; the edit's own groups still merge.
+    #[test]
+    fn purge_beats_an_edit_and_a_keep() {
+        let (_dp, _df, base) = pair_with_item();
+        let mut purge = binned(&base);
+        purge.purged = purged_at(v(7, f()));
+        let mut edit = base.clone();
+        edit.name = vs(v(30, p()), "edited.jpg".into());
+        edit.pinned = vs(v(31, p()), true);
+        for (local, remote) in [(&edit, &purge), (&purge, &edit)] {
+            let m = merge_item(local, remote).unwrap().merged;
+            assert_eq!(m.purged, purge.purged);
+            assert_eq!(m.name.v, edit.name.v, "the edit's name group still wins by version");
+            assert_eq!(m.name.val, "", "but a purged record keeps no name");
+        }
+        // Applied to a database: no delete-vs-keep rewrite happens on a purged item, so nothing is
+        // written back and nobody is told of a conflict that no longer means anything.
+        let dp = db_with_peer(p(), f());
+        store::insert_item(&dp.conn, &edit, LocalFileState::Present, T0).unwrap();
+        let mut keep_and_delete = purge.clone();
+        keep_and_delete.pinned = vs(v(31, p()), true);
+        let a = apply(&dp, p(), f(), &keep_and_delete);
+        assert!(!a.wrote_local && a.conflicts == 0, "no M5 rewrite on a purged item");
+        let (rec, _) = store::get_item(&dp.conn, base.id).unwrap().unwrap();
+        assert!(rec.purged.is_some() && rec.deleted.val.is_some() && rec.pinned.val);
+        assert_eq!(store::head_seq(&dp.conn).unwrap(), 0);
+    }
+
+    // Two purges settle on the higher version, the same on both sides; nothing ever unsets it.
+    #[test]
+    fn two_purges_keep_the_higher_version_and_never_unset() {
+        let lo = purged_at(v(5, p()));
+        let hi = purged_at(v(6, f()));
+        assert_eq!(merge_purged(&lo, &hi), (hi.clone(), true));
+        assert_eq!(merge_purged(&hi, &lo), (hi.clone(), false));
+        assert_eq!(merge_purged(&hi, &hi), (hi.clone(), false), "the same write: keep local");
+        assert_eq!(merge_purged(&hi, &None), (hi.clone(), false), "a record that was never purged cannot unset it");
+        assert_eq!(merge_purged(&None, &lo), (lo.clone(), true));
+        assert_eq!(merge_purged(&None, &None), (None, false));
+        // Commutative, associative, idempotent over every combination.
+        let all = [None, lo.clone(), hi.clone(), purged_at(v(6, p())), purged_at(v(6, dev(0xCC)))];
+        for a in &all {
+            assert_eq!(merge_purged(a, a).0, *a);
+            for b in &all {
+                assert_eq!(merge_purged(a, b).0, merge_purged(b, a).0);
+                for c in &all {
+                    assert_eq!(merge_purged(&merge_purged(a, b).0, c).0, merge_purged(a, &merge_purged(b, c).0).0);
+                }
+            }
+        }
+    }
+
+    // The whole record merges as before when purged is part of it (random versions, with purges).
+    #[test]
+    fn merge_with_purges_is_commutative_associative_idempotent() {
+        let mut g = Lcg(7);
+        for _ in 0..300 {
+            let mk = |g: &mut Lcg| {
+                let mut it = random_item(g);
+                if g.next().is_multiple_of(2) {
+                    it.purged = purged_at(random_version(g));
+                }
+                it.scrub_purged();
+                it
+            };
+            let (a, b, c) = (mk(&mut g), mk(&mut g), mk(&mut g));
+            let ab = merge_item(&a, &b).unwrap().merged;
+            assert_eq!(ab, merge_item(&b, &a).unwrap().merged, "commutative");
+            let bc = merge_item(&b, &c).unwrap().merged;
+            assert_eq!(merge_item(&ab, &c).unwrap().merged, merge_item(&a, &bc).unwrap().merged, "associative");
+            assert_eq!(merge_item(&a, &a).unwrap().merged, a, "idempotent");
+            assert_eq!(ab.purged.is_some(), a.purged.is_some() || b.purged.is_some(), "purged is terminal");
+            assert!(merge_item(&ab, &a).unwrap().taken.is_empty());
+        }
+    }
+
+    // Applying the same purge again changes nothing, logs nothing and says nothing.
+    #[test]
+    fn remerging_a_purge_is_idempotent() {
+        let (dp, _df, base) = pair_with_item();
+        let mut purge = binned(&base);
+        purge.purged = purged_at(v(7, f()));
+        let first = apply_relay(&dp, p(), f(), Record::Item(purge.clone()));
+        assert!(first.groups.contains(&group::PURGED) && first.relayed);
+        let rows = log_rows(&dp);
+        assert!(rows.contains(&("item".into(), "purged".into(), Some(f()))), "{rows:?}");
+        let again = apply_relay(&dp, p(), f(), Record::Item(purge.clone()));
+        assert_eq!(again.changed, None);
+        assert!(again.groups.is_empty() && !again.relayed);
+        assert_eq!(log_rows(&dp), rows, "no second relay row");
+        let n = activity::list(&dp.conn, None, 50).unwrap().iter().filter(|a| a.action == ActivityAction::DeletedForever).count();
+        assert_eq!(n, 1, "one activity row, not one per merge");
+    }
+
+    // Two devices that purged the same item apart: the higher purge version spreads (record and relay row),
+    // but this device has one "Deleted forever" row for the item, however the purges arrive.
+    #[test]
+    fn a_second_purge_of_the_same_item_logs_no_second_row() {
+        let rows = |d: &Db| activity::list(&d.conn, None, 50).unwrap().iter().filter(|a| a.action == ActivityAction::DeletedForever).count();
+        let (dp, _df, base) = pair_with_item();
+        let mut low = binned(&base);
+        low.purged = purged_at(v(5, f()));
+        let mut high = binned(&base);
+        high.purged = purged_at(v(7, dev(0xCC)));
+        apply_relay(&dp, p(), f(), Record::Item(low.clone()));
+        assert_eq!(rows(&dp), 1);
+        let a = apply_relay(&dp, p(), f(), Record::Item(high.clone()));
+        assert!(a.groups.contains(&group::PURGED) && a.relayed, "the higher purge still spreads");
+        assert_eq!(store::get_item(&dp.conn, base.id).unwrap().unwrap().0.purged, high.purged);
+        assert_eq!(rows(&dp), 1, "still one row for the item");
+        // A device that purged the item itself: the other device's higher purge adds no row.
+        let own = db_with_peer(p(), f());
+        store::insert_item(&own.conn, &base, LocalFileState::Binned, T0).unwrap();
+        let mut mine = binned(&base);
+        mine.purged = purged_at(v(5, p()));
+        store::update_item(&own.conn, &mine).unwrap();
+        activity::log(&own.conn, T0, Some(p()), Some(base.id), ActivityAction::DeletedForever, "Inbox").unwrap();
+        apply_relay(&own, p(), f(), Record::Item(high.clone()));
+        assert_eq!(rows(&own), 1);
+        // A device that never held the item stores the tombstone without a row, and the higher purge adds none.
+        let fresh = db_with_peer(p(), f());
+        apply_relay(&fresh, p(), f(), Record::Item(low));
+        assert_eq!(rows(&fresh), 0);
+        let a = apply_relay(&fresh, p(), f(), Record::Item(high.clone()));
+        assert!(a.groups.contains(&group::PURGED) && a.relayed);
+        assert_eq!(rows(&fresh), 0);
+        assert_eq!(store::get_item(&fresh.conn, base.id).unwrap().unwrap().0.purged, high.purged);
+    }
+
+    // A snapshot or an old record from a device that never saw the purge cannot bring the item back.
+    #[test]
+    fn a_stale_record_without_the_purge_changes_nothing() {
+        let (dp, _df, base) = pair_with_item();
+        let mut purge = binned(&base);
+        purge.purged = purged_at(v(7, f()));
+        apply(&dp, p(), f(), &purge);
+        let before = store::get_item(&dp.conn, base.id).unwrap().unwrap();
+        // The record as it was before the purge changes nothing at all.
+        let a = apply_relay(&dp, p(), f(), Record::Item(base.clone()));
+        assert!(a.groups.is_empty() && a.changed.is_none());
+        assert_eq!(store::get_item(&dp.conn, base.id).unwrap().unwrap(), before);
+        // A restore made later by a device that never saw the purge: its groups merge, the purge stays.
+        let mut restore = base.clone();
+        restore.deleted = vs(v(9, f()), None);
+        let a = apply_relay(&dp, p(), f(), Record::Item(restore));
+        assert_eq!(a.groups, vec![group::DELETED]);
+        assert!(store::get_item(&dp.conn, base.id).unwrap().unwrap().0.purged.is_some());
+        let mut renamed = base.clone();
+        renamed.name = vs(v(40, f()), "late.jpg".into());
+        let a = apply_relay(&dp, p(), f(), Record::Item(renamed));
+        assert_eq!(a.groups, vec![group::NAME], "an ordinary edit still merges");
+        assert!(!a.content_changed);
+        let (rec, lfs) = store::get_item(&dp.conn, base.id).unwrap().unwrap();
+        assert!(rec.purged.is_some());
+        assert_ne!(lfs, LocalFileState::Pending, "a purged item is never wanted again");
+    }
+
+    // A purge taken from a peer: queued thumbnail, one DeletedForever row naming the purging device,
+    // a relay row for the other PCs, and a never-seen tombstone is stored as Purged and not fetched.
+    #[test]
+    fn applying_a_purge_queues_the_thumbnail_and_logs_where_it_came_from() {
+        let dp = db_with_peer(p(), f());
+        let mut it = item(3, p(), v(1, p()));
+        it.content.val.thumb = Some(Thumb { hash: hash(0x33), size: 10 });
+        store::insert_item(&dp.conn, &it, LocalFileState::Present, T0).unwrap();
+        let mut purge = binned(&it);
+        purge.purged = purged_at(v(8, f()));
+        let a = apply_relay(&dp, p(), f(), Record::Item(purge.clone()));
+        assert!(!a.content_changed);
+        assert_eq!(store::thumbs_to_delete(&dp.conn).unwrap(), vec![hash(0x33)]);
+        let row = activity::list(&dp.conn, None, 10).unwrap().into_iter().find(|r| r.action == ActivityAction::DeletedForever).expect("an activity row");
+        assert_eq!((row.device, row.item, row.detail.as_str()), (Some(f()), Some(it.id), "Inbox - from peer"));
+        let (rec, _) = store::get_item(&dp.conn, it.id).unwrap().unwrap();
+        assert!(rec.content.val.thumb.is_none() && rec.name.val.is_empty(), "the stored record is scrubbed");
+        // A device this one has never heard of (another PC, seen from a PC) is "another device".
+        let stranger = db_with_peer(p(), dev(0xCC));
+        store::insert_item(&stranger.conn, &it, LocalFileState::Present, T0).unwrap();
+        apply_relay(&stranger, p(), dev(0xCC), Record::Item({
+            let mut by_other = purge.clone();
+            by_other.purged = purged_at(v(8, dev(0xDD)));
+            by_other
+        }));
+        let row = activity::list(&stranger.conn, None, 10).unwrap().into_iter().find(|r| r.action == ActivityAction::DeletedForever).unwrap();
+        assert_eq!((row.device, row.detail.as_str()), (Some(dev(0xDD)), "Inbox - from another device"));
+        // A device that never had the item stores the tombstone as Purged and wants nothing.
+        let fresh = db_with_peer(p(), f());
+        let b = apply_relay(&fresh, p(), f(), Record::Item(purge.clone()));
+        assert!(!b.content_changed && b.groups == vec![group::ALL]);
+        let (rec, lfs) = store::get_item(&fresh.conn, it.id).unwrap().unwrap();
+        assert_eq!((rec.purged, lfs), (purge.purged, LocalFileState::Purged));
+        assert!(activity::list(&fresh.conn, None, 10).unwrap().iter().all(|r| r.action != ActivityAction::DeletedForever), "no row for something this device never held");
+        assert!(store::thumbs_to_delete(&fresh.conn).unwrap().is_empty());
+    }
+
+    // A purged record keeps no name, no saved location and no thumbnail, and every device ends with the
+    // same record whether it purged itself or took the purge from a peer that did not scrub.
+    #[test]
+    fn a_purged_record_keeps_no_personal_data_and_is_the_same_everywhere() {
+        let geo = Geo { lat: -33.8, lon: 151.2, accuracy_m: 5.0 };
+        let mut live = item(4, p(), v(1, p()));
+        live.geo = Some(geo);
+        live.content.val.thumb = Some(Thumb { hash: hash(0x44), size: 10 });
+        let mut purge = binned(&live);
+        purge.purged = purged_at(v(8, f()));
+        let a = db_with_peer(p(), f());
+        let b = db_with_peer(p(), f());
+        for d in [&a, &b] {
+            store::insert_item(&d.conn, &live, LocalFileState::Present, T0).unwrap();
+        }
+        // A takes the purge unscrubbed (a sender that did not scrub), B takes it scrubbed.
+        apply(&a, p(), f(), &purge);
+        let mut scrubbed = purge.clone();
+        scrubbed.scrub_purged();
+        apply(&b, p(), f(), &scrubbed);
+        let (ra, rb) = (store::get_item(&a.conn, live.id).unwrap().unwrap().0, store::get_item(&b.conn, live.id).unwrap().unwrap().0);
+        assert_eq!(ra, rb, "the same record on both");
+        assert!(ra.name.val.is_empty() && ra.geo.is_none() && ra.content.val.thumb.is_none());
+        assert_eq!((ra.id, ra.purged.clone(), ra.name.v, ra.content.v), (live.id, purge.purged.clone(), live.name.v, live.content.v), "versions and the purge stay");
+        // A stale copy that still has the location is no protocol error and brings nothing back.
+        let a2 = apply(&a, p(), f(), &live);
+        assert!(a2.groups.is_empty());
+        let stale_newer_name = {
+            let mut s = live.clone();
+            s.name = vs(v(50, f()), "named later".into());
+            s
+        };
+        let a3 = apply(&a, p(), f(), &stale_newer_name);
+        assert_eq!(a3.conflicts, 0, "no conflict row that would repeat a name");
+        let after = store::get_item(&a.conn, live.id).unwrap().unwrap().0;
+        assert!(after.name.val.is_empty() && after.geo.is_none(), "{after:?}");
+        assert!(activity::list(&a.conn, None, 50).unwrap().iter().all(|r| !r.detail.contains("named later") && !r.detail.contains("IMG_4")));
+        // Two live copies that disagree on the location are still a protocol error.
+        let mut moved = live.clone();
+        moved.geo = None;
+        assert!(matches!(merge_item(&live, &moved), Err(CoreError::Protocol(_))));
+        // Scrubbing is idempotent and leaves a record that is not purged alone.
+        let mut again = ra.clone();
+        again.scrub_purged();
+        assert_eq!(again, ra);
+        let mut untouched = live.clone();
+        untouched.scrub_purged();
+        assert_eq!(untouched, live);
+    }
+
+    // A purge version must be a real write: 0 would sit at the "never purged" entry of the digest.
+    #[test]
+    fn a_purge_at_version_zero_or_out_of_range_is_refused() {
+        let d = db_with_peer(p(), f());
+        for ver in [Version { lamport: 0, device: f() }, GENESIS, v(store::MAX_LAMPORT + 1, f())] {
+            let mut it = item(9, f(), v(2, f()));
+            it.purged = purged_at(ver);
+            assert!(matches!(apply_remote(&d.conn, p(), f(), &Record::Item(it.clone()), false, T0), Err(CoreError::Protocol(_))), "{ver:?}");
+            assert!(store::get_item(&d.conn, it.id).unwrap().is_none());
+        }
+    }
+
+    // The wire shape: an unpurged record has no purged key (and reads back without one); a purged one round-trips.
+    #[test]
+    fn purged_on_the_wire() {
+        let (_dp, _df, base) = pair_with_item();
+        let plain = serde_json::to_value(Record::Item(base.clone())).unwrap();
+        assert!(plain.get("purged").is_none(), "{plain}");
+        let mut purge = binned(&base);
+        purge.purged = purged_at(v(7, f()));
+        let text = serde_json::to_string(&Record::Item(purge.clone())).unwrap();
+        assert!(text.contains("\"purged\""), "{text}");
+        assert_eq!(serde_json::from_str::<Record>(&text).unwrap(), Record::Item(purge));
+        assert_eq!(serde_json::from_value::<Record>(plain).unwrap(), Record::Item(base));
     }
 }

@@ -22,6 +22,7 @@ pub mod places;
 pub mod store;
 pub mod sync;
 
+pub use bin::BinCount;
 pub use clock::{Clock, SystemClock, TestClock};
 pub use error::{CoreError, Result};
 pub use events::Event;

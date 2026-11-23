@@ -87,6 +87,14 @@ export const itemMeta = (it: Pick<ItemView, "kind" | "ext" | "size">): string =>
 /** Said in the Bin when the item expired and the phone never confirmed holding it (it may exist on this PC only). */
 export const peerNote = (it: Pick<ItemView, "never_reached_peer">): string | null => (it.never_reached_peer ? "NOT ON PHONE" : null);
 
+/** Delete forever confirmation (one item): title and the one line under it. */
+export const DELETE_FOREVER_TITLE = "Delete forever?";
+export const DELETE_FOREVER_TEXT = "Removes it from every linked device.";
+
+/** Empty Bin confirmation: title, and the line with how many items go. */
+export const EMPTY_BIN_TITLE = "Empty Bin?";
+export const emptyBinText = (n: number): string => `Removes ${n} ${n === 1 ? "item" : "items"} from every linked device.`;
+
 /** Label of an item in the Bin: why it is there and when this PC removes its file. */
 export function binLabel(it: ItemView, binDays: number, now: number): Label {
   const s = it.state;
@@ -192,6 +200,7 @@ const ACTIONS: Record<ActivityAction, string> = {
   restored: "Restored",
   returned: "Returned",
   purged: "Removed from Bin",
+  deleted_forever: "Deleted forever",
   refused: "REFUSED",
   conflict: "CONFLICT",
   lost: "LOST",
