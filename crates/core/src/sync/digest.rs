@@ -81,7 +81,8 @@ fn feed_key(h: &mut blake3::Hasher, key: &EntityKey) {
 /// The ListEntry of one record (key + group versions in the fixed order).
 pub fn list_entry(r: &Record) -> ListEntry {
     let versions = match r {
-        Record::Item(i) => vec![i.name.v, i.content.v, i.location.v, i.pinned.v, i.deleted.v],
+        // An item that was never purged carries GENESIS, below the version of any purge.
+        Record::Item(i) => vec![i.name.v, i.content.v, i.location.v, i.pinned.v, i.deleted.v, i.purged.as_ref().map_or(GENESIS, |p| p.v)],
         Record::Folder(f) => vec![f.name.v, f.retention.v, f.deleted.v],
         Record::Place(p) => vec![p.name.v, p.area.v, p.target.v, p.deleted.v],
         Record::Receipt(_) => Vec::new(),
@@ -183,5 +184,43 @@ mod tests {
         let (h1, _) = compute(&b.conn).unwrap();
         store::put_folder(&b.conn, &f).unwrap();
         assert_eq!(h1, compute(&b.conn).unwrap().0);
+    }
+
+    // A purge is part of the entry and the digest: an item that was never purged carries GENESIS
+    // last, a purged one carries the purge version, and both sides compute the same bytes.
+    #[test]
+    fn purged_is_part_of_the_list_entry_and_the_digest() {
+        use crate::store::test_support::item;
+        let plain = item(1, dev(1), v(2, 1));
+        let mut purged = plain.clone();
+        purged.purged = Some(Versioned { v: v(9, 7), val: 123 });
+        let e_plain = list_entry(&Record::Item(plain.clone()));
+        let e_purged = list_entry(&Record::Item(purged.clone()));
+        assert_eq!(e_plain.versions.len(), 6, "name, content, placement, pinned, deleted, purged");
+        assert_eq!(e_plain.versions[5], GENESIS);
+        assert_eq!(e_purged.versions[5], v(9, 7));
+        // The device that has not seen the purge asks for the record; the other side never asks back.
+        assert_eq!(keys_to_fetch(std::slice::from_ref(&e_plain), std::slice::from_ref(&e_purged)), vec![e_purged.key]);
+        assert!(keys_to_fetch(std::slice::from_ref(&e_purged), std::slice::from_ref(&e_plain)).is_empty());
+        // A higher purge version replaces a lower one, so two concurrent purges converge.
+        let mut later = purged.clone();
+        later.purged = Some(Versioned { v: v(10, 3), val: 456 });
+        let e_later = list_entry(&Record::Item(later));
+        assert_eq!(keys_to_fetch(std::slice::from_ref(&e_purged), std::slice::from_ref(&e_later)), vec![e_later.key]);
+        // The digest sees it: same record with and without the purge, and two purge versions.
+        let digest_of = |it: &ItemRecord| {
+            let d = Db::open_in_memory().unwrap();
+            store::insert_item(&d.conn, it, LocalFileState::Present, 0).unwrap();
+            compute(&d.conn).unwrap().0
+        };
+        let (h_plain, h_purged) = (digest_of(&plain), digest_of(&purged));
+        assert_ne!(h_plain, h_purged);
+        assert_eq!(h_purged, digest_of(&purged), "stable");
+        let mut other_value = purged.clone();
+        other_value.purged.as_mut().unwrap().val = 999;
+        assert_eq!(h_purged, digest_of(&other_value), "versions count, not values");
+        let mut other_version = purged.clone();
+        other_version.purged = Some(Versioned { v: v(9, 8), val: 123 });
+        assert_ne!(h_purged, digest_of(&other_version));
     }
 }

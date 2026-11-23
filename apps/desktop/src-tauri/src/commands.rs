@@ -90,6 +90,24 @@ pub fn item_restore(window: WebviewWindow, be: Be, id: ItemId) -> CmdResult<()> 
     be.restore_item(id)
 }
 
+#[tauri::command(async)]
+pub fn item_purge(window: WebviewWindow, be: Be, id: ItemId) -> CmdResult<()> {
+    allow(&window)?;
+    be.purge_item(id)
+}
+
+#[tauri::command(async)]
+pub fn bin_empty(window: WebviewWindow, be: Be, shown: u32, token: String) -> CmdResult<u32> {
+    allow(&window)?;
+    be.empty_bin(shown, &token)
+}
+
+#[tauri::command(async)]
+pub fn bin_count(window: WebviewWindow, be: Be) -> CmdResult<tugboat_core::BinCount> {
+    allow(&window)?;
+    be.bin_count()
+}
+
 /// Open the item's file in the default app.
 #[tauri::command(async)]
 pub fn item_open(window: WebviewWindow, app: AppHandle, be: Be, id: ItemId) -> CmdResult<()> {

@@ -11,6 +11,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 
 import type { ActivityEntry } from "./bindings/ActivityEntry";
 import type { AppInfo } from "./bindings/AppInfo";
+import type { BinCount } from "./bindings/BinCount";
 import type { CmdError } from "./bindings/CmdError";
 import type { DropProgress } from "./bindings/DropProgress";
 import type { DropReport } from "./bindings/DropReport";
@@ -71,6 +72,13 @@ export const api = {
   renameItem: (id: ItemId, name: string) => call<void>("item_rename", { id, name }),
   deleteItem: (id: ItemId) => call<void>("item_delete", { id }),
   restoreItem: (id: ItemId) => call<void>("item_restore", { id }),
+  /** Delete forever: the item leaves the Bin here and on every linked device. */
+  purgeItem: (id: ItemId) => call<void>("item_purge", { id }),
+  /** Empty Bin: Delete forever for every item the Bin lists; `shown` and `token` are what `binCount` gave the question,
+   *  and a Bin that lists other items now (even the same number) deletes nothing. Resolves to how many. */
+  emptyBin: (shown: number, token: string) => call<number>("bin_empty", { shown, token }),
+  /** How many items Empty Bin would delete, and the token that names exactly those items. */
+  binCount: () => call<BinCount>("bin_count"),
   openItem: (id: ItemId) => call<void>("item_open", { id }),
   revealItem: (id: ItemId) => call<void>("item_reveal", { id }),
 

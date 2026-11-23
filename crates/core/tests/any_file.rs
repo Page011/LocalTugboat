@@ -365,19 +365,22 @@ async fn a_v1_database_migrates_and_syncs() {
         conn.pragma_update(None, "user_version", 1).unwrap();
         // Default folders as 0.1.x created them: the open below runs ensure_defaults on the migrated file.
         tugboat_core::folders::ensure_defaults(&conn).unwrap();
-        let v = tugboat_core::Version { lamport: 1, device: id_dev };
-        let rec = tugboat_core::ItemRecord {
-            id: item_id,
-            captured_at: T0,
-            origin: id_dev,
-            geo: None,
-            name: tugboat_core::Versioned { v, val: "old.jpg".into() },
-            content: tugboat_core::Versioned { v, val: tugboat_core::Content { hash, size: bytes.len() as u64, kind: MediaKind::Image, ext: "jpg".into(), thumb: None } },
-            location: tugboat_core::Versioned { v, val: tugboat_core::Location { folder: tugboat_core::KEEP_ID, entered_at: T0 } },
-            pinned: tugboat_core::Versioned { v, val: false },
-            deleted: tugboat_core::Versioned { v, val: None },
-        };
-        store::insert_item(&conn, &rec, LocalFileState::Present, T0).unwrap();
+        // The row as 0.1.x wrote it: the v1 columns only (the current insert also writes the purge columns).
+        conn.execute(
+            "INSERT INTO item (id, captured_at, origin_device, name, name_lamport, name_dev, blob_hash, size, media_kind, ext,
+                content_lamport, content_dev, folder_id, folder_entered_at, placement_lamport, placement_dev,
+                pinned, pinned_lamport, pinned_dev, deleted_lamport, deleted_dev, local_file_state, local_state_at)
+             VALUES (?1, ?2, ?3, 'old.jpg', 1, ?3, ?4, ?5, 'image', 'jpg', 1, ?3, ?6, ?2, 1, ?3, 0, 1, ?3, 1, ?3, 'present', ?2)",
+            rusqlite::params![
+                item_id.0.as_bytes().as_slice(),
+                T0,
+                &id_dev.0[..],
+                &hash.0[..],
+                bytes.len() as i64,
+                tugboat_core::KEEP_ID.0.as_bytes().as_slice()
+            ],
+        )
+        .unwrap();
         let path = items.join(format!("{}.jpg", item_id.0.hyphenated()));
         std::fs::write(&path, &bytes).unwrap();
         conn.execute("INSERT INTO file_ref (item_id, path) VALUES (?1, ?2)", rusqlite::params![item_id.0.as_bytes().as_slice(), path.to_string_lossy().into_owned()]).unwrap();

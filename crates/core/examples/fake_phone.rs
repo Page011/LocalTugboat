@@ -15,8 +15,8 @@
 //!   cargo run -p tugboat-core --example fake_phone -- list [--data <dir>]
 //!       syncs once and prints every item it holds (name, folder, state, local)
 //! Any command takes `--hold-secs <N>`: stay connected N seconds after it finishes (for screenshots of the
-//! "phone connected" state), and `--proto <N>`: speak sync protocol N in the handshake (2 is current;
-//! 1 plays a 0.1.x phone: both devices must then show "Update Tugboat on the phone").
+//! "phone connected" state), and `--proto <N>`: speak sync protocol N in the handshake (3 is current;
+//! 1 plays a 0.1.x phone, 2 a 0.3.0 one: both devices must then show "Update Tugboat on the phone").
 //! Default --data: %TEMP%\tugboat-fake-phone. The key lives in <data>\key (32 raw bytes)
 //! because this is a test tool; the real phone keeps it in the Android Keystore.
 //!

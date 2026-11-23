@@ -161,6 +161,8 @@ pub(crate) struct Inner {
     pub fetch_peak: AtomicU64,
     /// Tests only: ask a peer for any file, not only the ones that peer holds (an older build).
     pub no_holder_test: std::sync::atomic::AtomicBool,
+    /// How many purged items the upgrade backups were last scrubbed for (MAX = not yet this run).
+    pub backups_scrubbed: AtomicU64,
 }
 
 #[derive(Clone)]
@@ -214,6 +216,7 @@ impl Core {
                 fetching: Mutex::new(std::collections::HashMap::new()),
                 fetch_peak: AtomicU64::new(0),
                 no_holder_test: std::sync::atomic::AtomicBool::new(false),
+                backups_scrubbed: AtomicU64::new(u64::MAX),
             }),
         };
         core.sweep_and_emit()?;
@@ -314,6 +317,7 @@ impl Core {
                 location: Versioned { v, val: Location { folder: INBOX_ID, entered_at: ctx.now } },
                 pinned: Versioned { v, val: false },
                 deleted: Versioned { v, val: None },
+                purged: None,
             };
             store::insert_item(&tx, &rec, local, ctx.now)?;
             store::log_change(&tx, &EntityKey::Item { id }, group::ALL, v.lamport)?;
@@ -597,7 +601,7 @@ impl Core {
         let now = self.now();
         let db = lock(&self.inner.db);
         let c = &db.conn;
-        let Some((rec, lfs)) = store::get_item(c, id)? else { return Ok(None) };
+        let Some((rec, lfs)) = store::get_item(c, id)?.filter(|(r, _)| r.purged.is_none()) else { return Ok(None) };
         let fmap: HashMap<FolderId, FolderRecord> = store::all_folders(c)?.into_iter().map(|f| (f.id, f)).collect();
         let state = bin::derive_state_in(c, &fmap, &rec, now)?;
         Ok(Some(self.item_view(c, &fmap, &rec, lfs, state)))
@@ -653,7 +657,7 @@ impl Core {
         let fmap: HashMap<FolderId, FolderRecord> = store::all_folders(c)?.into_iter().map(|f| (f.id, f)).collect();
         let mut rows: Vec<ItemView> = Vec::new();
         let mut recs: Vec<(ItemRecord, LocalFileState)> = Vec::new();
-        for id in store::item_ids_where(c, "local_file_state = 'refused'")? {
+        for id in store::item_ids_where(c, "local_file_state = 'refused' AND purged_at IS NULL")? {
             if let Some(x) = store::get_item(c, id)? {
                 recs.push(x);
             }
@@ -732,35 +736,51 @@ impl Core {
             f.thumb = None;
         }
         // Thumbnails are content-addressed and shared between items, so a failed add leaves its
-        // thumbnail in place: another import may already point at the same file (no thumbnail GC
-        // exists, the cost is one small file).
-        let thumb = match f.thumb.take() {
+        // thumbnail in place: another import may already point at the same file (only a purge
+        // deletes thumbnails, and only those no live item uses; the cost is one small file).
+        let thumb_src = f.thumb.take();
+        let thumb = match &thumb_src {
             None => None,
             Some(src) => {
-                let (hash, size) = ops::hash_file(&src)?;
-                let dest = self.thumb_path(hash);
-                if !dest.exists() {
-                    // Copy to a name unique to this call, then rename: never a half-written
-                    // thumbnail, and two imports of the same bytes never share a temp file.
-                    let tmp = self.thumbs_dir().join(format!("{}.{}.tmp", hex::encode(hash.0), uuid::Uuid::now_v7().simple()));
-                    if let Err(e) = std::fs::copy(&src, &tmp) {
-                        let _ = std::fs::remove_file(&tmp);
-                        return Err(CoreError::io(&src, e));
-                    }
-                    if let Err(e) = std::fs::rename(&tmp, &dest) {
-                        let _ = std::fs::remove_file(&tmp);
-                        // A concurrent import published the same thumbnail first: that is success.
-                        if !dest.exists() {
-                            return Err(CoreError::io(&dest, e));
-                        }
-                    }
-                }
+                let (hash, size) = ops::hash_file(src)?;
+                self.publish_thumb(src, hash)?;
                 Some(Thumb { hash, size })
             }
         };
-        let id = self.with_ctx(|c, ctx| ops::add_local_file(c, ctx, &f, thumb.clone()))?;
+        let id = self.with_ctx(|c, ctx| {
+            // Under the database lock, which a thumbnail clean-up also takes: a copy that was queued for
+            // deletion (its item deleted forever) cannot be removed between this check and the insert
+            // below, which puts the hash back in use.
+            if let (Some(t), Some(src)) = (&thumb, &thumb_src) {
+                self.publish_thumb(src, t.hash)?;
+            }
+            ops::add_local_file(c, ctx, &f, thumb.clone())
+        })?;
         self.wrote(&[id], false, false);
         Ok(id)
+    }
+
+    /// Put a copy of `src` at the thumbnail path for `hash` unless the file is already there.
+    fn publish_thumb(&self, src: &std::path::Path, hash: BlobHash) -> Result<()> {
+        let dest = self.thumb_path(hash);
+        if dest.exists() {
+            return Ok(());
+        }
+        // Copy to a name unique to this call, then rename: never a half-written
+        // thumbnail, and two imports of the same bytes never share a temp file.
+        let tmp = self.thumbs_dir().join(format!("{}.{}.tmp", hex::encode(hash.0), uuid::Uuid::now_v7().simple()));
+        if let Err(e) = std::fs::copy(src, &tmp) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(CoreError::io(src, e));
+        }
+        if let Err(e) = std::fs::rename(&tmp, &dest) {
+            let _ = std::fs::remove_file(&tmp);
+            // A concurrent import published the same thumbnail first: that is success.
+            if !dest.exists() {
+                return Err(CoreError::io(&dest, e));
+            }
+        }
+        Ok(())
     }
 
     pub fn set_pinned(&self, id: ItemId, pinned: bool) -> Result<()> {
@@ -798,6 +818,107 @@ impl Core {
             self.inner.kick.fire();
         }
         r
+    }
+
+    /// Delete forever: the item leaves the Bin on this device and, as each device merges it, on every
+    /// linked device. It cannot be restored anywhere.
+    pub fn purge_item(&self, id: ItemId) -> Result<()> {
+        let r = self.with_ctx(|c, ctx| ops::purge_items(c, ctx, &[id]));
+        self.after_purge(&[id], &r);
+        r.map(|_| ())
+    }
+
+    /// Empty Bin: Delete forever for every item the Bin lists. `shown` and `token` are what `bin_count`
+    /// gave the question the user answered: when the Bin lists other items now (one expired, was
+    /// restored or was deleted meanwhile, even if the number is the same) nothing is deleted and the
+    /// caller asks again. Returns how many were deleted.
+    pub fn empty_bin(&self, shown: u32, token: &str) -> Result<u32> {
+        let mut ids: Vec<ItemId> = Vec::new();
+        let r = self.with_ctx(|c, ctx| {
+            ids = bin::bin_ids(c, ctx.now)?;
+            if ids.len() as u32 != shown || bin::bin_token(&ids) != token {
+                let now = ids.len();
+                ids.clear();
+                return Err(CoreError::Invalid(format!("BIN CHANGED - {shown} items were shown, the Bin holds {now} now; nothing was deleted")));
+            }
+            if ids.is_empty() {
+                return Ok(0);
+            }
+            ops::purge_items(c, ctx, &ids)
+        });
+        if !ids.is_empty() {
+            self.after_purge(&ids, &r);
+        }
+        r
+    }
+
+    /// How many items Empty Bin would delete (the confirmation reads "Removes N items ..."), with the
+    /// token that names exactly those items; `empty_bin` takes both back.
+    pub fn bin_count(&self) -> Result<bin::BinCount> {
+        let now = self.now();
+        let db = lock(&self.inner.db);
+        bin::bin_count(&db.conn, now)
+    }
+
+    /// Keep the upgrade backups next to the database free of what a purge removed: when the number of
+    /// purged items changed since the last time (or on the first pass of a run), clear their name,
+    /// saved location and thumbnail from every `tugboat.db.bak-*`. A failure is reported, then tried again.
+    fn scrub_backups(&self, conn: &Connection) {
+        let n: u64 = conn.query_row("SELECT count(*) FROM item WHERE purged_at IS NOT NULL", [], |r| r.get::<_, i64>(0)).map(|n| n.max(0) as u64).unwrap_or(0);
+        if self.inner.backups_scrubbed.swap(n, Ordering::SeqCst) == n {
+            return;
+        }
+        if let Err(e) = crate::db::scrub_backups(conn, &self.inner.cfg.data_dir) {
+            self.inner.backups_scrubbed.store(u64::MAX, Ordering::SeqCst);
+            tracing::warn!("could not clear a purged item from an upgrade backup: {e}");
+        }
+    }
+
+    /// After a purge: a placement failure after the commit stands, so the UI and the peer hear of it anyway.
+    fn after_purge(&self, ids: &[ItemId], r: &Result<u32>) {
+        if matches!(r, Ok(_) | Err(CoreError::Io { .. })) {
+            self.drain_thumbs();
+            self.wrote(ids, false, false);
+        }
+    }
+
+    /// Delete the thumbnails a purge queued, unless a live item still uses the same file. A
+    /// thumbnail that cannot be deleted stays queued and is tried again after the next sweep.
+    pub(crate) fn drain_thumbs(&self) {
+        let db = lock(&self.inner.db);
+        self.scrub_backups(&db.conn);
+        let queued = match store::thumbs_to_delete(&db.conn) {
+            Ok(q) => q,
+            Err(e) => {
+                drop(db);
+                self.emit_error(e.kind(), &format!("could not read the thumbnail queue: {e}"));
+                return;
+            }
+        };
+        let mut failed: Option<String> = None;
+        for hash in queued {
+            // The thumbnail and the half-downloaded copy an interrupted fetch kept to resume.
+            let file = self.thumb_path(hash);
+            let mut stuck = false;
+            for path in [file.with_extension("jpg.part"), file] {
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        failed.get_or_insert(format!("could not delete a thumbnail: {e}"));
+                        stuck = true;
+                    }
+                }
+            }
+            if stuck {
+                continue;
+            }
+            let _ = store::thumb_deleted(&db.conn, hash);
+        }
+        drop(db);
+        if let Some(msg) = failed {
+            self.emit_error("thumbnail", &msg);
+        }
     }
 
     pub fn create_folder(&self, name: &str, retention: Retention) -> Result<FolderId> {
@@ -911,7 +1032,11 @@ impl Core {
                 // move a file that is not there. The item is Binned with no file ref (not
                 // Purged: Purged items are tombstones the Bin screen never lists), so it shows
                 // in the Bin, and a restore fetches it back from the other device (bin.rs).
-                if let Some((_, lfs)) = store::get_item(c, *id)? {
+                if let Some((rec, lfs)) = store::get_item(c, *id)? {
+                    if rec.purged.is_some() {
+                        // Deleted forever: the sweep removed (or is removing) this file itself.
+                        return Ok(());
+                    }
                     if matches!(lfs, LocalFileState::Present | LocalFileState::Binned) {
                         store::set_local_state(c, *id, LocalFileState::Binned, ctx.now)?;
                         state_written = true;
@@ -1034,6 +1159,7 @@ impl Core {
             let mut db = lock(&self.inner.db);
             bin::sweep(&mut db.conn, &*self.inner.placement, self.inner.cfg.self_id, now)?
         };
+        self.drain_thumbs();
         let mut ids: Vec<ItemId> = Vec::new();
         for list in [&rep.to_bin, &rep.returned, &rep.purged, &rep.want] {
             ids.extend(list.iter().copied());
@@ -1068,6 +1194,7 @@ impl Core {
             let mut db = lock(&self.inner.db);
             bin::sweep_items(&mut db.conn, &*self.inner.placement, self.inner.cfg.self_id, ids, now)?
         };
+        self.drain_thumbs();
         for (id, msg) in &rep.errors {
             self.emit_error("placement", &format!("item {}: {msg}", id.0));
         }

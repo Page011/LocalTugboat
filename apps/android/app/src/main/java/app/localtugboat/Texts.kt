@@ -27,6 +27,14 @@ object Texts {
         else -> "${duration(ms)} ago"
     }
 
+    /** Delete forever, on the phone and on the PC: the question and the one line under it. */
+    const val DELETE_FOREVER_TITLE = "Delete forever?"
+    const val DELETE_FOREVER_TEXT = "Removes it from every linked device."
+    const val EMPTY_BIN_TITLE = "Empty Bin?"
+
+    /** Empty Bin: how many items go. One item reads as one item. */
+    fun emptyBinText(n: Int): String = "Removes $n ${if (n == 1) "item" else "items"} from every linked device."
+
     /** Label under a thumbnail in the gallery. */
     fun expiryLabel(state: ItemStateInfo, nowMs: Long, binDays: UInt): String = when (state) {
         is ItemStateInfo.Live -> "Expires in ${duration(state.expiresAtMs - nowMs)}"

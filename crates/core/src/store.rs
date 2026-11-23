@@ -318,7 +318,7 @@ pub fn set_last_seen(c: &Connection, peer: DeviceId, now: i64, addresses: &[Stri
 const ITEM_COLS: &str = "id, captured_at, origin_device, lat, lon, accuracy_m, name, name_lamport, name_dev, \
     blob_hash, size, media_kind, ext, thumb_hash, thumb_size, content_lamport, content_dev, \
     folder_id, folder_entered_at, placement_lamport, placement_dev, pinned, pinned_lamport, pinned_dev, \
-    deleted_at, deleted_lamport, deleted_dev, local_file_state";
+    deleted_at, deleted_lamport, deleted_dev, purged_at, purged_lamport, purged_dev, local_file_state";
 
 fn item_from_row(r: &Row) -> rusqlite::Result<(ItemRecord, LocalFileState)> {
     let lat: Option<f64> = r.get(3)?;
@@ -333,7 +333,11 @@ fn item_from_row(r: &Row) -> rusqlite::Result<(ItemRecord, LocalFileState)> {
         _ => None,
     };
     let kind: String = r.get(11)?;
-    let lfs: String = r.get(27)?;
+    let lfs: String = r.get(30)?;
+    let purged = match r.get::<_, Option<i64>>(27)? {
+        Some(at) => Some(Versioned { v: version(r, 28, 29)?, val: at }),
+        None => None,
+    };
     let rec = ItemRecord {
         id: ItemId(Uuid::from_bytes(b16(r, 0)?)),
         captured_at: r.get(1)?,
@@ -356,13 +360,14 @@ fn item_from_row(r: &Row) -> rusqlite::Result<(ItemRecord, LocalFileState)> {
         },
         pinned: Versioned { v: version(r, 22, 23)?, val: r.get::<_, i64>(21)? == 1 },
         deleted: Versioned { v: version(r, 25, 26)?, val: r.get(24)? },
+        purged,
     };
-    Ok((rec, lfs_parse(27, &lfs)?))
+    Ok((rec, lfs_parse(30, &lfs)?))
 }
 
-/// Items held here and not deleted that some device in `devices` has no receipt for (for the
-/// item's current hash), each with one flag per device (true = that device has none). One pass
-/// that also reads the whole row, so the caller needs no second lookup per item.
+/// Items held here and not deleted (nor purged) that some device in `devices` has no receipt for
+/// (for the item's current hash), each with one flag per device (true = that device has none). One
+/// pass that also reads the whole row, so the caller needs no second lookup per item.
 pub fn items_missing_receipts(c: &Connection, devices: &[DeviceId]) -> Result<Vec<(ItemRecord, Vec<bool>)>> {
     if devices.is_empty() {
         return Ok(Vec::new());
@@ -375,7 +380,7 @@ pub fn items_missing_receipts(c: &Connection, devices: &[DeviceId]) -> Result<Ve
         .collect();
     let names: Vec<String> = (0..devices.len()).map(|i| format!("m{i}")).collect();
     let sql = format!(
-        "SELECT * FROM (SELECT {ITEM_COLS}, {} FROM item WHERE local_file_state = 'present' AND deleted_at IS NULL) WHERE {}",
+        "SELECT * FROM (SELECT {ITEM_COLS}, {} FROM item WHERE local_file_state = 'present' AND deleted_at IS NULL AND purged_at IS NULL) WHERE {}",
         flags.join(", "),
         names.join(" OR ")
     );
@@ -383,7 +388,7 @@ pub fn items_missing_receipts(c: &Connection, devices: &[DeviceId]) -> Result<Ve
     let rows = st
         .query_map([], |r| {
             let (rec, _) = item_from_row(r)?;
-            let missing = (0..devices.len()).map(|i| r.get::<_, bool>(28 + i)).collect::<rusqlite::Result<Vec<bool>>>()?;
+            let missing = (0..devices.len()).map(|i| r.get::<_, bool>(31 + i)).collect::<rusqlite::Result<Vec<bool>>>()?;
             Ok((rec, missing))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -409,7 +414,7 @@ pub fn insert_item(c: &Connection, r: &ItemRecord, local: LocalFileState, now: i
         &format!(
             "INSERT INTO item ({ITEM_COLS}, local_state_at) VALUES
              (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21,
-              ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)"
+              ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32)"
         ),
         params![
             r.id.0.as_bytes().as_slice(),
@@ -439,6 +444,9 @@ pub fn insert_item(c: &Connection, r: &ItemRecord, local: LocalFileState, now: i
             r.deleted.val,
             to_i(r.deleted.v.lamport),
             &r.deleted.v.device.0[..],
+            r.purged.as_ref().map(|p| p.val),
+            r.purged.as_ref().map(|p| to_i(p.v.lamport)),
+            r.purged.as_ref().map(|p| p.v.device.0.to_vec()),
             lfs_str(local),
             now,
         ],
@@ -446,20 +454,27 @@ pub fn insert_item(c: &Connection, r: &ItemRecord, local: LocalFileState, now: i
     Ok(())
 }
 
-/// Overwrite all field groups (values + versions) of an existing item. Local columns untouched.
+/// Overwrite all field groups (values + versions) of an existing item. Local columns untouched. The
+/// saved location is written too: it only ever changes when a purge scrubs the record.
 pub fn update_item(c: &Connection, r: &ItemRecord) -> Result<()> {
     let (th, ts) = match &r.content.val.thumb {
         Some(t) => (Some(t.hash.0.to_vec()), Some(to_i(t.size))),
         None => (None, None),
     };
+    let (lat, lon, acc) = match r.geo {
+        Some(g) => (Some(g.lat), Some(g.lon), Some(g.accuracy_m)),
+        None => (None, None, None),
+    };
     let n = c.execute(
         "UPDATE item SET
+           lat = ?26, lon = ?27, accuracy_m = ?28,
            name = ?2, name_lamport = ?3, name_dev = ?4,
            blob_hash = ?5, size = ?6, media_kind = ?7, ext = ?8, thumb_hash = ?9, thumb_size = ?10,
            content_lamport = ?11, content_dev = ?12,
            folder_id = ?13, folder_entered_at = ?14, placement_lamport = ?15, placement_dev = ?16,
            pinned = ?17, pinned_lamport = ?18, pinned_dev = ?19,
-           deleted_at = ?20, deleted_lamport = ?21, deleted_dev = ?22
+           deleted_at = ?20, deleted_lamport = ?21, deleted_dev = ?22,
+           purged_at = ?23, purged_lamport = ?24, purged_dev = ?25
          WHERE id = ?1",
         params![
             r.id.0.as_bytes().as_slice(),
@@ -484,6 +499,12 @@ pub fn update_item(c: &Connection, r: &ItemRecord) -> Result<()> {
             r.deleted.val,
             to_i(r.deleted.v.lamport),
             &r.deleted.v.device.0[..],
+            r.purged.as_ref().map(|p| p.val),
+            r.purged.as_ref().map(|p| to_i(p.v.lamport)),
+            r.purged.as_ref().map(|p| p.v.device.0.to_vec()),
+            lat,
+            lon,
+            acc,
         ],
     )?;
     if n == 0 {
@@ -509,10 +530,46 @@ pub fn local_state_at(c: &Connection, id: ItemId) -> Result<Option<i64>> {
     Ok(c.query_row("SELECT local_state_at FROM item WHERE id = ?1", [id.0.as_bytes().as_slice()], |r| r.get(0)).optional()?)
 }
 
+/// Queue a thumbnail for deletion (see `thumb_trash` in the v4 schema). The file goes once no live
+/// item uses it.
+pub fn trash_thumb(c: &Connection, hash: BlobHash) -> Result<()> {
+    c.execute("INSERT OR IGNORE INTO thumb_trash (hash) VALUES (?1)", [&hash.0[..]])?;
+    Ok(())
+}
+
+/// Thumbnails waiting for deletion that no live item uses: the files to remove now. Queued hashes a
+/// live item still uses are dropped from the queue.
+pub fn thumbs_to_delete(c: &Connection) -> Result<Vec<BlobHash>> {
+    c.execute(
+        "DELETE FROM thumb_trash WHERE EXISTS (SELECT 1 FROM item WHERE thumb_hash = thumb_trash.hash AND purged_at IS NULL)",
+        [],
+    )?;
+    let mut st = c.prepare("SELECT hash FROM thumb_trash")?;
+    let rows = st.query_map([], |r| Ok(BlobHash(b32(r, 0)?)))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// The thumbnail file is gone (or was never there): take it off the queue.
+pub fn thumb_deleted(c: &Connection, hash: BlobHash) -> Result<()> {
+    c.execute("DELETE FROM thumb_trash WHERE hash = ?1", [&hash.0[..]])?;
+    Ok(())
+}
+
+/// Does an item other than `except` still want a download of `hash` (Pending or Lost, not deleted
+/// forever)? Then the partial file for that hash is kept.
+pub fn wanted_by_other(c: &Connection, hash: BlobHash, except: ItemId) -> Result<bool> {
+    let n: i64 = c.query_row(
+        "SELECT count(*) FROM (SELECT 1 FROM item WHERE blob_hash = ?1 AND id != ?2 AND purged_at IS NULL AND local_file_state IN ('pending', 'lost') LIMIT 1)",
+        rusqlite::params![&hash.0[..], except.0.as_bytes().as_slice()],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
 /// Items whose content hash is `hash` and whose local state is Present or Binned
 /// (blob source for the sender; dedupe on receive).
 pub fn items_holding(c: &Connection, hash: BlobHash) -> Result<Vec<ItemId>> {
-    let mut st = c.prepare("SELECT id FROM item WHERE blob_hash = ?1 AND local_file_state IN ('present', 'binned') ORDER BY id")?;
+    let mut st = c.prepare("SELECT id FROM item WHERE blob_hash = ?1 AND local_file_state IN ('present', 'binned') AND purged_at IS NULL ORDER BY id")?;
     let rows = st.query_map([&hash.0[..]], |r| Ok(ItemId(Uuid::from_bytes(b16(r, 0)?))))?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
@@ -543,7 +600,7 @@ pub fn items_in_state_after(
     // The strings come from lfs_str (fixed set), never from outside, so inlining is safe.
     let list = states.iter().map(|s| format!("'{}'", lfs_str(*s))).collect::<Vec<_>>().join(", ");
     let mut st = c.prepare(&format!(
-        "SELECT captured_at, id FROM item WHERE local_file_state IN ({list}) AND {HELD_BY}
+        "SELECT captured_at, id FROM item WHERE local_file_state IN ({list}) AND purged_at IS NULL AND {HELD_BY}
            AND (?2 IS NULL OR captured_at > ?2 OR (captured_at = ?2 AND id > ?3)) ORDER BY captured_at, id LIMIT ?1"
     ))?;
     let (cap, id): (Option<i64>, Option<Vec<u8>>) = match after {
@@ -558,7 +615,7 @@ pub fn items_in_state_after(
 /// True if any Pending item here is one `peer` can serve (a download still waiting on that device).
 pub fn pending_held_by(c: &Connection, peer: DeviceId) -> Result<bool> {
     let n: i64 = c.query_row(
-        &format!("SELECT count(*) FROM (SELECT 1 FROM item WHERE local_file_state = 'pending' AND {HELD_BY} LIMIT 1)"),
+        &format!("SELECT count(*) FROM (SELECT 1 FROM item WHERE local_file_state = 'pending' AND purged_at IS NULL AND {HELD_BY} LIMIT 1)"),
         params![0, 0, 0, &peer.0[..]],
         |r| r.get(0),
     )?;
@@ -575,7 +632,7 @@ pub fn pending_counts(c: &Connection, peers: &[DeviceId]) -> Result<(u32, Vec<u3
             format!(", COALESCE(SUM(content_dev = x'{h}' OR EXISTS (SELECT 1 FROM receipt r WHERE r.blob_hash = item.blob_hash AND r.device_id = x'{h}')), 0)")
         })
         .collect();
-    let sql = format!("SELECT count(*){sums} FROM item WHERE local_file_state = 'pending'");
+    let sql = format!("SELECT count(*){sums} FROM item WHERE local_file_state = 'pending' AND purged_at IS NULL");
     Ok(c.query_row(&sql, [], |r| {
         let all: i64 = r.get(0)?;
         let per = (0..peers.len()).map(|i| r.get::<_, i64>(i + 1).map(|n| n as u32)).collect::<rusqlite::Result<Vec<u32>>>()?;
@@ -593,7 +650,7 @@ pub fn item_ids_where(c: &Connection, fixed_where: &str) -> Result<Vec<ItemId>> 
 
 /// Ids of items whose placement folder is `folder` (any state).
 pub fn item_ids_in_folder(c: &Connection, folder: FolderId) -> Result<Vec<ItemId>> {
-    let mut st = c.prepare("SELECT id FROM item WHERE folder_id = ?1 ORDER BY captured_at, id")?;
+    let mut st = c.prepare("SELECT id FROM item WHERE folder_id = ?1 AND purged_at IS NULL ORDER BY captured_at, id")?;
     let rows = st.query_map([folder.0.as_bytes().as_slice()], |r| Ok(ItemId(Uuid::from_bytes(b16(r, 0)?))))?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
@@ -612,7 +669,7 @@ pub fn items_page(c: &Connection, folder: Option<FolderId>, after: Option<ItemId
     let a = after.map(|a| a.0.as_bytes().to_vec());
     let mut st = c.prepare(&format!(
         "SELECT {ITEM_COLS} FROM item
-         WHERE (?1 IS NULL OR folder_id = ?1)
+         WHERE purged_at IS NULL AND (?1 IS NULL OR folder_id = ?1)
            AND (?2 IS NULL OR (captured_at, id) < (SELECT captured_at, id FROM item WHERE id = ?2))
          ORDER BY captured_at DESC, id DESC LIMIT ?3"
     ))?;
@@ -1467,6 +1524,44 @@ pub(crate) mod test_support {
         }
     }
 
+    /// Insert an item into a database still at schema v1-v3, the columns those versions have: the
+    /// current `insert_item` also writes the purge columns of v4.
+    pub fn insert_item_before_v4(c: &Connection, r: &ItemRecord, local: LocalFileState, now: i64) {
+        c.execute(
+            "INSERT INTO item (id, captured_at, origin_device, name, name_lamport, name_dev, blob_hash, size, media_kind, ext,
+                content_lamport, content_dev, folder_id, folder_entered_at, placement_lamport, placement_dev,
+                pinned, pinned_lamport, pinned_dev, deleted_at, deleted_lamport, deleted_dev, local_file_state, local_state_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
+            params![
+                r.id.0.as_bytes().as_slice(),
+                r.captured_at,
+                &r.origin.0[..],
+                r.name.val,
+                to_i(r.name.v.lamport),
+                &r.name.v.device.0[..],
+                &r.content.val.hash.0[..],
+                to_i(r.content.val.size),
+                media_str(r.content.val.kind),
+                r.content.val.ext,
+                to_i(r.content.v.lamport),
+                &r.content.v.device.0[..],
+                r.location.val.folder.0.as_bytes().as_slice(),
+                r.location.val.entered_at,
+                to_i(r.location.v.lamport),
+                &r.location.v.device.0[..],
+                r.pinned.val as i64,
+                to_i(r.pinned.v.lamport),
+                &r.pinned.v.device.0[..],
+                r.deleted.val,
+                to_i(r.deleted.v.lamport),
+                &r.deleted.v.device.0[..],
+                lfs_str(local),
+                now,
+            ],
+        )
+        .unwrap();
+    }
+
     pub fn item(n: u8, origin: DeviceId, ver: Version) -> ItemRecord {
         ItemRecord {
             id: ItemId(Uuid::from_u128(0x1000 + n as u128)),
@@ -1481,6 +1576,7 @@ pub(crate) mod test_support {
             location: Versioned { v: ver, val: Location { folder: INBOX_ID, entered_at: T0 } },
             pinned: Versioned { v: ver, val: false },
             deleted: Versioned { v: ver, val: None },
+            purged: None,
         }
     }
 }

@@ -22,12 +22,13 @@ use serde::{Deserialize, Serialize};
 use crate::model::*;
 
 /// Sync protocol version, sent in Hello. 2 since 0.2.0: records may be `MediaKind::File` with any
-/// safe extension, and expiry no longer waits for receipts. A 0.1.x peer (proto 1) would drop
-/// those records as Protocol errors and its digest would never match, so the handshake refuses
+/// safe extension, and expiry no longer waits for receipts. 3 since Delete forever: an item carries
+/// a `purged` group that is part of its `ListEntry` and the digest. A peer on an older protocol
+/// would drop that group and its digest would never match, so the handshake refuses
 /// a mismatch on BOTH sides ("Update Tugboat on the <device with the lower number>") before any
 /// record moves. The ALPN stays `localtugboat/1` on purpose: an ALPN change would make an old
 /// peer fail the TLS handshake and show no message at all.
-pub const PROTO: u32 = 2;
+pub const PROTO: u32 = 3;
 
 /// Max records per Changes / Records page, keys per Fetch, entries per List.
 /// Keeps every frame far below tugboat-net frame::MAX_FRAME (8 MiB): a full item record
@@ -116,7 +117,7 @@ pub enum Refusal {
 }
 
 /// One digest/list line: the key and the versions of its groups in the record's fixed
-/// group order (items: name, content, placement, pinned, deleted; folders: name, retention,
+/// group order (items: name, content, placement, pinned, deleted, purged; folders: name, retention,
 /// deleted; places: name, area, target, deleted; receipts: none).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListEntry {

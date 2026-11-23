@@ -413,6 +413,7 @@ object UiLogic {
         ActivityAction.RESTORED -> "Restored"
         ActivityAction.RETURNED -> "Back from Bin"
         ActivityAction.PURGED -> "Removed from Bin"
+        ActivityAction.DELETED_FOREVER -> "Deleted forever"
         ActivityAction.REFUSED -> "REFUSED"
         ActivityAction.CONFLICT -> "CONFLICT"
         ActivityAction.LOST -> "FILE MISSING"

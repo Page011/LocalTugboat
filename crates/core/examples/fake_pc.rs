@@ -16,7 +16,7 @@
 //!     --send-refused <name> once paired and connected, write a record with that always-refused name and
 //!                           no file behind it (the way a hostile or newer peer would), so the phone
 //!                           must show it as REFUSED and never ask for its bytes
-//!     --proto <n>           speak sync protocol n in the handshake (2 is current; 1 plays a 0.1.x PC:
+//!     --proto <n>           speak sync protocol n in the handshake (3 is current; 1 plays a 0.1.x PC, 2 a 0.3.0 one:
 //!                           both devices must then show "Update Tugboat on the PC")
 //!     --new-pairing         allow pairing a new phone although one is paired (replaces it)
 //! Without --auto-confirm, type `y` or `n` and Enter after a code is printed.

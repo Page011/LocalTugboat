@@ -98,6 +98,7 @@ pub enum ActivityAction {
     Restored,
     Returned,
     Purged,
+    DeletedForever,
     Refused,
     Conflict,
     Lost,
@@ -220,6 +221,14 @@ pub struct ItemPage {
     pub rows: Vec<ItemInfo>,
     /// Pass back as `after` for the next page; None = last page.
     pub next: Option<String>,
+}
+
+/// What Empty Bin's question shows: how many items, and a token that names exactly those items.
+/// `empty_bin` takes both back and deletes nothing when the Bin lists other items now.
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct BinCount {
+    pub count: u32,
+    pub token: String,
 }
 
 #[derive(Debug, Clone, PartialEq, uniffi::Record)]
@@ -732,6 +741,26 @@ impl PhoneCore {
         self.core.restore_item(item_id(&id)?).map_err(SnapError::from)
     }
 
+    /// Delete forever: the item must be in the Bin. It leaves the Bin on this phone and on every
+    /// linked PC as each merges the change, and cannot be restored anywhere. Deleting an item that
+    /// is already gone is harmless.
+    pub fn purge_item(&self, id: String) -> Result<(), SnapError> {
+        self.core.purge_item(item_id(&id)?).map_err(SnapError::from)
+    }
+
+    /// Empty Bin: Delete forever for every item the Bin lists. `shown` and `token` are what the
+    /// confirmation named (`bin_count`); if the Bin lists other items now (even the same number),
+    /// nothing is deleted (`Invalid`). Returns how many were deleted.
+    pub fn empty_bin(&self, shown: u32, token: String) -> Result<u32, SnapError> {
+        self.core.empty_bin(shown, &token).map_err(SnapError::from)
+    }
+
+    /// How many items Empty Bin would delete, and the token naming them (for its confirmation).
+    pub fn bin_count(&self) -> Result<BinCount, SnapError> {
+        let c = self.core.bin_count().map_err(SnapError::from)?;
+        Ok(BinCount { count: c.count, token: c.token })
+    }
+
     /// Camera routing: which folder does the next shot go to. Pass the newest location fix or
     /// None. See `CaptureRoute`.
     pub fn route_capture(&self, fix: Option<LocationFix>) -> Result<CaptureRoute, SnapError> {
@@ -847,6 +876,42 @@ mod tests {
         let sink: Arc<dyn EventListener> = Arc::new(Sink(Mutex::new(Vec::new())));
         assert!(matches!(PhoneCore::open(cfg(vec![1; 31], None), sink.clone()), Err(SnapError::InvalidInput(_))), "short key");
         assert!(matches!(PhoneCore::open(cfg(vec![1; 32], Some("nonsense")), sink), Err(SnapError::InvalidInput(_))), "bad bind");
+    }
+
+    /// Delete forever and Empty Bin reach Kotlin with the right types: the count, the errors for an item
+    /// that is not in the Bin, bad ids, and the new activity action.
+    #[test]
+    fn delete_forever_and_empty_bin() {
+        let dir = tempfile::tempdir().unwrap();
+        let (phone, _sink) = open_phone(dir.path());
+        // Records with no file behind them: the Bin lists an item whose file this phone holds as Binned.
+        let add = |n: &str, held: LocalFileState| phone.core.debug_add_record(n, "jpg", tugboat_core::MediaKind::Image, None, held).unwrap().0.to_string();
+        let (a, b, c) = (add("a.jpg", LocalFileState::Binned), add("b.jpg", LocalFileState::Binned), add("c.jpg", LocalFileState::Binned));
+        let live = add("live.jpg", LocalFileState::Purged);
+        assert_eq!(phone.bin_count().unwrap().count, 0, "nothing is deleted yet");
+        assert!(matches!(phone.purge_item(live.clone()), Err(SnapError::Invalid(_))), "not in the Bin");
+        for id in [&a, &b, &c] {
+            phone.delete_item(id.clone()).unwrap();
+        }
+        let asked = phone.bin_count().unwrap();
+        assert_eq!(asked.count, 3);
+        phone.purge_item(a.clone()).unwrap();
+        phone.purge_item(a.clone()).unwrap();
+        assert_eq!(phone.bin_count().unwrap().count, 2);
+        assert!(matches!(phone.empty_bin(asked.count, asked.token.clone()), Err(SnapError::Invalid(_))), "the Bin changed since the question: nothing goes");
+        let asked = phone.bin_count().unwrap();
+        assert_eq!(asked.count, 2);
+        assert!(matches!(phone.empty_bin(2, "not the token".into()), Err(SnapError::Invalid(_))), "same count, other token: nothing goes");
+        assert_eq!(phone.empty_bin(asked.count, asked.token).unwrap(), 2);
+        let none = phone.bin_count().unwrap();
+        assert_eq!(phone.empty_bin(none.count, none.token).unwrap(), 0);
+        assert!(phone.item(a.clone()).unwrap().is_none(), "gone, not just hidden");
+        assert!(phone.item(live.clone()).unwrap().is_some());
+        assert!(matches!(phone.restore_item(b), Err(SnapError::NotFound(_))));
+        assert!(matches!(phone.purge_item("not-a-uuid".into()), Err(SnapError::InvalidInput(_))));
+        assert!(matches!(phone.purge_item(uuid::Uuid::nil().to_string()), Err(SnapError::NotFound(_))));
+        let rows = phone.activity(None, 50).unwrap();
+        assert_eq!(rows.iter().filter(|r| r.action == ActivityAction::DeletedForever).count(), 3);
     }
 
     #[test]

@@ -15,6 +15,15 @@ class TextsTest {
     private fun status(state: SyncState, last: Long? = null, waiting: UInt = 0u, message: String? = null) =
         TestData.status(state, waiting = waiting, message = message, lastSyncedAt = last)
 
+    @Test fun delete_forever_questions_say_what_goes_and_from_where() {
+        assertEquals("Delete forever?", Texts.DELETE_FOREVER_TITLE)
+        assertEquals("Removes it from every linked device.", Texts.DELETE_FOREVER_TEXT)
+        assertEquals("Empty Bin?", Texts.EMPTY_BIN_TITLE)
+        assertEquals("Removes 12 items from every linked device.", Texts.emptyBinText(12))
+        assertEquals("Removes 2 items from every linked device.", Texts.emptyBinText(2))
+        assertEquals("Removes 1 item from every linked device.", Texts.emptyBinText(1))
+    }
+
     @Test fun duration_rounds_down_and_switches_unit() {
         assertEquals("<1m", Texts.duration(59_999))
         assertEquals("1m", Texts.duration(min))

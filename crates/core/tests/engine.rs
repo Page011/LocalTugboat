@@ -12,7 +12,7 @@ use tugboat_core::{
     sync::{
         digest,
         engine::{Phase, Session, Step},
-        wire::{Msg, PullFrom},
+        wire::{Msg, PullFrom, PROTO},
     },
     AppStorage, DeviceId, DeviceRow, Retention, Role,
 };
@@ -313,7 +313,7 @@ fn final_page_cursor_is_head_with_exclusion() {
 fn refusal_names_the_pc_on_the_phone() {
     let (mut phone, mut pc) = pair_up();
     phone.sess.peer_name = Some("WORK-PC".into());
-    phone.sess.proto = 3;
+    phone.sess.proto = PROTO + 1;
     let hello = phone.sess.hello(&phone.db.conn).unwrap();
     let step = pc.sess.handle(&mut pc.db.conn, hello, T0).unwrap();
     assert_eq!(step.refused.as_deref(), Some("Update Tugboat on the PC"), "the PC keeps its wording");
@@ -323,7 +323,7 @@ fn refusal_names_the_pc_on_the_phone() {
     // The phone is the old one: it says so about itself, whatever the PC is called.
     let (mut phone, mut pc) = pair_up();
     phone.sess.peer_name = Some("WORK-PC".into());
-    pc.sess.proto = 3;
+    pc.sess.proto = PROTO + 1;
     let hello = phone.sess.hello(&phone.db.conn).unwrap();
     let step = pc.sess.handle(&mut pc.db.conn, hello, T0).unwrap();
     assert_eq!(step.refused.as_deref(), Some("Update Tugboat on the phone"));
@@ -373,7 +373,7 @@ fn a_message_before_hello_is_a_protocol_error() {
 #[test]
 fn version_mismatch_is_refused_on_both_sides_without_exchanging_records() {
     let (mut phone, mut pc) = pair_up();
-    phone.sess.proto = 3;
+    phone.sess.proto = PROTO + 1;
     phone.folder("secret");
     let hello = phone.sess.hello(&phone.db.conn).unwrap();
     let step = pc.sess.handle(&mut pc.db.conn, hello, T0).unwrap();

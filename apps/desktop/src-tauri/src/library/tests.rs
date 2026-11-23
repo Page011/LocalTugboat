@@ -1571,18 +1571,33 @@ mod placement {
         assert!(p.from_bin(&inbox(5, "nothing.jpg")).is_err());
     }
 
+    // adopt() of a file already in the library returns that very path (Core keys its failed-add
+    // clean-up on that), and once the item exists a purge removes the file at once, with no waiting
+    // period: a purge that left it would let the next rescan import it as a new item.
     #[test]
-    fn a_failed_add_never_deletes_the_users_own_file() {
+    fn a_file_adopted_in_place_is_removed_by_a_purge_right_away() {
         let (_t, p, root) = rig();
         let own = root.join("mine.jpg");
         std::fs::write(&own, jpeg(1, 64)).unwrap();
         let mut t = inbox(1, "mine.jpg");
-        // adopt() of a file already in the library returns it unchanged ...
         assert_eq!(p.adopt(&own, &t).unwrap(), own);
-        // ... and Core's cleanup after a failed record write calls purge on it: it must survive.
         t.current = Some(own.clone());
         p.purge(&t).unwrap();
-        assert!(own.exists(), "the user's file was not deleted");
+        assert!(!own.exists(), "the item's file is gone");
+        assert!(p.recently_departed(&own), "and a rescan does not call it missing");
+        p.purge(&t).unwrap();
+    }
+
+    // A file in neither the library nor the Bin is not the placement's to remove.
+    #[test]
+    fn purge_leaves_a_file_outside_the_library_and_the_bin() {
+        let (tmp, p, _root) = rig();
+        let elsewhere = tmp.path().join("elsewhere.jpg");
+        std::fs::write(&elsewhere, jpeg(2, 64)).unwrap();
+        let mut t = inbox(2, "elsewhere.jpg");
+        t.current = Some(elsewhere.clone());
+        p.purge(&t).unwrap();
+        assert!(elsewhere.exists());
     }
 
     #[test]

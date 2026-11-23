@@ -385,3 +385,230 @@ async fn s10c_thumbnail_is_synced_before_the_file() {
     assert!(r.pc.error_kinds().is_empty(), "{:?}", r.pc.errors());
     r.shutdown().await;
 }
+
+// ---------- Delete forever ----------
+
+fn tombstone(d: &Dev, id: tugboat_core::ItemId) -> bool {
+    d.local(id) == Some(LocalFileState::Purged) && d.record(id).is_some_and(|r| r.purged.is_some()) && d.view(id).is_none()
+}
+
+// With no other device linked the same actions work: Delete forever and Empty Bin remove the file
+// and the thumbnail here, and refuse an item that is not in the Bin.
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_forever_with_nothing_linked() {
+    let d = Dev::new(Role::Phone, "Alone", &TestClock::new(T0));
+    let ids: Vec<_> = (0..3u64).map(|n| d.add_with_thumb(&format!("solo{n}.jpg"), 60 + n, 5_000)).collect();
+    let live = d.add("live.jpg", 70, 5_000);
+    assert_eq!((d.stored_files(), d.thumb_files()), (4, 3));
+    // Only an item in the Bin can be deleted forever.
+    assert!(matches!(d.core.purge_item(live), Err(tugboat_core::CoreError::Invalid(_))));
+    for id in &ids {
+        d.core.delete_item(*id).unwrap();
+    }
+    let asked = d.core.bin_count().unwrap();
+    assert_eq!(asked.count, 3);
+    d.core.purge_item(ids[0]).unwrap();
+    assert!(tombstone(&d, ids[0]));
+    assert_eq!((d.stored_files(), d.thumb_files()), (3, 2), "one file and one thumbnail gone");
+    assert_eq!(d.core.bin_count().unwrap().count, 2);
+    // The Bin changed since the question (it holds 2, the user was told 3): nothing is deleted.
+    assert!(matches!(d.core.empty_bin(asked.count, &asked.token), Err(tugboat_core::CoreError::Invalid(_))));
+    let asked = d.core.bin_count().unwrap();
+    assert_eq!(asked.count, 2);
+    assert_eq!(d.core.empty_bin(asked.count, &asked.token).unwrap(), 2);
+    assert!(ids.iter().all(|id| tombstone(&d, *id)));
+    assert_eq!((d.stored_files(), d.thumb_files()), (1, 0), "only the live item's file is left");
+    assert!(d.bin().is_empty() && d.items().len() == 1);
+    let none = d.core.bin_count().unwrap();
+    assert_eq!(d.core.empty_bin(none.count, &none.token).unwrap(), 0);
+    assert!(matches!(d.core.purge_item(ids[1]), Ok(())), "deleting forever twice is harmless");
+    assert!(matches!(d.core.restore_item(ids[1]), Err(tugboat_core::CoreError::NotFound { .. })));
+    assert!(d.has_activity(ActivityAction::DeletedForever));
+    assert_eq!(d.core.folders().unwrap().iter().find(|f| f.id == INBOX_ID).unwrap().count, 1, "the folder count leaves it out");
+}
+
+// Empty Bin deletes the items the question named, not "as many items as the question named": when one
+// item left the Bin and another arrived meanwhile the count is the same, and nothing may be deleted.
+#[tokio::test(flavor = "multi_thread")]
+async fn empty_bin_refuses_when_another_item_took_the_place_of_one_shown() {
+    let d = Dev::new(Role::Phone, "Alone", &TestClock::new(T0));
+    let (a, b, c, other) = (d.add("a.jpg", 81, 5_000), d.add("b.jpg", 82, 5_000), d.add("c.jpg", 83, 5_000), d.add("d.jpg", 84, 5_000));
+    for id in [a, b, c] {
+        d.core.delete_item(id).unwrap();
+    }
+    let asked = d.core.bin_count().unwrap();
+    assert_eq!(asked.count, 3);
+    // Meanwhile c is restored and d is deleted: the Bin lists three items again, but not the same three.
+    d.core.restore_item(c).unwrap();
+    d.core.delete_item(other).unwrap();
+    let now = d.core.bin_count().unwrap();
+    assert_eq!(now.count, asked.count, "the number alone cannot tell the difference");
+    assert_ne!(now.token, asked.token);
+    assert!(matches!(d.core.empty_bin(asked.count, &asked.token), Err(tugboat_core::CoreError::Invalid(m)) if m.contains("BIN CHANGED")));
+    for id in [a, b, other] {
+        assert!(d.record(id).is_some_and(|r| r.purged.is_none()), "nothing was deleted");
+    }
+    assert_eq!(d.stored_files(), 4, "every file is still there");
+    assert_eq!(d.bin().len(), 3);
+    // Asked again, the question names the items the Bin holds now, and that goes through.
+    assert_eq!(d.core.empty_bin(now.count, &now.token).unwrap(), 3);
+    assert!(d.record(c).is_some_and(|r| r.purged.is_none()), "the restored item was never part of it");
+    assert_eq!(d.stored_files(), 1);
+}
+
+// A thumbnail download that was interrupted keeps a partial file to resume; deleting the item forever
+// removes that too.
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_forever_removes_a_partial_thumbnail_download() {
+    let d = Dev::new(Role::Phone, "Alone", &TestClock::new(T0));
+    let id = d.add_with_thumb("half.jpg", 91, 5_000);
+    let hash = d.record(id).unwrap().content.val.thumb.expect("a thumbnail").hash;
+    let thumbs = d.dir.path().join("data").join("thumbs");
+    let part = thumbs.join(format!("{}.jpg.part", hex::encode(hash.0)));
+    std::fs::write(&part, b"half").unwrap();
+    d.core.delete_item(id).unwrap();
+    d.core.purge_item(id).unwrap();
+    assert!(!part.exists(), "the partial thumbnail is gone");
+    assert_eq!(d.thumb_files(), 0);
+    assert!(std::fs::read_dir(&thumbs).unwrap().all(|e| e.unwrap().path().extension().is_none_or(|x| x != "part")));
+}
+
+// An item added with the same thumbnail as one deleted forever a moment ago: if the clean-up removes the
+// thumbnail file after the add decided to reuse it and before the record exists, the new item must still
+// end up with its thumbnail.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_thumbnail_removed_while_an_add_waits_is_put_back() {
+    let d = Dev::new(Role::Phone, "Alone", &TestClock::new(T0));
+    let first = d.add_with_thumb("first.jpg", 93, 5_000);
+    let hash = d.record(first).unwrap().content.val.thumb.expect("a thumbnail").hash;
+    let path = d.dir.path().join("data").join("thumbs").join(format!("{}.jpg", hex::encode(hash.0)));
+    assert!(path.exists());
+    let second = std::thread::scope(|s| {
+        // Holds the database for a while, then removes the thumbnail file, as a clean-up would.
+        let hold = s.spawn(|| {
+            d.core.debug_conn(|_| {
+                std::thread::sleep(std::time::Duration::from_millis(600));
+                std::fs::remove_file(&path).unwrap();
+            })
+        });
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        // Decides the thumbnail is there, then waits for the database.
+        let add = s.spawn(|| d.add_with_thumb("second.jpg", 93, 5_000));
+        hold.join().unwrap();
+        add.join().unwrap()
+    });
+    assert_eq!(d.record(second).unwrap().content.val.thumb.map(|t| t.hash), Some(hash), "the same thumbnail");
+    assert!(path.exists(), "the new item's thumbnail file is there");
+    assert_eq!(d.thumb_files(), 1);
+}
+
+// Thumbnails are shared by content: the file goes only when the last item using it is deleted forever.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_thumbnail_shared_by_two_items_goes_with_the_last_one() {
+    let d = Dev::new(Role::Phone, "Alone", &TestClock::new(T0));
+    let shared = d.jpeg("shared-thumb.jpg", 99, 600);
+    let add = |name: &str, seed: u64| {
+        d.core
+            .add_local_file(tugboat_core::ops::NewLocalFile {
+                src: d.jpeg(name, seed, 5_000),
+                name: name.to_string(),
+                folder: None,
+                captured_at: d.clock_now(),
+                geo: None,
+                thumb: Some(shared.clone()),
+                how: tugboat_core::ops::AddKind::Captured,
+                ntfs: None,
+            })
+            .unwrap()
+    };
+    let (a, b) = (add("one.jpg", 1), add("two.jpg", 2));
+    assert_eq!(d.thumb_files(), 1, "one thumbnail for both");
+    d.core.delete_item(a).unwrap();
+    d.core.delete_item(b).unwrap();
+    d.core.purge_item(a).unwrap();
+    assert_eq!(d.thumb_files(), 1, "item two still shows it");
+    assert!(d.view(b).and_then(|v| v.thumb_path).is_some());
+    d.core.purge_item(b).unwrap();
+    assert_eq!(d.thumb_files(), 0);
+}
+
+// A purge made while the phone is away waits in the PC's log and arrives when the phone is back.
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_forever_on_the_pc_while_the_phone_is_away() {
+    let r = Rig::new().await;
+    let id = r.phone.add_with_thumb("later.jpg", 61, 30_000);
+    until("the item and thumbnail on the PC", 20, || r.pc.local(id) == Some(LocalFileState::Present) && r.pc.thumb_files() == 1).await;
+    r.settle().await;
+    r.pc.core.delete_item(id).unwrap();
+    until("in the Bin on the phone", 20, || r.phone.local(id) == Some(LocalFileState::Binned)).await;
+    r.settle().await;
+
+    r.apart().await;
+    r.pc.core.purge_item(id).unwrap();
+    assert!(tombstone(&r.pc, id));
+    assert_eq!(r.phone.local(id), Some(LocalFileState::Binned), "the phone has not heard yet");
+    r.together().await;
+    until("the phone deleted its copy too", 30, || tombstone(&r.phone, id)).await;
+    until("no file and no thumbnail on either device", 20, || r.phone.stored_files() == 0 && r.phone.thumb_files() == 0 && r.pc.stored_files() == 0 && r.pc.thumb_files() == 0).await;
+    r.settle().await;
+    assert!(r.phone.error_kinds().is_empty() && r.pc.error_kinds().is_empty(), "{:?} {:?}", r.phone.errors(), r.pc.errors());
+    r.shutdown().await;
+}
+
+// The tombstone a purge leaves keeps no personal data on either device: no name, no saved location, no
+// thumbnail, the same record on both, equal digests.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deleted_forever_item_keeps_no_name_or_location_on_either_device() {
+    let r = Rig::new().await;
+    let id = r.phone.add_with_geo("Patient_ward_3.jpg", 63, 20_000);
+    until("the item, its location and thumbnail on the PC", 20, || {
+        r.pc.local(id) == Some(LocalFileState::Present) && r.pc.thumb_files() == 1 && r.pc.record(id).is_some_and(|x| x.geo.is_some())
+    })
+    .await;
+    r.settle().await;
+    assert!(r.phone.record(id).unwrap().geo.is_some() && r.phone.record(id).unwrap().name.val == "Patient_ward_3.jpg");
+    r.pc.core.delete_item(id).unwrap();
+    until("in the Bin on the phone", 20, || r.phone.local(id) == Some(LocalFileState::Binned)).await;
+    r.settle().await;
+
+    r.phone.core.purge_item(id).unwrap();
+    until("deleted forever on the PC", 20, || tombstone(&r.pc, id)).await;
+    r.settle().await;
+    assert_eq!(r.pc.digest(), r.phone.digest(), "equal digests after the purge");
+    for d in [&r.phone, &r.pc] {
+        let rec = d.record(id).expect("the tombstone stays");
+        assert!(rec.name.val.is_empty(), "{}: no name", d.name);
+        assert!(rec.geo.is_none(), "{}: no location", d.name);
+        assert!(rec.content.val.thumb.is_none() && d.thumb_files() == 0, "{}: no thumbnail", d.name);
+        assert!(rec.purged.is_some());
+    }
+    assert_eq!(r.phone.record(id), r.pc.record(id), "the same record on both devices");
+    // The Activity rows no longer name it.
+    for d in [&r.phone, &r.pc] {
+        assert!(d.activity_text().iter().all(|t| !t.contains("Patient_ward_3")), "{}: {:?}", d.name, d.activity_text());
+    }
+    r.shutdown().await;
+}
+
+// The timed clean-up of the Bin stays what it was: each device on its own clock, deleting only its
+// own copy. It is not a purge and does not travel.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_timed_bin_clean_up_is_not_a_purge() {
+    let r = Rig::new().await;
+    let id = r.phone.add("timed.jpg", 62, 5_000);
+    until("the item on the PC", 20, || r.pc.local(id) == Some(LocalFileState::Present)).await;
+    r.settle().await;
+    r.phone.core.delete_item(id).unwrap();
+    until("in the Bin on the PC", 20, || r.pc.local(id) == Some(LocalFileState::Binned)).await;
+    r.settle().await;
+
+    r.phone.clock.advance(8 * DAY);
+    r.phone.core.tick().unwrap();
+    assert_eq!(r.phone.local(id), Some(LocalFileState::Purged), "the phone's Bin days passed: its copy is gone");
+    assert!(r.phone.record(id).unwrap().purged.is_none(), "but the record is not deleted forever");
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert_eq!(r.pc.local(id), Some(LocalFileState::Binned), "the PC keeps its copy for its own Bin days");
+    assert!(r.pc.bin().iter().any(|v| v.id == id));
+    r.settle().await;
+    r.shutdown().await;
+}

@@ -55,10 +55,16 @@ describe("wrappers", () => {
     await api.libraryChoose("D:\\Local Tugboat", true);
     await api.items({ folder: null, bin: false, after: null, limit: 50 });
     await api.pairingConfirm(true);
+    await api.purgeItem("i1" as never);
+    await api.emptyBin(3, "tok");
+    await api.binCount();
     expect(calls).toEqual([
       { cmd: "library_choose", args: { path: "D:\\Local Tugboat", acceptCloud: true } },
       { cmd: "items", args: { query: { folder: null, bin: false, after: null, limit: 50 } } },
       { cmd: "pairing_confirm", args: { accept: true } },
+      { cmd: "item_purge", args: { id: "i1" } },
+      { cmd: "bin_empty", args: { shown: 3, token: "tok" } },
+      { cmd: "bin_count", args: undefined },
     ]);
   });
 

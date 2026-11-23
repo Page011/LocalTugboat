@@ -285,6 +285,58 @@ impl Dev {
             .expect("add_local_file")
     }
 
+    /// Like `add`, with a thumbnail made by this device (a second small JPEG).
+    pub fn add_with_thumb(&self, name: &str, seed: u64, len: usize) -> ItemId {
+        let src = self.jpeg(name, seed, len);
+        let thumb = self.jpeg(&format!("thumb-{name}"), seed + 5_000, 600);
+        self.core
+            .add_local_file(NewLocalFile {
+                src,
+                name: name.to_string(),
+                folder: None,
+                captured_at: self.clock_now(),
+                geo: None,
+                thumb: Some(thumb),
+                how: AddKind::Captured,
+                ntfs: None,
+            })
+            .expect("add_local_file")
+    }
+
+    /// Like `add_with_thumb`, with a saved location.
+    pub fn add_with_geo(&self, name: &str, seed: u64, len: usize) -> ItemId {
+        let src = self.jpeg(name, seed, len);
+        let thumb = self.jpeg(&format!("thumb-{name}"), seed + 5_000, 600);
+        self.core
+            .add_local_file(NewLocalFile {
+                src,
+                name: name.to_string(),
+                folder: None,
+                captured_at: self.clock_now(),
+                geo: Some(tugboat_core::model::Geo { lat: -33.8, lon: 151.2, accuracy_m: 5.0 }),
+                thumb: Some(thumb),
+                how: AddKind::Captured,
+                ntfs: None,
+            })
+            .expect("add_local_file")
+    }
+
+    /// How many thumbnail files this device keeps on disk.
+    pub fn thumb_files(&self) -> usize {
+        match std::fs::read_dir(self.dir.path().join("data").join("thumbs")) {
+            Ok(rd) => rd.filter_map(|e| e.ok()).filter(|e| e.path().extension().is_some_and(|x| x == "jpg")).count(),
+            Err(_) => 0,
+        }
+    }
+
+    /// Files under this device's item storage and Bin area (the phone and test layout: items/ and bin/).
+    pub fn stored_files(&self) -> usize {
+        ["items", "bin"]
+            .iter()
+            .map(|d| std::fs::read_dir(self.dir.path().join("storage").join(d)).map(|rd| rd.filter_map(|e| e.ok()).count()).unwrap_or(0))
+            .sum()
+    }
+
     pub fn clock_now(&self) -> i64 {
         use tugboat_core::Clock;
         self.clock.now_ms()

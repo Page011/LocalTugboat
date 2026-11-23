@@ -91,7 +91,7 @@ pub fn folder_views(c: &Connection, now: i64, hide_refused: bool) -> Result<Vec<
     let mut counts: HashMap<FolderId, u32> = HashMap::new();
     // Items effectively deleted are in the Bin whatever the rest says: only items that are not
     // deleted, or that carry a pin (which may outrank an older delete), can be outside it.
-    for id in store::item_ids_where(c, "deleted_at IS NULL OR pinned = 1")? {
+    for id in store::item_ids_where(c, "purged_at IS NULL AND (deleted_at IS NULL OR pinned = 1)")? {
         let Some((rec, lfs)) = store::get_item(c, id)? else { continue };
         if hide_refused && lfs == LocalFileState::Refused {
             continue;
